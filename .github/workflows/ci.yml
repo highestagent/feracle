@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FE_VERSION: v26.7.0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: p2p-shim
+
+      - name: Install Fe
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version "$FE_VERSION" --no-modify-path
+          echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
+
+      - run: fe --version
+      - run: fe fmt --check ingots
+      - run: cargo fmt --manifest-path p2p-shim/Cargo.toml -- --check
+      - name: Syntax checks (JS, Python, Shell)
+        run: |
+          node --check telemetry/host.mjs
+          python3 -m py_compile infra/mock_feeds.py
+          bash -n scripts/*.sh
+
+      - name: Test cli ingot
+        run: fe test --backend native ingots/cli
+
+      - name: Test feracle_core across Native, EVM, and WASM
+        run: |
+          fe test --backend native ingots/core
+          fe test ingots/core
+          fe test --backend wasm ingots/core
+
+      - name: Test and build evm ingot
+        run: |
+          fe test ingots/evm
+          fe build --emit abi,bytecode --out-dir ingots/evm/out ingots/evm
+
+      - name: Test P2P ingots
+        run: |
+          fe test --backend native ingots/p2p
+          fe test --backend native ingots/p2p_udp
+          fe test --backend native ingots/p2p_tcp
+          fe check --backend native ingots/p2p_libp2p
+
+      - name: Test and build WASM telemetry ingot
+        run: |
+          fe test --backend wasm ingots/wasm
+          ./scripts/build-wasm.sh
+
+      - name: Test Rust p2p-shim
+        run: cargo test --manifest-path p2p-shim/Cargo.toml
+
+      - name: Build feracle binary and smoke test CLI
+        run: |
+          ./scripts/build-feracle.sh
+          ./out/feracle >/dev/null
+          ./out/feracle --version
+
+  e2e:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: p2p-shim
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install Fe
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version "$FE_VERSION" --no-modify-path
+          echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
+
+      - name: E2E consensus suite (libp2p, tcp, udp)
+        run: |
+          ./scripts/e2e.sh
+          P2P_BACKEND=tcp ./scripts/e2e.sh
+          P2P_BACKEND=udp ./scripts/e2e.sh
+
+      - name: E2E telemetry suite (libp2p, tcp, udp)
+        run: |
+          ./scripts/e2e-telemetry.sh
+          P2P_BACKEND=tcp ./scripts/e2e-telemetry.sh
+          P2P_BACKEND=udp ./scripts/e2e-telemetry.sh
+
+  package:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: p2p-shim
+
+      - name: Install Fe
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version "$FE_VERSION" --no-modify-path
+          echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
+
+      - name: Package Feracle + Telemetry archive
+        run: |
+          mkdir -p dist
+          ./scripts/install.sh --package "dist/feracle-${{ matrix.target }}.tar.gz"
+
+      - name: Verify single-script install from archive
+        run: |
+          ./scripts/install.sh \
+            --archive "dist/feracle-${{ matrix.target }}.tar.gz" \
+            --prefix /tmp/feracle-ci-install
+          /tmp/feracle-ci-install/bin/feracle >/dev/null
+          /tmp/feracle-ci-install/bin/feracle --version
+          /tmp/feracle-ci-install/bin/feracle-telemetry --help >/dev/null
+          /tmp/feracle-ci-install/bin/feracle-demo --help >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feracle-${{ matrix.target }}
+          path: dist/feracle-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: [e2e, package]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum feracle-*.tar.gz > SHA256SUMS.txt)
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Feracle $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/feracle-*.tar.gz dist/SHA256SUMS.txt \
+          || gh release upload "$GITHUB_REF_NAME" \
+            --clobber \
+            dist/feracle-*.tar.gz dist/SHA256SUMS.txt

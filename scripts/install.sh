@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FERACLE_REPO="${FERACLE_REPO:-highestagent/feracle}"
+FE_VERSION="${FE_VERSION:-v26.7.0}"
+PREFIX="${FERACLE_PREFIX:-$HOME/.local}"
+RELEASE_VERSION="latest"
+MODE="auto"
+ARCHIVE_PATH=""
+PACKAGE_OUT=""
+INSTALL_FOUNDRY=0
+
+usage() {
+  cat <<'EOF'
+Feracle installer and packager (native oracle node + WASM telemetry)
+
+Usage:
+  install.sh [OPTIONS]
+
+Options:
+  --prefix <DIR>        Install destination prefix (default: $HOME/.local)
+  --from-source         Build and install from source instead of release archives
+  --archive <PATH>      Install from a local feracle-<os>-<arch>.tar.gz archive
+  --version <TAG>       GitHub release tag to install when downloading (default: latest)
+  --package <PATH>      Build from local source and emit a relocatable .tar.gz bundle
+  --install-foundry     Install Foundry (anvil/cast) via foundryup if missing
+  -h, --help            Print help
+
+Environment variables:
+  FERACLE_REPO          GitHub repository slug (default: highestagent/feracle)
+  FERACLE_PREFIX        Default install prefix if --prefix is omitted
+  FE_VERSION            Fe toolchain version for source builds (default: v26.7.0)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prefix)
+      [[ $# -ge 2 ]] || { echo "error: --prefix requires a directory argument" >&2; exit 2; }
+      PREFIX="$2"
+      shift 2
+      ;;
+    --prefix=*)
+      PREFIX="${1#--prefix=}"
+      shift
+      ;;
+    --from-source)
+      MODE="source"
+      shift
+      ;;
+    --archive)
+      [[ $# -ge 2 ]] || { echo "error: --archive requires a file path" >&2; exit 2; }
+      MODE="archive"
+      ARCHIVE_PATH="$2"
+      shift 2
+      ;;
+    --archive=*)
+      MODE="archive"
+      ARCHIVE_PATH="${1#--archive=}"
+      shift
+      ;;
+    --version)
+      [[ $# -ge 2 ]] || { echo "error: --version requires a tag" >&2; exit 2; }
+      RELEASE_VERSION="$2"
+      shift 2
+      ;;
+    --version=*)
+      RELEASE_VERSION="${1#--version=}"
+      shift
+      ;;
+    --package)
+      [[ $# -ge 2 ]] || { echo "error: --package requires an output .tar.gz path" >&2; exit 2; }
+      MODE="package"
+      PACKAGE_OUT="$2"
+      shift 2
+      ;;
+    --package=*)
+      MODE="package"
+      PACKAGE_OUT="${1#--package=}"
+      shift
+      ;;
+    --install-foundry)
+      INSTALL_FOUNDRY=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+abs_path() {
+  local target="$1"
+  local dir base
+  dir="$(dirname "$target")"
+  base="$(basename "$target")"
+  mkdir -p "$dir"
+  echo "$(cd "$dir" && pwd)/$base"
+}
+
+abs_existing_file() {
+  local target="$1"
+  [[ -f "$target" ]] || { echo "error: file not found: $target" >&2; exit 1; }
+  local dir base
+  dir="$(cd "$(dirname "$target")" && pwd)"
+  base="$(basename "$target")"
+  echo "$dir/$base"
+}
+
+detect_target() {
+  local os arch
+  case "$(uname -s)" in
+    Linux) os="linux" ;;
+    Darwin) os="darwin" ;;
+    *) echo "error: unsupported OS $(uname -s)" >&2; exit 1 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x86_64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *) echo "error: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+  esac
+  echo "${os}-${arch}"
+}
+
+find_local_repo() {
+  local script_path="${BASH_SOURCE[0]:-}"
+  if [[ -n "$script_path" && -f "$script_path" ]]; then
+    local script_dir root
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    root="$(cd "$script_dir/.." && pwd)"
+    if [[ -f "$root/ingots/feracle/fe.toml" && -f "$root/ingots/wasm/fe.toml" ]]; then
+      echo "$root"
+      return 0
+    fi
+  fi
+  if [[ -f "$PWD/ingots/feracle/fe.toml" && -f "$PWD/ingots/wasm/fe.toml" ]]; then
+    echo "$PWD"
+    return 0
+  fi
+  return 1
+}
+
+ensure_fe() {
+  if [[ -x "$HOME/.fe/bin/fe" ]]; then
+    export PATH="$HOME/.fe/bin:$PATH"
+  fi
+  if command -v fe >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Installing Fe toolchain ($FE_VERSION)..."
+  curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh \
+    | bash -s -- --version "$FE_VERSION" --no-modify-path
+  export PATH="$HOME/.fe/bin:$PATH"
+  command -v fe >/dev/null 2>&1 || {
+    echo "error: fe installation succeeded but fe is still not on PATH" >&2
+    exit 1
+  }
+}
+
+ensure_cargo() {
+  if command -v cargo >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "error: cargo is required to build p2p-shim from source." >&2
+  echo "Install Rust via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+  exit 1
+}
+
+maybe_install_foundry() {
+  if [[ "$INSTALL_FOUNDRY" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ -x "$HOME/.foundry/bin/anvil" ]]; then
+    export PATH="$HOME/.foundry/bin:$PATH"
+  fi
+  if command -v anvil >/dev/null 2>&1 && command -v cast >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Installing Foundry (anvil + cast)..."
+  curl -fsSL https://foundry.paradigm.xyz | bash
+  export PATH="$HOME/.foundry/bin:$PATH"
+  "$HOME/.foundry/bin/foundryup"
+}
+
+write_wrappers() {
+  local dest="$1"
+
+  cat >"$dest/bin/feracle-telemetry" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHARE_DIR="$(cd "$BIN_DIR/../share/feracle" && pwd)"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "error: Node.js (>= 20) is required to run feracle-telemetry." >&2
+  exit 1
+fi
+
+exec node "$SHARE_DIR/telemetry/host.mjs" \
+  --wasm "$SHARE_DIR/out/telemetry_wasm.wasm" \
+  "$@"
+EOF
+  chmod +x "$dest/bin/feracle-telemetry"
+
+  cat >"$dest/bin/feracle-demo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHARE_DIR="$(cd "$BIN_DIR/../share/feracle" && pwd)"
+BACKEND="${P2P_BACKEND:-libp2p}"
+METRICS_PORT=9200
+
+usage() {
+  cat <<'HELP'
+Launch a local 3-node Feracle devnet (Anvil + mock feeds + WASM telemetry TUI)
+
+Usage: feracle-demo [OPTIONS]
+
+Options:
+  --backend <libp2p|tcp|udp>  P2P backend (default: libp2p or $P2P_BACKEND)
+  --metrics-port <PORT>       Prometheus/JSON HTTP port (default: 9200)
+  -h, --help                  Print help
+HELP
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend)
+      [[ $# -ge 2 ]] || { echo "error: --backend requires a value" >&2; exit 2; }
+      BACKEND="$2"
+      shift 2
+      ;;
+    --metrics-port)
+      [[ $# -ge 2 ]] || { echo "error: --metrics-port requires a port" >&2; exit 2; }
+      METRICS_PORT="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+for cmd in anvil cast node python3; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "error: missing required tool '$cmd' on PATH." >&2
+    if [[ "$cmd" == "anvil" || "$cmd" == "cast" ]]; then
+      echo "Install Foundry via: curl -L https://foundry.paradigm.xyz | bash && foundryup" >&2
+    fi
+    exit 1
+  fi
+done
+
+RPC_URL="http://127.0.0.1:8545"
+CHAIN_ID="31337"
+ADDR0="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+PK0="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+ADDR1="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+PK1="0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+ADDR2="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+PK2="0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+
+LOG_DIR="$(mktemp -d)"
+ANVIL_PID=""
+FEEDS_PID=""
+NODE_PIDS=()
+
+cleanup() {
+  for pid in "${NODE_PIDS[@]:-}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "$FEEDS_PID" "$ANVIL_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  rm -rf "$LOG_DIR"
+}
+trap cleanup EXIT INT TERM
+
+echo "Starting local Anvil on :8545..."
+anvil --port 8545 --chain-id "$CHAIN_ID" >"$LOG_DIR/anvil.log" 2>&1 &
+ANVIL_PID=$!
+for _ in $(seq 1 50); do
+  if cast block-number --rpc-url "$RPC_URL" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+
+BYTECODE="0x$(tr -d '\r\n' < "$SHARE_DIR/ingots/evm/out/OffchainMedianOracle.bin")"
+DEPLOY_JSON="$(cast send --rpc-url "$RPC_URL" --private-key "$PK0" --json --create "$BYTECODE")"
+CONTRACT_ADDR="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["contractAddress"])' <<<"$DEPLOY_JSON")"
+cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR0" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
+cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR1" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
+cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR2" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
+
+python3 "$SHARE_DIR/infra/mock_feeds.py" >"$LOG_DIR/feeds.log" 2>&1 &
+FEEDS_PID=$!
+
+"$BIN_DIR/feracle" \
+  --node-id 0 --p2p-backend "$BACKEND" --p2p-port 7001 --telemetry-port 9101 \
+  --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
+  --privkey-hex "$PK0" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 15 \
+  >"$LOG_DIR/node0.log" 2>&1 &
+PID0=$!
+
+sleep 0.3
+"$BIN_DIR/feracle" \
+  --node-id 1 --p2p-backend "$BACKEND" --p2p-port 7002 --telemetry-port 9102 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7001" \
+  --sources "binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK1" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 15 \
+  >"$LOG_DIR/node1.log" 2>&1 &
+PID1=$!
+
+"$BIN_DIR/feracle" \
+  --node-id 2 --p2p-backend "$BACKEND" --p2p-port 7003 --telemetry-port 9103 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7001,/ip4/127.0.0.1/tcp/7002" \
+  --sources "hyperliquid=127.0.0.1:9001,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK2" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 15 \
+  >"$LOG_DIR/node2.log" 2>&1 &
+PID2=$!
+NODE_PIDS=("$PID0" "$PID1" "$PID2")
+
+echo "Launching Feracle WASM telemetry TUI (backend=$BACKEND, metrics http://127.0.0.1:$METRICS_PORT/metrics). Press Ctrl-C to stop."
+"$BIN_DIR/feracle-telemetry" \
+  --rpc-url "$RPC_URL" \
+  --contract "$CONTRACT_ADDR" \
+  --oracles "$ADDR0,$ADDR1,$ADDR2" \
+  --nodes "http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103" \
+  --metrics-port "$METRICS_PORT" \
+  --mode tui
+EOF
+  chmod +x "$dest/bin/feracle-demo"
+}
+
+stage_from_source() {
+  local src_dir="$1"
+  local stage_dir="$2"
+
+  ensure_fe
+  ensure_cargo
+
+  echo "Building Feracle targets (EVM, WASM, Native)..."
+  fe build --emit abi,bytecode --out-dir "$src_dir/ingots/evm/out" "$src_dir/ingots/evm"
+  "$src_dir/scripts/build-wasm.sh"
+  "$src_dir/scripts/build-feracle.sh"
+
+  mkdir -p \
+    "$stage_dir/bin" \
+    "$stage_dir/share/feracle/out" \
+    "$stage_dir/share/feracle/ingots/evm/out" \
+    "$stage_dir/share/feracle/telemetry" \
+    "$stage_dir/share/feracle/infra"
+
+  cp "$src_dir/out/feracle" "$stage_dir/bin/feracle"
+  chmod +x "$stage_dir/bin/feracle"
+
+  cp "$src_dir/out/telemetry_wasm.wasm" "$stage_dir/share/feracle/out/"
+  cp "$src_dir/out/telemetry_wasm.manifest.json" "$stage_dir/share/feracle/out/"
+  cp "$src_dir/ingots/evm/out/OffchainMedianOracle.bin" "$stage_dir/share/feracle/ingots/evm/out/"
+  cp "$src_dir/ingots/evm/out/OffchainMedianOracle.abi.json" "$stage_dir/share/feracle/ingots/evm/out/"
+  cp "$src_dir/telemetry/host.mjs" "$stage_dir/share/feracle/telemetry/"
+  cp "$src_dir/infra/mock_feeds.py" "$stage_dir/share/feracle/infra/"
+  cp "$src_dir/infra/Caddyfile" "$stage_dir/share/feracle/infra/"
+
+  write_wrappers "$stage_dir"
+}
+
+install_stage_dir() {
+  local stage_dir="$1"
+  local prefix="$2"
+
+  mkdir -p "$prefix/bin" "$prefix/share/feracle"
+  cp -R "$stage_dir/bin/." "$prefix/bin/"
+  cp -R "$stage_dir/share/feracle/." "$prefix/share/feracle/"
+  chmod +x "$prefix/bin/feracle" "$prefix/bin/feracle-telemetry" "$prefix/bin/feracle-demo"
+}
+
+extract_and_install_archive() {
+  local archive="$1"
+  local prefix="$2"
+  local work_dir="$3"
+  local tmp_extract="$work_dir/extract"
+  rm -rf "$tmp_extract"
+  mkdir -p "$tmp_extract"
+  tar -xzf "$archive" -C "$tmp_extract"
+  [[ -x "$tmp_extract/bin/feracle" && -f "$tmp_extract/share/feracle/out/telemetry_wasm.wasm" ]] || {
+    echo "error: invalid Feracle archive layout in $archive" >&2
+    exit 1
+  }
+  install_stage_dir "$tmp_extract" "$prefix"
+}
+
+try_download_release() {
+  local target="$1"
+  local out_archive="$2"
+  local url
+  if [[ "$RELEASE_VERSION" == "latest" ]]; then
+    url="https://github.com/$FERACLE_REPO/releases/latest/download/feracle-${target}.tar.gz"
+  else
+    url="https://github.com/$FERACLE_REPO/releases/download/${RELEASE_VERSION}/feracle-${target}.tar.gz"
+  fi
+  echo "Checking release archive $url..."
+  curl -fsSL "$url" -o "$out_archive"
+}
+
+main() {
+  maybe_install_foundry
+
+  local work_tmp
+  work_tmp="$(mktemp -d)"
+  trap 'rm -rf "${work_tmp:-}"' EXIT
+
+  if [[ "$MODE" == "package" ]]; then
+    local local_repo
+    local_repo="$(find_local_repo)" || {
+      echo "error: --package must be run inside a Feracle source checkout" >&2
+      exit 1
+    }
+    local out_tar
+    out_tar="$(abs_path "$PACKAGE_OUT")"
+    stage_from_source "$local_repo" "$work_tmp/stage"
+    tar -C "$work_tmp/stage" -czf "$out_tar" bin share
+    echo "Packaged release archive: $out_tar"
+    return 0
+  fi
+
+  if [[ "$MODE" == "archive" ]]; then
+    local archive_abs
+    archive_abs="$(abs_existing_file "$ARCHIVE_PATH")"
+    extract_and_install_archive "$archive_abs" "$PREFIX" "$work_tmp"
+  elif [[ "$MODE" == "auto" ]]; then
+    if local_repo="$(find_local_repo 2>/dev/null)"; then
+      stage_from_source "$local_repo" "$work_tmp/stage"
+      install_stage_dir "$work_tmp/stage" "$PREFIX"
+    else
+      local target archive_dl
+      target="$(detect_target)"
+      archive_dl="$work_tmp/feracle-${target}.tar.gz"
+      if try_download_release "$target" "$archive_dl"; then
+        extract_and_install_archive "$archive_dl" "$PREFIX" "$work_tmp"
+      else
+        echo "No prebuilt archive for $target; falling back to source build..."
+        git clone --depth 1 "https://github.com/$FERACLE_REPO.git" "$work_tmp/src"
+        stage_from_source "$work_tmp/src" "$work_tmp/stage"
+        install_stage_dir "$work_tmp/stage" "$PREFIX"
+      fi
+    fi
+  else
+    # --from-source
+    if local_repo="$(find_local_repo 2>/dev/null)"; then
+      stage_from_source "$local_repo" "$work_tmp/stage"
+      install_stage_dir "$work_tmp/stage" "$PREFIX"
+    else
+      git clone --depth 1 "https://github.com/$FERACLE_REPO.git" "$work_tmp/src"
+      stage_from_source "$work_tmp/src" "$work_tmp/stage"
+      install_stage_dir "$work_tmp/stage" "$PREFIX"
+    fi
+  fi
+
+  echo ""
+  echo "Installed Feracle to $PREFIX:"
+  echo "  - $PREFIX/bin/feracle"
+  echo "  - $PREFIX/bin/feracle-telemetry"
+  echo "  - $PREFIX/bin/feracle-demo"
+  echo "  - $PREFIX/share/feracle/"
+  echo ""
+  echo "Smoke check:"
+  "$PREFIX/bin/feracle" --version
+  if command -v node >/dev/null 2>&1; then
+    "$PREFIX/bin/feracle-telemetry" --help >/dev/null
+    echo "feracle-telemetry OK"
+  else
+    echo "note: install Node.js (>= 20) to run feracle-telemetry"
+  fi
+  echo ""
+  case ":$PATH:" in
+    *":$PREFIX/bin:"*) ;;
+    *)
+      echo "Add to your shell PATH:"
+      echo "  export PATH=\"$PREFIX/bin:\$PATH\""
+      echo ""
+      ;;
+  esac
+  echo "Try it out:"
+  echo "  feracle                         # show node CLI help"
+  echo "  feracle-telemetry --help        # inspect WASM telemetry host options"
+  echo "  feracle-demo                    # launch local Anvil + 3 nodes + telemetry TUI"
+}
+
+main
