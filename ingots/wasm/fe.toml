@@ -1,0 +1,7 @@
+[ingot]
+name = "telemetry_wasm"
+version = "0.1.0"
+target = "wasm"
+
+[dependencies]
+feracle_core = { path = "../core" }

@@ -1,0 +1,214 @@
+//! WASM telemetry formatting helpers, RPC batch builder, and `feracle_core` re-exports.
+
+use core::num::IntDowncast
+use std::io::Display
+pub use super::fixed_str::FixedStr
+pub use feracle_core::{
+    SEL_CURRENT_ROUND,
+    SEL_IS_ORACLE,
+    SEL_LATEST_PRICES,
+    SEL_OWNER,
+    decode_hex_bytes,
+    hex_char,
+    hex_nibble,
+    is_ascii_ws,
+    json_get_bool,
+    json_get_raw,
+    json_get_str_bounds,
+    json_get_u64,
+    json_next_array_elem,
+    normalize_addr20_hex,
+    parse_abi_word_addr20,
+    parse_abi_word_bool,
+    parse_abi_word_u64,
+    parse_hex_addr20,
+    parse_hex_u64,
+    push_addr20_hex,
+    signed_bps_diff,
+    strip_0x_offset,
+    to_ascii_lower,
+}
+
+pub fn write_u64_commas(_ n: u64, _ with_commas: bool, _ out: mut MemBuffer) {
+    if n == 0 {
+        out.push(b'0')
+        return
+    }
+    var digits: [u8; 32] = [0; 32]
+    var count: usize = 0
+    var cur = n
+    var group: usize = 0
+    while cur > 0 {
+        if with_commas && group == 3 {
+            digits[count] = b','
+            count += 1
+            group = 0
+        }
+        let rem: u8 = (cur % 10).downcast_truncate()
+        digits[count] = b'0' + rem
+        count += 1
+        cur /= 10
+        group += 1
+    }
+    while count > 0 {
+        count -= 1
+        out.push(digits[count])
+    }
+}
+
+pub fn format_price_decimal(
+    _ price_1e8: u64,
+    decimals: usize,
+    with_commas: bool,
+    _ out: mut MemBuffer,
+) {
+    let whole = price_1e8 / feracle_core::PRICE_SCALE
+    let frac = price_1e8 % feracle_core::PRICE_SCALE
+    write_u64_commas(whole, with_commas, mut out)
+    if decimals == 0 { return }
+    out.push(b'.')
+    var frac_digits: [u8; 8] = [b'0'; 8]
+    var tmp = frac
+    var idx: usize = 8
+    while idx > 0 {
+        idx -= 1
+        let d: u8 = (tmp % 10).downcast_truncate()
+        frac_digits[idx] = b'0' + d
+        tmp /= 10
+    }
+    let show = if decimals < 8 { decimals } else { 8 }
+    var j: usize = 0
+    while j < show {
+        out.push(frac_digits[j])
+        j += 1
+    }
+}
+
+pub fn format_asset_price_usd(_ price_1e8: u64, _ out: mut MemBuffer) {
+    out.push(b'$')
+    let decimals: usize = if price_1e8 >= 10_000_000_000 {
+        2
+    } else if price_1e8 >= feracle_core::PRICE_SCALE {
+        3
+    } else {
+        4
+    }
+    format_price_decimal(price_1e8, decimals, with_commas: true, mut out)
+}
+
+pub fn format_signed_bps(_ bps: i64, _ out: mut MemBuffer) {
+    if bps > 0 {
+        out.push(b'+')
+        write!(mut out, bps, " bps")
+    } else {
+        write!(mut out, bps, " bps")
+    }
+}
+
+pub fn format_age(now_ms: u64, ts_sec: u64, _ out: mut MemBuffer) {
+    if ts_sec == 0 {
+        out.extend_from("never".span())
+        return
+    }
+    let now_sec = now_ms / 1000
+    if now_sec <= ts_sec {
+        out.extend_from("0s ago".span())
+        return
+    }
+    let diff = now_sec - ts_sec
+    if diff < 60 {
+        write!(mut out, diff, "s ago")
+    } else if diff < 3600 {
+        write!(mut out, diff / 60, "m ", diff % 60, "s ago")
+    } else {
+        write!(mut out, diff / 3600, "h ", (diff % 3600) / 60, "m ago")
+    }
+}
+
+pub fn write_padded_col(_ text: MemSpan, width: usize, right_align: bool, _ out: mut MemBuffer) {
+    let n = text.len()
+    if n >= width {
+        out.extend_from(text.head(width))
+        return
+    }
+    let pad = width - n
+    if right_align {
+        var i: usize = 0
+        while i < pad {
+            out.push(b' ')
+            i += 1
+        }
+        out.extend_from(text)
+    } else {
+        out.extend_from(text)
+        var i: usize = 0
+        while i < pad {
+            out.push(b' ')
+            i += 1
+        }
+    }
+}
+
+fn append_eth_call_item<D: Display>(
+    id: usize,
+    target_addr: MemSpan,
+    data_hex: D,
+    _ out: mut MemBuffer,
+) {
+    write!(
+        mut out,
+        "{\"jsonrpc\":\"2.0\",\"id\":",
+        id,
+        ",\"method\":\"eth_call\",\"params\":[{\"to\":\"",
+        target_addr,
+        "\",\"data\":\"",
+        data_hex,
+        "\"},\"latest\"]}",
+    )
+}
+
+pub fn build_rpc_batch_into(
+    target_addr: MemSpan,
+    oracle_addrs: [FixedStr<48>; 3],
+    oracle_count: usize,
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    out.extend_from("[".span())
+    out.extend_from(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]},".span(),
+    )
+    out.extend_from(
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_blockNumber\",\"params\":[]},".span(),
+    )
+    out.extend_from(
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"eth_getBlockByNumber\",\"params\":[\"latest\",false]},"
+            .span(),
+    )
+    append_eth_call_item(id: 4, target_addr, data_hex: SEL_LATEST_PRICES, mut out)
+    out.push(b',')
+    append_eth_call_item(id: 5, target_addr, data_hex: SEL_CURRENT_ROUND, mut out)
+    out.push(b',')
+    append_eth_call_item(id: 6, target_addr, data_hex: SEL_OWNER, mut out)
+
+    var i: usize = 0
+    while i < oracle_count && i < 3 {
+        var addr_buf = MemBuffer::empty()
+        oracle_addrs[i].write_to(mut addr_buf)
+        let trim_addr = addr_buf.span().trim()
+        let stripped = trim_addr.tail(strip_0x_offset(trim_addr))
+        if stripped.len() == 40 {
+            var calldata = MemBuffer::with_capacity(74)
+            write!(
+                mut calldata,
+                SEL_IS_ORACLE,
+                "000000000000000000000000",
+                stripped,
+            )
+            out.push(b',')
+            append_eth_call_item(id: 7 + i, target_addr, data_hex: calldata.span(), mut out)
+        }
+        i += 1
+    }
+    out.push(b']')
+}

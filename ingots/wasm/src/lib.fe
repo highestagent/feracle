@@ -1,0 +1,210 @@
+use core::num::IntDowncast
+use std::io::Stdout
+use std::wasm::{Clock, HostText, Reply}
+
+use render::{render_json_into, render_prometheus_into, render_tui_into}
+use state::TelemetryEngine
+
+fn emit_stdout(_ buf: MemSpan) -> Reply uses (out: mut Stdout) {
+    let ok = out.write_stdout(buf)
+    if !ok {
+        return Reply::error(2)
+    }
+    let len_u32: u32 = buf.len().downcast_saturate()
+    Reply::ok(len_u32)
+}
+
+#[unsafe(export)]
+pub fn telemetry_new() -> u32 {
+    let p = TelemetryEngine::alloc_new()
+    (p as usize).downcast().unwrap()
+}
+
+#[unsafe(export)]
+pub fn telemetry_free(_ handle: u32) {
+    if handle == 0 { return }
+    let p = (handle as usize) as *TelemetryEngine
+    unsafe {
+        TelemetryEngine::free_ptr(p)
+    }
+}
+
+#[unsafe(export)]
+pub fn telemetry_configure(
+    _ handle: u32,
+    _ contract_hex: HostText,
+    _ oracles_csv: HostText,
+) -> Reply {
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    let target_contract = contract_hex.copy()
+    let oracles = oracles_csv.copy()
+    let p = (handle as usize) as *TelemetryEngine
+    unsafe {
+        (*p).configure(
+                contract_hex: target_contract.span(),
+                oracles_csv: oracles.span(),
+            )
+    }
+    Reply::ok(0)
+}
+
+#[unsafe(export)]
+pub fn telemetry_build_rpc_batch(_ handle: u32) -> Reply uses (out: mut Stdout) {
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    var buf = MemBuffer::with_capacity(1024)
+    let p = (handle as usize) as *TelemetryEngine
+    unsafe {
+        (*p).build_rpc_batch(mut buf)
+    }
+    emit_stdout(buf.span())
+}
+
+#[unsafe(export)]
+pub fn telemetry_ingest_rpc(_ handle: u32, _ payload: HostText, _ latency_ms: u64) -> Reply
+uses (clock: mut Clock)
+{
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    let json = payload.copy()
+    let now_ms = clock.now_ms()
+    let p = (handle as usize) as *TelemetryEngine
+    let ok = unsafe {
+        (*p).ingest_rpc_batch(payload: json.span(), latency_ms, now_ms)
+    }
+    if ok { Reply::ok(1) } else { Reply::error(3) }
+}
+
+#[unsafe(export)]
+pub fn telemetry_ingest_tx(
+    _ handle: u32,
+    _ round_id: u64,
+    _ block_num: u64,
+    _ gas_used: u64,
+    _ tx_count: u32,
+    _ submitter_hex: HostText,
+) -> Reply {
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    let submitter = submitter_hex.copy()
+    let p = (handle as usize) as *TelemetryEngine
+    unsafe {
+        (*p).ingest_tx(
+                round_id,
+                block_num,
+                gas_used,
+                tx_count,
+                submitter_hex: submitter.span(),
+            )
+    }
+    Reply::ok(0)
+}
+
+#[unsafe(export)]
+pub fn telemetry_ingest_wire_frame(
+    _ handle: u32,
+    _ frame_hex: HostText,
+    _ peer_tag: HostText,
+    _ is_tx: u32,
+) -> Reply
+uses (clock: mut Clock)
+{
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    let hex_str = frame_hex.copy()
+    let peer = peer_tag.copy()
+    let now_ms = clock.now_ms()
+    let p = (handle as usize) as *TelemetryEngine
+    let ok = unsafe {
+        (*p)
+            .ingest_wire_frame(
+                frame_hex: hex_str.span(),
+                peer_tag: peer.span(),
+                is_tx: is_tx != 0,
+                now_ms,
+            )
+    }
+    if ok { Reply::ok(1) } else { Reply::error(4) }
+}
+
+#[unsafe(export)]
+pub fn telemetry_ingest_node_status(_ handle: u32, _ node_id: u32, _ payload: HostText) -> Reply
+uses (clock: mut Clock)
+{
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    let json = payload.copy()
+    let now_ms = clock.now_ms()
+    let p = (handle as usize) as *TelemetryEngine
+    let ok = unsafe {
+        (*p).ingest_node_status(node_id: node_id as usize, payload: json.span(), now_ms)
+    }
+    if ok { Reply::ok(1) } else { Reply::error(5) }
+}
+
+#[unsafe(export)]
+pub fn telemetry_mark_node_offline(_ handle: u32, _ node_id: u32) -> Reply {
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    let p = (handle as usize) as *TelemetryEngine
+    let ok = unsafe {
+        (*p).mark_node_offline(node_id: node_id as usize)
+    }
+    if ok { Reply::ok(0) } else { Reply::error(5) }
+}
+
+#[unsafe(export)]
+pub fn telemetry_render_tui(_ handle: u32, _ ansi: u32) -> Reply
+uses (clock: mut Clock, out: mut Stdout)
+{
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    var buf = MemBuffer::with_capacity(8192)
+    let now_ms = clock.now_ms()
+    let p = (handle as usize) as *TelemetryEngine
+    unsafe {
+        render_tui_into(*p, now_ms, ansi: ansi != 0, mut buf)
+    }
+    emit_stdout(buf.span())
+}
+
+#[unsafe(export)]
+pub fn telemetry_render_json(_ handle: u32) -> Reply
+uses (clock: mut Clock, out: mut Stdout)
+{
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    var buf = MemBuffer::with_capacity(16384)
+    let now_ms = clock.now_ms()
+    let p = (handle as usize) as *TelemetryEngine
+    unsafe {
+        render_json_into(*p, now_ms, mut buf)
+    }
+    emit_stdout(buf.span())
+}
+
+#[unsafe(export)]
+pub fn telemetry_render_prometheus(_ handle: u32) -> Reply
+uses (clock: mut Clock, out: mut Stdout)
+{
+    if handle == 0 {
+        return Reply::error(1)
+    }
+    var buf = MemBuffer::with_capacity(4096)
+    let now_ms = clock.now_ms()
+    let p = (handle as usize) as *TelemetryEngine
+    unsafe {
+        render_prometheus_into(*p, now_ms, mut buf)
+    }
+    emit_stdout(buf.span())
+}

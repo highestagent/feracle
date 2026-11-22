@@ -1,0 +1,1076 @@
+use core::num::IntDowncast
+use feracle_core::{
+    ASSET_COUNT,
+    MAX_TOLERANCE_BPS,
+    NODE_COUNT,
+    PRICE_SCALE,
+    QUORUM,
+    abs_i64,
+    first_tolerance_breach_asset,
+    leader_index,
+    within_tolerance_bps,
+    worst_quote_deviation,
+    write_asset_symbol,
+}
+use super::codec::{
+    FixedStr,
+    format_age,
+    format_asset_price_usd,
+    format_price_decimal,
+    format_signed_bps,
+    signed_bps_diff,
+    write_padded_col,
+}
+use super::state::{MAX_ORACLES, TelemetryEngine}
+
+fn push_ansi_clear(_ out: mut MemBuffer) {
+    out.push(27)
+    out.extend_from("[2J".span())
+    out.push(27)
+    out.extend_from("[H".span())
+}
+
+fn push_ansi_code(_ ansi: bool, _ code: MemSpan, _ out: mut MemBuffer) {
+    if !ansi { return }
+    out.push(27)
+    out.extend_from(code)
+}
+
+fn append_fixed_json<const N: usize>(_ s: FixedStr<N>, _ out: mut MemBuffer) {
+    out.push(b'"')
+    s.write_json_escaped(mut out)
+    out.push(b'"')
+}
+
+fn append_u64_array_json(_ arr: [u64; 20], _ out: mut MemBuffer) {
+    out.push(b'[')
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        if i > 0 { out.push(b',') }
+        write!(mut out, arr[i])
+        i += 1
+    }
+    out.push(b']')
+}
+
+fn compute_age_secs(now_ms: u64, ts_sec: u64) -> u64 {
+    if ts_sec == 0 { return 0 }
+    let now_sec = now_ms / 1000
+    if now_sec > ts_sec {
+        now_sec - ts_sec
+    } else {
+        0
+    }
+}
+
+fn format_asset_cell(asset_id: usize, price_1e8: u64, delta_bps: i64, _ out: mut MemBuffer) {
+    var sym = MemBuffer::empty()
+    write_asset_symbol(asset_id, mut sym)
+    write_padded_col(sym.span(), width: 5, right_align: false, mut out)
+
+    var pbuf = MemBuffer::empty()
+    if price_1e8 > 0 {
+        format_asset_price_usd(price_1e8, mut pbuf)
+    } else {
+        pbuf.extend_from("$0.00".span())
+    }
+    write_padded_col(pbuf.span(), width: 12, right_align: true, mut out)
+
+    out.extend_from("  (".span())
+    var dbuf = MemBuffer::empty()
+    format_signed_bps(delta_bps, mut dbuf)
+    out.extend_from(dbuf.span())
+    out.push(b')')
+}
+
+fn render_sparkline(_ st: TelemetryEngine, _ out: mut MemBuffer) {
+    var vals: [u64; 16] = [0; 16]
+    var count: usize = 0
+    let start = if st.rounds_len > 16 {
+        st.rounds_len - 16
+    } else {
+        0
+    }
+    var i = start
+    while i < st.rounds_len && count < 16 {
+        let p = st.round_at(i).prices[0]
+        if p > 0 {
+            vals[count] = p
+            count += 1
+        }
+        i += 1
+    }
+    if count == 0 {
+        out.extend_from("(no history yet)".span())
+        return
+    }
+    var min_p = vals[0]
+    var max_p = vals[0]
+    var j: usize = 1
+    while j < count {
+        if vals[j] < min_p {
+            min_p = vals[j]
+        }
+        if vals[j] > max_p {
+            max_p = vals[j]
+        }
+        j += 1
+    }
+    let bars = "_.-:=+*#"
+    var k: usize = 0
+    while k < count {
+        let level: usize = if max_p == min_p {
+            4
+        } else {
+            let num: u128 = ((vals[k] - min_p) as u128) * (7 as u128)
+            let den: u128 = (max_p - min_p) as u128
+            let scaled: u64 = (num / den).downcast_unchecked()
+            scaled.downcast_unchecked()
+        }
+        out.push(bars.span().byte_at(level))
+        k += 1
+    }
+}
+
+pub fn render_tui_into(_ st: TelemetryEngine, now_ms: u64, ansi: bool, _ out: mut MemBuffer) {
+    out.clear()
+    if ansi {
+        push_ansi_clear(mut out)
+    }
+
+    push_ansi_code(ansi, "[1;36m".span(), mut out)
+    writeln!(
+        mut out,
+        "================================================================================",
+    )
+    writeln!(
+        mut out,
+        "  FERACLE  |  Decentralized Price Oracle  |  WASM Telemetry",
+    )
+    writeln!(
+        mut out,
+        "================================================================================",
+    )
+    push_ansi_code(ansi, "[0m".span(), mut out)
+
+    let conn_str = if st.onchain.connected {
+        "CONNECTED"
+    } else {
+        "WAITING"
+    }
+    write!(
+        mut out,
+        "  Chain ID: ",
+        st.onchain.chain_id,
+        "   Block: #",
+        st.onchain.block_number,
+        "   RPC Latency: ",
+        st.onchain.rpc_latency_ms,
+        "ms   Status: ",
+        conn_str,
+        " (polls=",
+        st.onchain.total_rpc_polls,
+        " err=",
+        st.onchain.rpc_errors,
+        ")\n",
+    )
+
+    out.extend_from("  Contract: ".span())
+    if st.onchain.contract_addr.is_empty() {
+        out.extend_from("<unconfigured>".span())
+    } else {
+        st.onchain.contract_addr.write_to(mut out)
+    }
+    out.extend_from("   Owner: ".span())
+    if st.onchain.owner.is_empty() {
+        out.extend_from("...".span())
+    } else {
+        st.onchain.owner.write_short_addr(mut out)
+    }
+    out.push(b'\n')
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+
+    // --- Live Resolved 20-Asset Price Board ---
+    var age_buf = MemBuffer::empty()
+    format_age(now_ms, ts_sec: st.onchain.last_updated, mut age_buf)
+    let age_secs = compute_age_secs(now_ms, ts_sec: st.onchain.last_updated)
+    let health = if st.onchain.last_updated == 0 {
+        "PENDING"
+    } else if age_secs <= 60 { "FRESH" } else { "STALE" }
+
+    push_ansi_code(ansi, "[1;32m".span(), mut out)
+    write!(
+        mut out,
+        "  LIVE TOP-20 BASKET (Updated: ",
+        age_buf,
+        " [",
+        health,
+        "])   BTC Trend: ",
+    )
+    render_sparkline(st, mut out)
+    out.push(b'\n')
+    push_ansi_code(ansi, "[0m".span(), mut out)
+
+    var row: usize = 0
+    while row < 10 {
+        var left = MemBuffer::empty()
+        format_asset_cell(
+            asset_id: row,
+            price_1e8: st.onchain.latest_prices[row],
+            delta_bps: st.onchain.last_deltas_bps[row],
+            mut left,
+        )
+        out.extend_from("  ".span())
+        write_padded_col(left.span(), width: 36, right_align: false, mut out)
+        out.extend_from(" | ".span())
+        var right = MemBuffer::empty()
+        format_asset_cell(
+            asset_id: row + 10,
+            price_1e8: st.onchain.latest_prices[row + 10],
+            delta_bps: st.onchain.last_deltas_bps[row + 10],
+            mut right,
+        )
+        out.extend_from(right.span())
+        out.push(b'\n')
+        row += 1
+    }
+
+    // --- Consensus & Protocol Invariants ---
+    let cur_round = if st.onchain.current_round > 0 {
+        st.onchain.current_round
+    } else {
+        1
+    }
+    let primary_leader = leader_index(round_id: cur_round, node_count: NODE_COUNT)
+    let backup_leader = leader_index(round_id: cur_round + 1, node_count: NODE_COUNT)
+    let inv_str = if st.onchain.tx_invariant_ok {
+        "OK (1 tx/round)"
+    } else {
+        "VIOLATED (>1 tx/round)"
+    }
+    let failover_str = if st.onchain.last_tx_failover {
+        "YES"
+    } else {
+        "NO"
+    }
+
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    write!(
+        mut out,
+        "  Round: ",
+        st.onchain.current_round,
+        " (settled=",
+        if st.onchain.current_round > 1 {
+            st.onchain.current_round - 1
+        } else {
+            0
+        },
+        ")   Assets: ",
+        ASSET_COUNT,
+        "   Primary: Node ",
+        primary_leader,
+        "   Backup: Node ",
+        backup_leader,
+        "\n",
+    )
+    write!(
+        mut out,
+        "  Quorum: ",
+        QUORUM,
+        "/",
+        NODE_COUNT,
+        "   Tolerance: +-",
+        MAX_TOLERANCE_BPS,
+        " bps   Invariant: ",
+        inv_str,
+        "   Gas: ",
+        st.onchain.last_tx_gas,
+        "   Failover: ",
+        failover_str,
+        "\n",
+    )
+
+    // --- Off-Chain GossipSub Wire Telemetry ---
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    out.extend_from("  OFF-CHAIN P2P WIRE (feracle_core): round=".span())
+    write!(
+        mut out,
+        st.active_wire_round,
+        " q=",
+        st.wire_quote_count,
+        "/",
+        NODE_COUNT,
+        " s=",
+        st.wire_sig_count,
+        "/",
+        QUORUM,
+        " guard=[",
+    )
+    if st.wire_breach_detected {
+        out.extend_from("BREACH".span())
+        if st.wire_breach_asset >= 0 {
+            let bad_id: usize = st.wire_breach_asset.downcast_unchecked()
+            out.extend_from(" on ".span())
+            write_asset_symbol(bad_id, mut out)
+        }
+        out.extend_from(" >100bps".span())
+    } else {
+        out.extend_from("OK".span())
+    }
+    write!(
+        mut out,
+        "] (seen q=",
+        st.total_wire_quotes_seen,
+        " s=",
+        st.total_wire_sigs_seen,
+        " err=",
+        st.total_wire_decode_errors,
+        ")\n",
+    )
+    if st.wire_group_medians[0] > 0 {
+        var btc_med = MemBuffer::empty()
+        var eth_med = MemBuffer::empty()
+        format_asset_price_usd(st.wire_group_medians[0], mut btc_med)
+        format_asset_price_usd(st.wire_group_medians[1], mut eth_med)
+        writeln!(
+            mut out,
+            "    Proposed Median Basket: BTC=",
+            btc_med,
+            "  ETH=",
+            eth_med,
+            " (ts=",
+            st.wire_round_ts,
+            ")",
+        )
+    }
+
+    var qi: usize = 0
+    while qi < st.wire_quote_count {
+        let q = st.wire_quotes[qi]
+        var qp = MemBuffer::empty()
+        format_asset_price_usd(q.prices[0], mut qp)
+        out.extend_from("    Quote[".span())
+        write!(mut out, qi, "] peer=")
+        if q.peer_tag.is_empty() {
+            out.extend_from("unknown".span())
+        } else {
+            q.peer_tag.write_short_addr(mut out)
+        }
+        write!(mut out, "  btc=", qp, "  rx=", q.rx_count)
+        if st.wire_group_medians[0] > 0 {
+            let (worst_idx, worst_bps) = worst_quote_deviation(q.prices, st.wire_group_medians)
+            var dbuf = MemBuffer::empty()
+            format_signed_bps(worst_bps, mut dbuf)
+            var wsym = MemBuffer::empty()
+            write_asset_symbol(worst_idx, mut wsym)
+            let ok = first_tolerance_breach_asset(
+                local: q.prices,
+                proposed: st.wire_group_medians,
+                max_bps: MAX_TOLERANCE_BPS,
+            )
+                .is_none()
+            let tag = if ok { "OK" } else { "BREACH" }
+            write!(mut out, "  max_diff=", dbuf, "(", wsym, ") [", tag, "]")
+        }
+        out.push(b'\n')
+        qi += 1
+    }
+
+    var si: usize = 0
+    while si < st.wire_sig_count {
+        let s = st.wire_sigs[si]
+        var sp = MemBuffer::empty()
+        format_asset_price_usd(s.median_prices[0], mut sp)
+        out.extend_from("    Sig[".span())
+        write!(mut out, si, "] signer=")
+        s.signer_hex.write_short_addr(mut out)
+        write!(
+            mut out,
+            "  v=",
+            s.v,
+            "  btc=",
+            sp,
+            "  rx=",
+            s.rx_count,
+            "\n",
+        )
+        si += 1
+    }
+
+    // --- Oracle Nodes & Per-Exchange Feeds ---
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    writeln!(mut out, "  ORACLE NODES & EXCHANGE FEEDS:")
+    var ni: usize = 0
+    while ni < MAX_ORACLES {
+        let node = st.nodes[ni]
+        let auth_tag = if !node.auth_known {
+            "AUTH?"
+        } else if node.is_authorized_onchain {
+            "AUTH"
+        } else {
+            "UNAUTH"
+        }
+        let live_tag = if node.online {
+            "ONLINE"
+        } else if node.seen { "OFFLINE" } else { "NO_TAP" }
+        write!(
+            mut out,
+            "  Node ",
+            ni,
+            " [",
+            auth_tag,
+            "][",
+            live_tag,
+            "] addr=",
+        )
+        if node.evm_addr.is_empty() {
+            out.extend_from("-".span())
+        } else {
+            node.evm_addr.write_short_addr(mut out)
+        }
+        write!(
+            mut out,
+            "  peers=",
+            node.peer_count,
+            "  r=",
+            node.round_id,
+            "  phase=",
+        )
+        if node.phase.is_empty() {
+            out.extend_from("-".span())
+        } else {
+            node.phase.write_to(mut out)
+        }
+        if node.local_price > 0 {
+            var lp = MemBuffer::empty()
+            format_asset_price_usd(node.local_price, mut lp)
+            write!(mut out, "  btc=", lp)
+        }
+        write!(
+            mut out,
+            "  q=",
+            node.quotes_tx,
+            "/",
+            node.quotes_rx,
+            "  s=",
+            node.sigs_tx,
+            "/",
+            node.sigs_rx,
+            "  breach=",
+            node.tolerance_breaches,
+            "  sub=",
+            node.submissions_ok,
+            "/",
+            node.submissions_err,
+            "\n",
+        )
+        if node.feed_count > 0 {
+            out.extend_from("    feeds: ".span())
+            var fi: usize = 0
+            while fi < node.feed_count {
+                if fi > 0 {
+                    out.extend_from(" | ".span())
+                }
+                let f = node.feeds[fi]
+                f.provider.write_to(mut out)
+                out.push(b'@')
+                f.addr.write_to(mut out)
+                out.push(b'=')
+                if f.ok {
+                    var fp = MemBuffer::empty()
+                    format_asset_price_usd(f.price, mut fp)
+                    write!(mut out, f.assets_ok, "/20 ", fp, "(", f.latency_ms, "ms)")
+                } else {
+                    write!(mut out, "ERR(", f.latency_ms, "ms)")
+                }
+                fi += 1
+            }
+            out.push(b'\n')
+        }
+        ni += 1
+    }
+
+    // --- Recent Settled Rounds History ---
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    writeln!(mut out, "  RECENT SETTLED ROUNDS (newest first):")
+    if st.rounds_len == 0 {
+        writeln!(mut out, "    (no settled rounds observed yet)")
+    } else {
+        let show = if st.rounds_len > 8 { 8 } else { st.rounds_len }
+        var step: usize = 0
+        while step < show {
+            let l_idx = st.rounds_len - 1 - step
+            let rs = st.round_at(l_idx)
+            var rbtc = MemBuffer::empty()
+            if rs.prices[0] > 0 {
+                format_asset_price_usd(rs.prices[0], mut rbtc)
+            } else {
+                rbtc.extend_from("-".span())
+            }
+            var reth = MemBuffer::empty()
+            if rs.prices[1] > 0 {
+                format_asset_price_usd(rs.prices[1], mut reth)
+            } else {
+                reth.extend_from("-".span())
+            }
+            var rdelta = MemBuffer::empty()
+            format_signed_bps(rs.delta_bps, mut rdelta)
+            var rage = MemBuffer::empty()
+            format_age(now_ms, ts_sec: rs.timestamp, mut rage)
+
+            write!(
+                mut out,
+                "    Round ",
+                rs.round_id,
+                "  | BTC=",
+                rbtc,
+                " ETH=",
+                reth,
+                " (",
+                rdelta,
+                ") | ",
+                rage,
+                " | exp=",
+                rs.expected_leader_idx,
+            )
+            if rs.actual_leader_idx >= 0 {
+                write!(mut out, " act=", rs.actual_leader_idx)
+            }
+            if rs.failover {
+                out.extend_from(" [FAILOVER]".span())
+            }
+            if rs.gas_used > 0 || rs.tx_count > 0 {
+                write!(mut out, " | gas=", rs.gas_used, " txs=", rs.tx_count)
+            }
+            out.push(b'\n')
+            step += 1
+        }
+    }
+    writeln!(
+        mut out,
+        "================================================================================",
+    )
+}
+
+pub fn render_json_into(_ st: TelemetryEngine, now_ms: u64, _ out: mut MemBuffer) {
+    out.clear()
+    let cur_round = if st.onchain.current_round > 0 {
+        st.onchain.current_round
+    } else {
+        1
+    }
+    let primary_leader = leader_index(round_id: cur_round, node_count: NODE_COUNT)
+    let backup_leader = leader_index(round_id: cur_round + 1, node_count: NODE_COUNT)
+    let age_secs = compute_age_secs(now_ms, ts_sec: st.onchain.last_updated)
+    let stale = st.onchain.last_updated == 0 || age_secs > 60
+
+    var price_fmt = MemBuffer::empty()
+    format_price_decimal(
+        st.onchain.latest_prices[0],
+        decimals: 8,
+        with_commas: false,
+        mut price_fmt,
+    )
+
+    write!(
+        mut out,
+        "{\"protocol\":{\"asset_count\":",
+        ASSET_COUNT,
+        ",\"quorum\":",
+        QUORUM,
+        ",\"node_count\":",
+        NODE_COUNT,
+        ",\"max_tolerance_bps\":",
+        MAX_TOLERANCE_BPS,
+        ",\"price_scale\":",
+        PRICE_SCALE,
+        "},\"onchain\":{\"connected\":",
+        st.onchain.connected,
+        ",\"chain_id\":",
+        st.onchain.chain_id,
+        ",\"block_number\":",
+        st.onchain.block_number,
+        ",\"block_timestamp\":",
+        st.onchain.block_timestamp,
+        ",\"current_round\":",
+        st.onchain.current_round,
+        ",\"latest_price\":",
+        st.onchain.latest_prices[0],
+        ",\"latest_price_formatted\":\"",
+        price_fmt,
+        "\",\"previous_price\":",
+        st.onchain.previous_prices[0],
+        ",\"last_delta_bps\":",
+        st.onchain.last_deltas_bps[0],
+        ",\"prices\":[",
+    )
+
+    var ai: usize = 0
+    while ai < ASSET_COUNT {
+        if ai > 0 { out.push(b',') }
+        var sym = MemBuffer::empty()
+        write_asset_symbol(ai, mut sym)
+        var fmt_a = MemBuffer::empty()
+        format_price_decimal(
+            st.onchain.latest_prices[ai],
+            decimals: 8,
+            with_commas: false,
+            mut fmt_a,
+        )
+        write!(
+            mut out,
+            "{\"id\":",
+            ai,
+            ",\"symbol\":\"",
+            sym,
+            "\",\"price\":",
+            st.onchain.latest_prices[ai],
+            ",\"formatted\":\"",
+            fmt_a,
+            "\",\"delta_bps\":",
+            st.onchain.last_deltas_bps[ai],
+            "}",
+        )
+        ai += 1
+    }
+
+    write!(
+        mut out,
+        "],\"last_updated\":",
+        st.onchain.last_updated,
+        ",\"age_secs\":",
+        age_secs,
+        ",\"stale\":",
+        stale,
+        ",\"primary_leader\":",
+        primary_leader,
+        ",\"backup_leader\":",
+        backup_leader,
+        ",\"contract\":",
+    )
+    append_fixed_json(st.onchain.contract_addr, mut out)
+    out.extend_from(",\"owner\":".span())
+    append_fixed_json(st.onchain.owner, mut out)
+    write!(
+        mut out,
+        ",\"rpc_latency_ms\":",
+        st.onchain.rpc_latency_ms,
+        ",\"last_poll_ms\":",
+        st.onchain.last_poll_ms,
+        ",\"total_rpc_polls\":",
+        st.onchain.total_rpc_polls,
+        ",\"rpc_errors\":",
+        st.onchain.rpc_errors,
+        ",\"has_tx_data\":",
+        st.onchain.has_tx_data,
+        ",\"last_tx_gas\":",
+        st.onchain.last_tx_gas,
+        ",\"last_tx_failover\":",
+        st.onchain.last_tx_failover,
+        ",\"tx_invariant_ok\":",
+        st.onchain.tx_invariant_ok,
+        "},\"wire\":{\"active_round\":",
+        st.active_wire_round,
+        ",\"group_median\":",
+        st.wire_group_medians[0],
+        ",\"group_medians\":",
+    )
+    append_u64_array_json(st.wire_group_medians, mut out)
+    write!(
+        mut out,
+        ",\"round_ts\":",
+        st.wire_round_ts,
+        ",\"breach_detected\":",
+        st.wire_breach_detected,
+        ",\"breach_asset\":",
+        st.wire_breach_asset,
+        ",\"total_quotes_seen\":",
+        st.total_wire_quotes_seen,
+        ",\"total_sigs_seen\":",
+        st.total_wire_sigs_seen,
+        ",\"decode_errors\":",
+        st.total_wire_decode_errors,
+        ",\"quotes\":[",
+    )
+
+    var qi: usize = 0
+    while qi < st.wire_quote_count {
+        if qi > 0 { out.push(b',') }
+        let q = st.wire_quotes[qi]
+        let diff_bps = if st.wire_group_medians[0] > 0 {
+            signed_bps_diff(val: q.prices[0], base: st.wire_group_medians[0])
+        } else {
+            0
+        }
+        var max_abs_diff_bps: u64 = 0
+        var within = true
+        var q_breach_asset: i64 = -1
+        if st.wire_group_medians[0] > 0 {
+            let (_, worst_bps) = worst_quote_deviation(q.prices, st.wire_group_medians)
+            max_abs_diff_bps = abs_i64(worst_bps)
+            if let Option::Some(bad_idx) = first_tolerance_breach_asset(
+                local: q.prices,
+                proposed: st.wire_group_medians,
+                max_bps: MAX_TOLERANCE_BPS,
+            ) {
+                within = false
+                q_breach_asset = bad_idx.downcast_unchecked()
+            }
+        }
+        write!(
+            mut out,
+            "{\"round_id\":",
+            q.round_id,
+            ",\"price\":",
+            q.prices[0],
+            ",\"btc_price\":",
+            q.prices[0],
+            ",\"prices\":",
+        )
+        append_u64_array_json(q.prices, mut out)
+        write!(
+            mut out,
+            ",\"timestamp\":",
+            q.timestamp,
+            ",\"rx_count\":",
+            q.rx_count,
+            ",\"diff_bps\":",
+            diff_bps,
+            ",\"max_abs_diff_bps\":",
+            max_abs_diff_bps,
+            ",\"within_tolerance\":",
+            within,
+            ",\"breach_asset\":",
+            q_breach_asset,
+            ",\"peer_tag\":",
+        )
+        append_fixed_json(q.peer_tag, mut out)
+        out.push(b'}')
+        qi += 1
+    }
+
+    out.extend_from("],\"sigs\":[".span())
+    var si: usize = 0
+    while si < st.wire_sig_count {
+        if si > 0 { out.push(b',') }
+        let s = st.wire_sigs[si]
+        write!(
+            mut out,
+            "{\"round_id\":",
+            s.round_id,
+            ",\"median_price\":",
+            s.median_prices[0],
+            ",\"median_prices\":",
+        )
+        append_u64_array_json(s.median_prices, mut out)
+        write!(
+            mut out,
+            ",\"timestamp\":",
+            s.timestamp,
+            ",\"v\":",
+            s.v,
+            ",\"rx_count\":",
+            s.rx_count,
+            ",\"signer\":",
+        )
+        append_fixed_json(s.signer_hex, mut out)
+        out.push(b'}')
+        si += 1
+    }
+
+    out.extend_from("]},\"nodes\":[".span())
+    var ni: usize = 0
+    while ni < MAX_ORACLES {
+        if ni > 0 { out.push(b',') }
+        let node = st.nodes[ni]
+        write!(mut out, "{\"node_id\":", ni, ",\"evm_addr\":")
+        append_fixed_json(node.evm_addr, mut out)
+        write!(
+            mut out,
+            ",\"is_authorized_onchain\":",
+            node.is_authorized_onchain,
+            ",\"auth_known\":",
+            node.auth_known,
+            ",\"online\":",
+            node.online,
+            ",\"seen\":",
+            node.seen,
+            ",\"p2p_port\":",
+            node.p2p_port,
+            ",\"peer_count\":",
+            node.peer_count,
+            ",\"round_id\":",
+            node.round_id,
+            ",\"phase\":",
+        )
+        append_fixed_json(node.phase, mut out)
+        write!(
+            mut out,
+            ",\"local_price\":",
+            node.local_price,
+            ",\"group_median\":",
+            node.group_median,
+            ",\"round_ts\":",
+            node.round_ts,
+            ",\"counters\":{\"quotes_tx\":",
+            node.quotes_tx,
+            ",\"quotes_rx\":",
+            node.quotes_rx,
+            ",\"sigs_tx\":",
+            node.sigs_tx,
+            ",\"sigs_rx\":",
+            node.sigs_rx,
+            ",\"tolerance_breaches\":",
+            node.tolerance_breaches,
+            ",\"submissions_ok\":",
+            node.submissions_ok,
+            ",\"submissions_err\":",
+            node.submissions_err,
+            ",\"last_submit_ms\":",
+            node.last_submit_ms,
+            "},\"feeds\":[",
+        )
+        var fi: usize = 0
+        while fi < node.feed_count {
+            if fi > 0 { out.push(b',') }
+            let f = node.feeds[fi]
+            out.extend_from("{\"provider\":".span())
+            append_fixed_json(f.provider, mut out)
+            out.extend_from(",\"addr\":".span())
+            append_fixed_json(f.addr, mut out)
+            write!(
+                mut out,
+                ",\"price\":",
+                f.price,
+                ",\"assets_ok\":",
+                f.assets_ok,
+                ",\"ok\":",
+                f.ok,
+                ",\"latency_ms\":",
+                f.latency_ms,
+                "}",
+            )
+            fi += 1
+        }
+        out.extend_from("]}".span())
+        ni += 1
+    }
+
+    out.extend_from("],\"rounds\":[".span())
+    var ri: usize = 0
+    while ri < st.rounds_len {
+        if ri > 0 { out.push(b',') }
+        let rs = st.round_at(ri)
+        write!(
+            mut out,
+            "{\"round_id\":",
+            rs.round_id,
+            ",\"price\":",
+            rs.prices[0],
+            ",\"prices\":",
+        )
+        append_u64_array_json(rs.prices, mut out)
+        write!(
+            mut out,
+            ",\"timestamp\":",
+            rs.timestamp,
+            ",\"block_number\":",
+            rs.block_number,
+            ",\"gas_used\":",
+            rs.gas_used,
+            ",\"tx_count\":",
+            rs.tx_count,
+            ",\"expected_leader\":",
+            rs.expected_leader_idx,
+            ",\"actual_leader\":",
+            rs.actual_leader_idx,
+            ",\"failover\":",
+            rs.failover,
+            ",\"delta_bps\":",
+            rs.delta_bps,
+            ",\"submitter\":",
+        )
+        append_fixed_json(rs.submitter, mut out)
+        out.push(b'}')
+        ri += 1
+    }
+    out.extend_from("]}".span())
+}
+
+pub fn render_prometheus_into(_ st: TelemetryEngine, now_ms: u64, _ out: mut MemBuffer) {
+    out.clear()
+    let age_secs = compute_age_secs(now_ms, ts_sec: st.onchain.last_updated)
+    let tx_ok: u64 = if st.onchain.tx_invariant_ok { 1 } else { 0 }
+    let breach_num: u64 = if st.wire_breach_detected { 1 } else { 0 }
+
+    writeln!(mut out, "# TYPE feracle_asset_count gauge")
+    writeln!(mut out, "feracle_asset_count ", ASSET_COUNT)
+    writeln!(mut out, "# TYPE feracle_latest_price_1e8 gauge")
+    writeln!(
+        mut out,
+        "feracle_latest_price_1e8 ",
+        st.onchain.latest_prices[0],
+    )
+    writeln!(mut out, "# TYPE feracle_asset_price_1e8 gauge")
+    var ai: usize = 0
+    while ai < ASSET_COUNT {
+        var sym = MemBuffer::empty()
+        write_asset_symbol(ai, mut sym)
+        writeln!(
+            mut out,
+            "feracle_asset_price_1e8{asset=\"",
+            sym,
+            "\"} ",
+            st.onchain.latest_prices[ai],
+        )
+        ai += 1
+    }
+
+    writeln!(mut out, "# TYPE feracle_current_round gauge")
+    writeln!(
+        mut out,
+        "feracle_current_round ",
+        st.onchain.current_round,
+    )
+    writeln!(mut out, "# TYPE feracle_price_age_seconds gauge")
+    writeln!(mut out, "feracle_price_age_seconds ", age_secs)
+    writeln!(mut out, "# TYPE feracle_block_number gauge")
+    writeln!(mut out, "feracle_block_number ", st.onchain.block_number)
+    writeln!(mut out, "# TYPE feracle_rpc_latency_ms gauge")
+    writeln!(
+        mut out,
+        "feracle_rpc_latency_ms ",
+        st.onchain.rpc_latency_ms,
+    )
+    writeln!(mut out, "# TYPE feracle_last_settlement_gas gauge")
+    writeln!(
+        mut out,
+        "feracle_last_settlement_gas ",
+        st.onchain.last_tx_gas,
+    )
+    writeln!(mut out, "# TYPE feracle_tx_per_round_ok gauge")
+    writeln!(mut out, "feracle_tx_per_round_ok ", tx_ok)
+    writeln!(mut out, "# TYPE feracle_wire_round gauge")
+    writeln!(mut out, "feracle_wire_round ", st.active_wire_round)
+    writeln!(mut out, "# TYPE feracle_wire_quotes_count gauge")
+    writeln!(mut out, "feracle_wire_quotes_count ", st.wire_quote_count)
+    writeln!(mut out, "# TYPE feracle_wire_sigs_count gauge")
+    writeln!(mut out, "feracle_wire_sigs_count ", st.wire_sig_count)
+    writeln!(mut out, "# TYPE feracle_wire_breach_detected gauge")
+    writeln!(mut out, "feracle_wire_breach_detected ", breach_num)
+    writeln!(mut out, "# TYPE feracle_wire_breach_asset gauge")
+    writeln!(
+        mut out,
+        "feracle_wire_breach_asset ",
+        st.wire_breach_asset,
+    )
+
+    writeln!(mut out, "# TYPE feracle_node_online gauge")
+    writeln!(mut out, "# TYPE feracle_node_authorized gauge")
+    writeln!(mut out, "# TYPE feracle_node_peers gauge")
+    writeln!(mut out, "# TYPE feracle_node_local_price_1e8 gauge")
+    writeln!(
+        mut out,
+        "# TYPE feracle_node_tolerance_breaches_total counter",
+    )
+    var ni: usize = 0
+    while ni < MAX_ORACLES {
+        let node = st.nodes[ni]
+        let online_v: u64 = if node.online { 1 } else { 0 }
+        let auth_v: u64 = if node.is_authorized_onchain { 1 } else { 0 }
+        writeln!(
+            mut out,
+            "feracle_node_online{node=\"",
+            ni,
+            "\"} ",
+            online_v,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_authorized{node=\"",
+            ni,
+            "\"} ",
+            auth_v,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_peers{node=\"",
+            ni,
+            "\"} ",
+            node.peer_count,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_local_price_1e8{node=\"",
+            ni,
+            "\"} ",
+            node.local_price,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_tolerance_breaches_total{node=\"",
+            ni,
+            "\"} ",
+            node.tolerance_breaches,
+        )
+        ni += 1
+    }
+
+    writeln!(mut out, "# TYPE feracle_feed_price_1e8 gauge")
+    writeln!(mut out, "# TYPE feracle_feed_assets_ok gauge")
+    writeln!(mut out, "# TYPE feracle_feed_latency_ms gauge")
+    var n2: usize = 0
+    while n2 < MAX_ORACLES {
+        let node = st.nodes[n2]
+        var fi: usize = 0
+        while fi < node.feed_count {
+            let f = node.feeds[fi]
+            var pname = MemBuffer::empty()
+            f.provider.write_to(mut pname)
+            writeln!(
+                mut out,
+                "feracle_feed_price_1e8{node=\"",
+                n2,
+                "\",provider=\"",
+                pname,
+                "\"} ",
+                f.price,
+            )
+            writeln!(
+                mut out,
+                "feracle_feed_assets_ok{node=\"",
+                n2,
+                "\",provider=\"",
+                pname,
+                "\"} ",
+                f.assets_ok,
+            )
+            writeln!(
+                mut out,
+                "feracle_feed_latency_ms{node=\"",
+                n2,
+                "\",provider=\"",
+                pname,
+                "\"} ",
+                f.latency_ms,
+            )
+            fi += 1
+        }
+        n2 += 1
+    }
+}

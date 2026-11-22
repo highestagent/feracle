@@ -1,0 +1,489 @@
+use feracle_core::{ASSET_COUNT, QuoteMsg, SigMsg, encode_quote_buf, encode_sig_msg_buf}
+use super::codec::{
+    format_asset_price_usd,
+    format_price_decimal,
+    format_signed_bps,
+    hex_char,
+    signed_bps_diff,
+}
+use super::render::{render_json_into, render_prometheus_into, render_tui_into}
+use super::state::TelemetryEngine
+
+fn contains_span(_ haystack: MemSpan, _ needle: MemSpan) -> bool {
+    haystack.index_of(needle).is_some()
+}
+
+fn push_hex_span(_ raw: MemSpan, _ out: mut MemBuffer) {
+    out.clear()
+    var i: usize = 0
+    while i < raw.len() {
+        let b = raw.byte_at(i)
+        out.push(hex_char(b >> 4))
+        out.push(hex_char(b & 0x0f))
+        i += 1
+    }
+}
+
+fn push_word_u64(_ val: u64, _ out: mut MemBuffer) {
+    var digits: [u8; 64] = [b'0'; 64]
+    var cur = val
+    var idx: usize = 64
+    while idx > 0 && cur > 0 {
+        idx -= 1
+        let rem: u8 = (cur & 0x0f).downcast_truncate()
+        digits[idx] = hex_char(rem)
+        cur = cur >> 4
+    }
+    var i: usize = 0
+    while i < 64 {
+        out.push(digits[i])
+        i += 1
+    }
+}
+
+fn sample_prices() -> [u64; 20] {
+    [
+        9_245_150_000_000,
+        342_050_000_000,
+        21_840_000_000,
+        245_200_000,
+        68_520_000_000,
+        38_400_000,
+        104_500_000,
+        26_100_000,
+        4_480_000_000,
+        2_360_000_000,
+        415_200_000,
+        892_000_000,
+        29_500_000,
+        51_230_000_000,
+        11_460_000_000,
+        1_475_000_000,
+        648_000_000,
+        1_235_000_000,
+        94_500_000,
+        31_850_000_000,
+    ]
+}
+
+fn make_configured_engine() -> *TelemetryEngine {
+    let p = TelemetryEngine::alloc_new()
+    let target_contract = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+    let oracles = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+    unsafe {
+        (*p).configure(
+                contract_hex: target_contract.span(),
+                oracles_csv: oracles.span(),
+            )
+    }
+    p
+}
+
+#[test]
+fn test_rpc_batch_generation_and_selectors() {
+    let p = make_configured_engine()
+    var batch = MemBuffer::empty()
+    unsafe {
+        (*p).build_rpc_batch(mut batch)
+        TelemetryEngine::free_ptr(p)
+    }
+    let s = batch.span()
+    assert!(contains_span(s, "\"method\":\"eth_chainId\"".span()))
+    assert!(contains_span(s, "\"method\":\"eth_blockNumber\"".span()))
+    assert!(
+        contains_span(s, "\"method\":\"eth_getBlockByNumber\"".span()),
+    )
+    assert!(contains_span(s, "0xda8fa900".span()))
+    assert!(contains_span(s, "0x8a19c8bc".span()))
+    assert!(contains_span(s, "0x8da5cb5b".span()))
+    assert!(
+        contains_span(
+            s,
+            "0xa97e5c93000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266".span(),
+        ),
+    )
+    assert!(
+        contains_span(
+            s,
+            "0xa97e5c930000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc".span(),
+        ),
+    )
+}
+
+#[test]
+fn test_rpc_ingest_and_price_formatting() {
+    var price_out = MemBuffer::empty()
+    format_price_decimal(
+        9_245_150_000_000,
+        decimals: 2,
+        with_commas: true,
+        mut price_out,
+    )
+    assert!(price_out.span() == "92,451.50")
+
+    var doge_out = MemBuffer::empty()
+    format_asset_price_usd(38_400_000, mut doge_out)
+    assert!(doge_out.span() == "$0.3840")
+
+    var sui_out = MemBuffer::empty()
+    format_asset_price_usd(415_200_000, mut sui_out)
+    assert!(sui_out.span() == "$4.152")
+
+    var bps_out = MemBuffer::empty()
+    let diff = signed_bps_diff(val: 9_337_601_500_000, base: 9_245_150_000_000)
+    assert!(diff == 100)
+    format_signed_bps(diff, mut bps_out)
+    assert!(bps_out.span() == "+100 bps")
+
+    let p = make_configured_engine()
+    let prices = sample_prices()
+
+    // Build latestPrices() 21-word response: 20 prices + timestamp 1795255391
+    var lp_res = MemBuffer::empty()
+    lp_res.extend_from("0x".span())
+    var ai: usize = 0
+    while ai < ASSET_COUNT {
+        push_word_u64(prices[ai], mut lp_res)
+        ai += 1
+    }
+    push_word_u64(1_795_255_391, mut lp_res)
+
+    var cr_res = MemBuffer::empty()
+    cr_res.extend_from("0x".span())
+    push_word_u64(3, mut cr_res)
+
+    var bool_true = MemBuffer::empty()
+    bool_true.extend_from("0x".span())
+    push_word_u64(1, mut bool_true)
+
+    let owner_word = "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+
+    let rpc_json = format!(
+        "[{\"id\":1,\"result\":\"0x7a69\"},",
+        "{\"id\":2,\"result\":\"0x0c\"},",
+        "{\"id\":3,\"result\":{\"timestamp\":\"0x6b02605f\"}},",
+        "{\"id\":4,\"result\":\"",
+        lp_res,
+        "\"},",
+        "{\"id\":5,\"result\":\"",
+        cr_res,
+        "\"},",
+        "{\"id\":6,\"result\":\"",
+        owner_word,
+        "\"},",
+        "{\"id\":7,\"result\":\"",
+        bool_true,
+        "\"},",
+        "{\"id\":8,\"result\":\"",
+        bool_true,
+        "\"},",
+        "{\"id\":9,\"result\":\"",
+        bool_true,
+        "\"}]",
+    )
+
+    unsafe {
+        let ok = (*p)
+            .ingest_rpc_batch(
+                payload: rpc_json.span(),
+                latency_ms: 4,
+                now_ms: 1_795_255_395_000,
+            )
+        assert!(ok)
+        assert!((*p).onchain.chain_id == 31337)
+        assert!((*p).onchain.block_number == 12)
+        assert!((*p).onchain.current_round == 3)
+        assert!((*p).onchain.latest_prices[0] == 9_245_150_000_000)
+        assert!((*p).onchain.latest_prices[1] == 342_050_000_000)
+        assert!((*p).onchain.latest_prices[19] == 31_850_000_000)
+        assert!((*p).onchain.last_updated == 1_795_255_391)
+        assert!((*p).nodes[0].is_authorized_onchain)
+        assert!((*p).nodes[1].is_authorized_onchain)
+        assert!((*p).nodes[2].is_authorized_onchain)
+        assert!((*p).rounds_len == 1)
+        assert!((*p).round_at(0).round_id == 2)
+        assert!((*p).round_at(0).expected_leader_idx == 2)
+        TelemetryEngine::free_ptr(p)
+    }
+}
+
+#[test]
+fn test_wire_quote_and_sig_decoding_with_breach_detection() {
+    let p = make_configured_engine()
+    let now_ms: u64 = 1_795_255_400_000
+
+    var outlier_eth = sample_prices()
+    outlier_eth[1] = 9_999_900_000_000
+    let normal_p = sample_prices()
+    var higher_eth = sample_prices()
+    higher_eth[1] = 342_210_000_000
+
+    let q0 = encode_quote_buf(
+        QuoteMsg { round_id: 3, timestamp: 1_795_255_398, prices: outlier_eth },
+    )
+    let q1 = encode_quote_buf(
+        QuoteMsg { round_id: 3, timestamp: 1_795_255_399, prices: normal_p },
+    )
+    let q2 = encode_quote_buf(
+        QuoteMsg { round_id: 3, timestamp: 1_795_255_400, prices: higher_eth },
+    )
+
+    var h0 = MemBuffer::empty()
+    var h1 = MemBuffer::empty()
+    var h2 = MemBuffer::empty()
+    push_hex_span(q0.span(), mut h0)
+    push_hex_span(q1.span(), mut h1)
+    push_hex_span(q2.span(), mut h2)
+
+    let p0 = "12D3KooWChB9WqepHyykxzjmhZtwTsPczyBBuuk1NiTgaBzw1111"
+    let p1 = "12D3KooWAAkGfNFGKZRVpL3GAesSVywyS6fWQVWQ3bmayaNj2222"
+    let p2 = "12D3KooWR7xpbJEyvTj5sf2HHRjf6tpY2noUve4bjGpUxKy73333"
+
+    unsafe {
+        assert!(
+            (*p).ingest_wire_frame(
+                    frame_hex: h0.span(),
+                    peer_tag: p0.span(),
+                    is_tx: true,
+                    now_ms,
+                ),
+        )
+        assert!(
+            (*p).ingest_wire_frame(
+                    frame_hex: h1.span(),
+                    peer_tag: p1.span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+        assert!(
+            (*p).ingest_wire_frame(
+                    frame_hex: h2.span(),
+                    peer_tag: p2.span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+        // Duplicate rebroadcast of 52-char PeerId does not inflate slot count
+        assert!(
+            (*p).ingest_wire_frame(
+                    frame_hex: h0.span(),
+                    peer_tag: p0.span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+
+        assert!((*p).active_wire_round == 3)
+        assert!((*p).wire_quote_count == 3)
+        assert!((*p).wire_quotes[0].rx_count == 2)
+        assert!((*p).wire_group_medians[0] == 9_245_150_000_000)
+        assert!((*p).wire_group_medians[1] == 342_210_000_000)
+        assert!((*p).wire_breach_detected)
+        assert!((*p).wire_breach_asset == 1)
+
+        var addr1: [u8; 20] = [0; 20]
+        addr1[0] = 0x70
+        addr1[19] = 0xc8
+        var addr2: [u8; 20] = [0; 20]
+        addr2[0] = 0x3c
+        addr2[19] = 0xbc
+        var r_arr: [u8; 32] = [0x11; 32]
+        var s_arr: [u8; 32] = [0x22; 32]
+
+        let sig1 = encode_sig_msg_buf(
+            SigMsg {
+                round_id: 3,
+                timestamp: 1_795_255_399,
+                median_prices: normal_p,
+                signer_addr: addr1,
+                v: 27,
+                r: r_arr,
+                s: s_arr,
+            },
+        )
+        let sig2 = encode_sig_msg_buf(
+            SigMsg {
+                round_id: 3,
+                timestamp: 1_795_255_399,
+                median_prices: normal_p,
+                signer_addr: addr2,
+                v: 28,
+                r: r_arr,
+                s: s_arr,
+            },
+        )
+        var sh1 = MemBuffer::empty()
+        var sh2 = MemBuffer::empty()
+        push_hex_span(sig1.span(), mut sh1)
+        push_hex_span(sig2.span(), mut sh2)
+
+        assert!(
+            (*p)
+                .ingest_wire_frame(
+                    frame_hex: sh1.span(),
+                    peer_tag: "peer-1".span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+        assert!(
+            (*p)
+                .ingest_wire_frame(
+                    frame_hex: sh1.span(),
+                    peer_tag: "peer-2".span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+        assert!(
+            (*p)
+                .ingest_wire_frame(
+                    frame_hex: sh2.span(),
+                    peer_tag: "peer-2".span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+
+        assert!((*p).wire_sig_count == 2)
+        assert!((*p).wire_sigs[0].rx_count == 2)
+
+        // Malformed hex increments decode error counter and returns false
+        assert!(
+            !(*p)
+                .ingest_wire_frame(
+                    frame_hex: "dead".span(),
+                    peer_tag: "peer-x".span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+        assert!((*p).total_wire_decode_errors == 1)
+        TelemetryEngine::free_ptr(p)
+    }
+}
+
+#[test]
+fn test_tx_meta_and_leader_failover_detection() {
+    let p = make_configured_engine()
+    unsafe {
+        // Round 1 expected leader is node 1 (0x7099...); node 2 (0x3C44...) submitting triggers failover
+        (*p)
+            .ingest_tx(
+                round_id: 1,
+                block_num: 10,
+                gas_used: 545000,
+                tx_count: 1,
+                submitter_hex: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC".span(),
+            )
+        assert!((*p).onchain.last_tx_gas == 545000)
+        assert!((*p).onchain.last_tx_failover)
+        assert!((*p).onchain.tx_invariant_ok)
+        assert!((*p).rounds_len == 1)
+        assert!((*p).round_at(0).expected_leader_idx == 1)
+        assert!((*p).round_at(0).actual_leader_idx == 2)
+        assert!((*p).round_at(0).failover)
+
+        // Round 2 normal leader is node 2
+        (*p)
+            .ingest_tx(
+                round_id: 2,
+                block_num: 11,
+                gas_used: 185200,
+                tx_count: 1,
+                submitter_hex: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC".span(),
+            )
+        assert!(!(*p).onchain.last_tx_failover)
+        assert!((*p).onchain.tx_invariant_ok)
+        TelemetryEngine::free_ptr(p)
+    }
+}
+
+#[test]
+fn test_node_status_ingest_and_renderers() {
+    let p = make_configured_engine()
+    let now_ms: u64 = 1_795_255_405_000
+    let status_json = format!(
+        "{\"node_id\":1,\"peer_id\":\"12D3Test\",\"p2p_port\":7002,\"peer_count\":2,",
+        "\"peers\":[\"p0\",\"p2\"],\"round_id\":3,\"phase\":\"settled\",",
+        "\"local_price\":9245150000000,\"group_median\":9245150000000,\"round_ts\":1795255400,",
+        "\"counters\":{\"quotes_tx\":3,\"quotes_rx\":4,\"sigs_tx\":2,\"sigs_rx\":4,\"tolerance_breaches\":1,\"submissions_ok\":1,\"submissions_err\":0,\"last_submit_ms\":18},",
+        "\"feeds\":[{\"provider\":\"hyperliquid\",\"addr\":\"127.0.0.1:9001\",\"price\":9245150000000,\"assets_ok\":20,\"ok\":true,\"latency_ms\":2}]}",
+    )
+
+    unsafe {
+        assert!(
+            (*p).ingest_node_status(node_id: 1, payload: status_json.span(), now_ms),
+        )
+        (*p).onchain.connected = true
+        (*p).onchain.chain_id = 31337
+        (*p).onchain.block_number = 15
+        (*p).onchain.current_round = 4
+        (*p).onchain.latest_prices = sample_prices()
+        (*p).onchain.last_updated = 1_795_255_400
+
+        var tui = MemBuffer::empty()
+        render_tui_into(*p, now_ms, ansi: false, mut tui)
+        assert!(contains_span(tui.span(), "BTC".span()))
+        assert!(contains_span(tui.span(), "ETH".span()))
+        assert!(contains_span(tui.span(), "SOL".span()))
+        assert!(contains_span(tui.span(), "AAVE".span()))
+        assert!(contains_span(tui.span(), "$92,451.50".span()))
+        assert!(
+            contains_span(
+                tui.span(),
+                "hyperliquid@127.0.0.1:9001=20/20 $92,451.50(2ms)".span(),
+            ),
+        )
+        assert!(contains_span(tui.span(), "ONLINE".span()))
+
+        var json_out = MemBuffer::empty()
+        render_json_into(*p, now_ms, mut json_out)
+        assert!(
+            contains_span(json_out.span(), "\"asset_count\":20".span()),
+        )
+        assert!(
+            contains_span(json_out.span(), "\"latest_price\":9245150000000".span()),
+        )
+        assert!(
+            contains_span(json_out.span(), "\"symbol\":\"AAVE\"".span()),
+        )
+        assert!(contains_span(json_out.span(), "\"assets_ok\":20".span()))
+        assert!(
+            contains_span(json_out.span(), "\"tolerance_breaches\":1".span()),
+        )
+
+        var prom_out = MemBuffer::empty()
+        render_prometheus_into(*p, now_ms, mut prom_out)
+        assert!(
+            contains_span(prom_out.span(), "feracle_asset_count 20".span()),
+        )
+        assert!(
+            contains_span(
+                prom_out.span(),
+                "feracle_latest_price_1e8 9245150000000".span(),
+            ),
+        )
+        assert!(
+            contains_span(
+                prom_out.span(),
+                "feracle_asset_price_1e8{asset=\"AAVE\"} 31850000000".span(),
+            ),
+        )
+        assert!(
+            contains_span(
+                prom_out.span(),
+                "feracle_feed_assets_ok{node=\"1\",provider=\"hyperliquid\"} 20".span(),
+            ),
+        )
+        assert!(
+            contains_span(
+                prom_out.span(),
+                "feracle_node_tolerance_breaches_total{node=\"1\"} 1".span(),
+            ),
+        )
+
+        TelemetryEngine::free_ptr(p)
+    }
+}

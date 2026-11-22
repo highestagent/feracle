@@ -1,0 +1,128 @@
+//! Fixed-capacity inline `Copy` string stored directly inside WASM linear memory.
+
+use feracle_core::to_ascii_lower
+
+pub struct FixedStr<const N: usize> { pub bytes: [u8; N], pub len: usize }
+
+impl<const N: usize> Copy for FixedStr<N> {}
+
+impl<const N: usize> FixedStr<N> {
+    pub fn empty() -> Self {
+        Self { bytes: [0; N], len: 0 }
+    }
+
+    pub fn from_span(_ s: MemSpan) -> Self {
+        var out = Self::empty()
+        out.set_from_span(s)
+        out
+    }
+
+    pub fn clear(mut self) {
+        self.len = 0
+    }
+
+    pub fn set_from_span(mut self, _ s: MemSpan) {
+        let copy_len = if s.len() < N { s.len() } else { N }
+        var i: usize = 0
+        while i < copy_len {
+            self.bytes[i] = s.byte_at(i)
+            i += 1
+        }
+        self.len = copy_len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn len(self) -> usize {
+        self.len
+    }
+
+    pub fn write_to(self, _ out: mut MemBuffer) {
+        var i: usize = 0
+        while i < self.len {
+            out.push(self.bytes[i])
+            i += 1
+        }
+    }
+
+    pub fn write_short_addr(self, _ out: mut MemBuffer) {
+        if self.len >= 12 {
+            var i: usize = 0
+            while i < 6 {
+                out.push(self.bytes[i])
+                i += 1
+            }
+            out.extend_from("..".span())
+            var j = self.len - 4
+            while j < self.len {
+                out.push(self.bytes[j])
+                j += 1
+            }
+        } else {
+            self.write_to(mut out)
+        }
+    }
+
+    pub fn write_json_escaped(self, _ out: mut MemBuffer) {
+        var i: usize = 0
+        while i < self.len {
+            let b = self.bytes[i]
+            if b == b'"' {
+                out.extend_from("\\\"".span())
+            } else if b == b'\\' {
+                out.extend_from("\\\\".span())
+            } else if b == b'\n' {
+                out.extend_from("\\n".span())
+            } else if b == b'\r' {
+                out.extend_from("\\r".span())
+            } else if b == b'\t' {
+                out.extend_from("\\t".span())
+            } else if b >= 0x20 { out.push(b) }
+            i += 1
+        }
+    }
+
+    pub fn equals_span(self, _ s: MemSpan) -> bool {
+        if self.len != s.len() {
+            return false
+        }
+        var i: usize = 0
+        while i < self.len {
+            if self.bytes[i] != s.byte_at(i) {
+                return false
+            }
+            i += 1
+        }
+        true
+    }
+
+    pub fn equals(self, _ other: Self) -> bool {
+        if self.len != other.len {
+            return false
+        }
+        var i: usize = 0
+        while i < self.len {
+            if self.bytes[i] != other.bytes[i] {
+                return false
+            }
+            i += 1
+        }
+        true
+    }
+
+    pub fn equals_ascii_ignore_case(self, _ s: MemSpan) -> bool {
+        if self.len != s.len() {
+            return false
+        }
+        var i: usize = 0
+        while i < self.len {
+            if to_ascii_lower(self.bytes[i]) != to_ascii_lower(s.byte_at(i)) {
+                return false
+            }
+            i += 1
+        }
+        true
+    }
+}
