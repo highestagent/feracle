@@ -1,0 +1,206 @@
+use core::num::IntDowncast
+use core::ptr
+
+extern {
+    fn p2p_telemetry_set_phase(
+        _ round_id: u64,
+        _ phase_ptr: *u8,
+        _ phase_len: usize,
+        _ local_prices_be160_ptr: *u8,
+        _ group_medians_be160_ptr: *u8,
+        _ round_ts: u64,
+    ) -> i32
+    fn p2p_telemetry_set_feed(
+        _ slot: u32,
+        _ provider_ptr: *u8,
+        _ provider_len: usize,
+        _ addr_ptr: *u8,
+        _ addr_len: usize,
+        _ price: u64,
+        _ assets_ok: u32,
+        _ ok: u32,
+        _ latency_ms: u64,
+    ) -> i32
+    fn p2p_telemetry_record_event(_ kind: u32, _ value: u64) -> i32
+    fn telemetry_start(
+        _ p2p_port: u32,
+        _ telemetry_port: u32,
+        _ node_id: u64,
+        _ peer_id_ptr: *u8,
+        _ peer_id_len: usize,
+    ) -> i32
+    fn telemetry_set_peers(_ peer_count: u32, _ peers_csv_ptr: *u8, _ peers_csv_len: usize) -> i32
+    fn telemetry_record_frame(
+        _ is_tx: u32,
+        _ peer_ptr: *u8,
+        _ peer_len: usize,
+        _ data_ptr: *u8,
+        _ data_len: usize,
+    ) -> i32
+    fn telemetry_stop() -> i32
+    fn crypto_keccak_and_sign(
+        _ privkey32_ptr: *u8,
+        _ chain_id: u64,
+        _ contract20_ptr: *u8,
+        _ round_id: u64,
+        _ prices_be160_ptr: *u8,
+        _ timestamp: u64,
+        _ out_addr20: *u8,
+        _ out_v: *u8,
+        _ out_r32: *u8,
+        _ out_s32: *u8,
+    ) -> i32
+}
+
+pub fn telemetry_set_phase(
+    round_id: u64,
+    phase: MemSpan,
+    local_prices: [u64; 20],
+    group_medians: [u64; 20],
+    round_ts: u64,
+) {
+    let local_buf = feracle_core::encode_prices_be160(local_prices)
+    let med_buf = feracle_core::encode_prices_be160(group_medians)
+    let _ = unsafe {
+        p2p_telemetry_set_phase(
+            round_id,
+            phase.ptr(),
+            phase.len(),
+            local_buf.ptr(),
+            med_buf.ptr(),
+            round_ts,
+        )
+    }
+}
+
+pub fn telemetry_set_feed(
+    slot: u32,
+    provider: MemSpan,
+    addr: MemSpan,
+    price: u64,
+    assets_ok: u32,
+    ok: bool,
+    latency_ms: u64,
+) {
+    let ok_flag: u32 = if ok { 1 } else { 0 }
+    let _ = unsafe {
+        p2p_telemetry_set_feed(
+            slot,
+            provider.ptr(),
+            provider.len(),
+            addr.ptr(),
+            addr.len(),
+            price,
+            assets_ok,
+            ok_flag,
+            latency_ms,
+        )
+    }
+}
+
+pub fn telemetry_record_event(kind: u32, value: u64) {
+    let _ = unsafe {
+        p2p_telemetry_record_event(kind, value)
+    }
+}
+
+pub fn start_telemetry_only(
+    p2p_port: u16,
+    telemetry_port: u16,
+    node_id: u64,
+    peer_id: MemSpan,
+) -> i32 {
+    unsafe {
+        telemetry_start(
+            p2p_port as u32,
+            telemetry_port as u32,
+            node_id,
+            peer_id.ptr(),
+            peer_id.len(),
+        )
+    }
+}
+
+pub fn set_telemetry_peers(peer_count: usize, peers_csv: MemSpan) {
+    let count_u32: u32 = peer_count.downcast_saturate()
+    let _ = unsafe {
+        telemetry_set_peers(count_u32, peers_csv.ptr(), peers_csv.len())
+    }
+}
+
+pub fn record_telemetry_frame(is_tx: bool, peer: MemSpan, data: MemSpan) {
+    let dir_flag: u32 = if is_tx { 1 } else { 0 }
+    let _ = unsafe {
+        telemetry_record_frame(dir_flag, peer.ptr(), peer.len(), data.ptr(), data.len())
+    }
+}
+
+pub fn stop_telemetry_only() {
+    let _ = unsafe {
+        telemetry_stop()
+    }
+}
+
+pub fn sign_digest(
+    privkey32: MemSpan,
+    chain_id: u64,
+    contract20: MemSpan,
+    round_id: u64,
+    prices: [u64; 20],
+    timestamp: u64,
+) -> Option<feracle_core::SigMsg> {
+    if privkey32.len() != 32 || contract20.len() != 20 {
+        return Option::None
+    }
+    let prices_buf = feracle_core::encode_prices_be160(prices)
+    var addr_buf = MemBuffer::new(20)
+    var v_buf = MemBuffer::new(1)
+    var r_buf = MemBuffer::new(32)
+    var s_buf = MemBuffer::new(32)
+
+    let rc = unsafe {
+        crypto_keccak_and_sign(
+            privkey32.ptr(),
+            chain_id,
+            contract20.ptr(),
+            round_id,
+            prices_buf.ptr(),
+            timestamp,
+            addr_buf.ptr(),
+            v_buf.ptr(),
+            r_buf.ptr(),
+            s_buf.ptr(),
+        )
+    }
+    if rc != 0 {
+        return Option::None
+    }
+
+    var signer_addr: [u8; 20] = [0; 20]
+    var i: usize = 0
+    while i < 20 {
+        signer_addr[i] = addr_buf[i]
+        i += 1
+    }
+
+    var r: [u8; 32] = [0; 32]
+    var s: [u8; 32] = [0; 32]
+    var j: usize = 0
+    while j < 32 {
+        r[j] = r_buf[j]
+        s[j] = s_buf[j]
+        j += 1
+    }
+
+    Option::Some(
+        feracle_core::SigMsg {
+            round_id,
+            timestamp,
+            median_prices: prices,
+            signer_addr,
+            v: v_buf[0],
+            r,
+            s,
+        },
+    )
+}

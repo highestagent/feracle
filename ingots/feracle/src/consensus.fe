@@ -1,0 +1,463 @@
+//! Core oracle consensus round loop.
+
+use core::num::IntDowncast
+use std::io::{Stderr, Stdout}
+use std::net::Net
+use std::process::Spawn
+use std::time::Clock
+use feracle_core::{
+    MAX_TOLERANCE_BPS,
+    NODE_COUNT,
+    QuoteMsg,
+    SigMsg,
+    add_sig_dedup,
+    encode_quote_buf,
+    encode_sig_msg_buf,
+    first_tolerance_breach_asset,
+    leader_index,
+    median_prices_3,
+    median_u64,
+    prices_eq,
+    sort_three_sigs,
+    write_asset_symbol,
+}
+use super::config::NodeConfig
+use super::feeds::{FeedReport, feed_kind_name, fetch_local_medians_detailed}
+use super::ffi
+use super::network::PeerSession
+use super::round_io::{poll_all_messages, wait_for_quotes, wait_for_settlement, wait_for_sigs}
+use super::submit::{query_current_round, query_latest_prices, submit_medians}
+
+fn emit_feed_reports(_ reports: MemVec<FeedReport>) {
+    var i: usize = 0
+    while i < reports.len() && i < 8 {
+        let rep = reports[i]
+        let provider_buf = feed_kind_name(rep.kind)
+        let addr_buf = format!(rep.addr)
+        ffi::telemetry_set_feed(
+            slot: i.downcast_unchecked(),
+            provider: provider_buf.span(),
+            addr: addr_buf.span(),
+            price: rep.price,
+            assets_ok: rep.assets_ok,
+            ok: rep.ok,
+            latency_ms: rep.latency_ms,
+        )
+        i += 1
+    }
+}
+
+pub fn run(config: NodeConfig, _ peer: mut PeerSession) -> i32
+uses (out: mut Stdout, err: mut Stderr, net: mut Net, clock: Clock, proc: mut Spawn)
+{
+    var pending_quotes = MemVec<QuoteMsg>::new()
+    var pending_sigs = MemVec<SigMsg>::new()
+    var scratch = MemBuffer::with_capacity(512)
+    var completed_rounds: u64 = 0
+    var fallback_round: u64 = 1
+    let zero_prices: [u64; 20] = [0; 20]
+
+    while config.rounds == 0 || completed_rounds < config.rounds {
+        let round_id = match query_current_round(
+            rpc_addr: config.rpc_addr,
+            contract_0x: config.contract_0x.span(),
+        ) {
+            Option::Some(r) => r,
+            Option::None => {
+                eprintln!(
+                    "node ",
+                    config.node_id,
+                    " warning: failed to query currentRound, using fallback=",
+                    fallback_round,
+                )
+                fallback_round
+            },
+        }
+        let last_updated: u64 = match query_latest_prices(
+            rpc_addr: config.rpc_addr,
+            contract_0x: config.contract_0x.span(),
+        ) {
+            Option::Some((_, ts)) => ts,
+            Option::None => 0,
+        }
+
+        while clock.now().as_secs() <= last_updated {
+            peer.step(timeout_ms: 100)
+        }
+
+        println!("node ", config.node_id, " starting round ", round_id)
+        ffi::telemetry_record_event(kind: 4, value: 0)
+        ffi::telemetry_set_phase(
+            round_id,
+            phase: "fetching".span(),
+            local_prices: zero_prices,
+            group_medians: zero_prices,
+            round_ts: 0,
+        )
+
+        var feed_reports = MemVec<FeedReport>::new()
+        var local_prices_opt: Option<[u64; 20]> = Option::None
+        var fetch_try: usize = 0
+        while fetch_try < 3 {
+            local_prices_opt = fetch_local_medians_detailed(
+                config.sources.as_slice(),
+                mut feed_reports,
+            )
+            if local_prices_opt.is_some() {
+                break
+            }
+            peer.step(timeout_ms: 250)
+            peer.step(timeout_ms: 250)
+            fetch_try += 1
+        }
+        emit_feed_reports(feed_reports)
+
+        let local_prices = match local_prices_opt {
+            Option::Some(p) => p,
+            Option::None => {
+                eprintln!(
+                    "node ",
+                    config.node_id,
+                    " round ",
+                    round_id,
+                    " error: incomplete price feeds for 20-asset basket",
+                )
+                ffi::telemetry_set_phase(
+                    round_id,
+                    phase: "feed_error".span(),
+                    local_prices: zero_prices,
+                    group_medians: zero_prices,
+                    round_ts: 0,
+                )
+                completed_rounds += 1
+                peer.step(timeout_ms: 500)
+                peer.step(timeout_ms: 500)
+                continue
+            },
+        }
+        let local_ts = clock.now().as_secs()
+        println!(
+            "node ",
+            config.node_id,
+            " round ",
+            round_id,
+            " local_btc=",
+            local_prices[0],
+            " eth=",
+            local_prices[1],
+            " ts=",
+            local_ts,
+        )
+
+        // Phase A: Quote Gossip
+        ffi::telemetry_set_phase(
+            round_id,
+            phase: "phase_a_quotes".span(),
+            local_prices,
+            group_medians: zero_prices,
+            round_ts: local_ts,
+        )
+        let self_quote = QuoteMsg { round_id, timestamp: local_ts, prices: local_prices }
+        var quotes = MemVec<QuoteMsg>::new()
+        quotes.push(self_quote)
+
+        var next_pending_quotes = MemVec<QuoteMsg>::new()
+        var pq_i: usize = 0
+        while pq_i < pending_quotes.len() {
+            let q = pending_quotes[pq_i]
+            if q.round_id == round_id && quotes.len() < 3 {
+                quotes.push(q)
+            } else if q.round_id > round_id {
+                next_pending_quotes.push(q)
+            }
+            pq_i += 1
+        }
+        pending_quotes = next_pending_quotes
+
+        let quote_frame = encode_quote_buf(self_quote)
+        let _ = peer.publish(quote_frame.span())
+        wait_for_quotes(
+            config,
+            mut peer,
+            round_id,
+            quote_frame: quote_frame.span(),
+            mut quotes,
+            mut pending_quotes,
+            mut pending_sigs,
+            mut scratch,
+        )
+
+        if quotes.len() < 3 {
+            eprintln!(
+                "node ",
+                config.node_id,
+                " round ",
+                round_id,
+                " timed out in Phase A with ",
+                quotes.len(),
+                " quotes",
+            )
+            ffi::telemetry_set_phase(
+                round_id,
+                phase: "timeout_phase_a".span(),
+                local_prices,
+                group_medians: zero_prices,
+                round_ts: local_ts,
+            )
+            completed_rounds += 1
+            continue
+        }
+
+        // Phase B: Multi-Asset Median Agreement & Tolerance Check
+        let group_medians = median_prices_3(quotes[0].prices, quotes[1].prices, quotes[2].prices)
+        let round_ts = median_u64(
+            [quotes[0].timestamp, quotes[1].timestamp, quotes[2].timestamp],
+        )
+
+        if let Option::Some(bad_idx) = first_tolerance_breach_asset(
+            local: local_prices,
+            proposed: group_medians,
+            max_bps: MAX_TOLERANCE_BPS,
+        ) {
+            var sym = MemBuffer::empty()
+            write_asset_symbol(bad_idx, mut sym)
+            eprintln!(
+                "node ",
+                config.node_id,
+                " round ",
+                round_id,
+                " tolerance guard breached on ",
+                sym,
+                " (asset=",
+                bad_idx,
+                "): local=",
+                local_prices[bad_idx],
+                " proposed=",
+                group_medians[bad_idx],
+            )
+            ffi::telemetry_record_event(kind: 1, value: bad_idx.downcast_unchecked())
+            ffi::telemetry_set_phase(
+                round_id,
+                phase: "tolerance_breach".span(),
+                local_prices,
+                group_medians,
+                round_ts,
+            )
+            var dummy_sigs = MemVec<SigMsg>::new()
+            let wait_start = clock.instant()
+            while clock.instant().duration_since(wait_start).as_secs() < config.round_timeout_secs {
+                poll_all_messages(
+                    mut peer,
+                    round_id,
+                    mut quotes,
+                    mut pending_quotes,
+                    mut dummy_sigs,
+                    mut pending_sigs,
+                    accept_sigs: false,
+                    expected_prices: zero_prices,
+                    expected_ts: 0,
+                    mut scratch,
+                )
+                if let Option::Some(r) = query_current_round(
+                    rpc_addr: config.rpc_addr,
+                    contract_0x: config.contract_0x.span(),
+                ) {
+                    if r > round_id {
+                        fallback_round = r
+                        break
+                    }
+                }
+                peer.step(timeout_ms: 150)
+            }
+            completed_rounds += 1
+            continue
+        }
+
+        let self_sig = match ffi::sign_digest(
+            privkey32: config.privkey32.span(),
+            chain_id: config.chain_id,
+            contract20: config.contract20.span(),
+            round_id,
+            prices: group_medians,
+            timestamp: round_ts,
+        ) {
+            Option::Some(s) => s,
+            Option::None => {
+                eprintln!(
+                    "node ",
+                    config.node_id,
+                    " round ",
+                    round_id,
+                    " failed to sign digest",
+                )
+                completed_rounds += 1
+                continue
+            },
+        }
+
+        var sigs = MemVec<SigMsg>::new()
+        add_sig_dedup(mut sigs, self_sig)
+        var next_pending_sigs = MemVec<SigMsg>::new()
+        var ps_i: usize = 0
+        while ps_i < pending_sigs.len() {
+            let s = pending_sigs[ps_i]
+            if s.round_id == round_id
+                && prices_eq(s.median_prices, group_medians)
+                && s.timestamp == round_ts {
+                add_sig_dedup(mut sigs, s)
+            } else if s.round_id > round_id {
+                add_sig_dedup(mut next_pending_sigs, s)
+            }
+            ps_i += 1
+        }
+        pending_sigs = next_pending_sigs
+
+        let sig_frame = encode_sig_msg_buf(self_sig)
+        let _ = peer.publish(sig_frame.span())
+        ffi::telemetry_set_phase(
+            round_id,
+            phase: "phase_c_sigs".span(),
+            local_prices,
+            group_medians,
+            round_ts,
+        )
+        wait_for_sigs(
+            config,
+            mut peer,
+            round_id,
+            sig_frame: sig_frame.span(),
+            expected_prices: group_medians,
+            expected_ts: round_ts,
+            mut quotes,
+            mut pending_quotes,
+            mut sigs,
+            mut pending_sigs,
+            mut scratch,
+        )
+
+        if sigs.len() < 3 {
+            eprintln!(
+                "node ",
+                config.node_id,
+                " round ",
+                round_id,
+                " timed out in Phase C with ",
+                sigs.len(),
+                " sigs",
+            )
+            ffi::telemetry_set_phase(
+                round_id,
+                phase: "timeout_phase_c".span(),
+                local_prices,
+                group_medians,
+                round_ts,
+            )
+            completed_rounds += 1
+            continue
+        }
+
+        let sorted_sigs = sort_three_sigs([sigs[0], sigs[1], sigs[2]])
+        let primary_leader = leader_index(round_id, node_count: NODE_COUNT)
+        let backup_leader = leader_index(round_id: round_id + 1, node_count: NODE_COUNT)
+
+        var submitted = false
+        if config.node_id == primary_leader {
+            println!(
+                "node ",
+                config.node_id,
+                " is leader for round ",
+                round_id,
+                ", submitting 20 medians btc=",
+                group_medians[0],
+            )
+            ffi::telemetry_set_phase(
+                round_id,
+                phase: "submitting".span(),
+                local_prices,
+                group_medians,
+                round_ts,
+            )
+            let sub_start = clock.instant()
+            let ok = submit_medians(
+                rpc_url: config.rpc_url.span(),
+                privkey_0x: config.privkey_0x.span(),
+                contract_0x: config.contract_0x.span(),
+                round_id,
+                prices: group_medians,
+                timestamp: round_ts,
+                sigs: sorted_sigs,
+            )
+            let sub_ms = clock.instant().duration_since(sub_start).as_millis()
+            ffi::telemetry_record_event(kind: if ok { 2 } else { 3 }, value: sub_ms)
+            submitted = ok
+        } else {
+            println!(
+                "node ",
+                config.node_id,
+                " waiting for leader ",
+                primary_leader,
+                " to settle round ",
+                round_id,
+            )
+        }
+
+        ffi::telemetry_set_phase(
+            round_id,
+            phase: "settling".span(),
+            local_prices,
+            group_medians,
+            round_ts,
+        )
+        let (settled, next_round) = wait_for_settlement(
+            config,
+            mut peer,
+            round_id,
+            sig_frame: sig_frame.span(),
+            group_medians,
+            round_ts,
+            sorted_sigs,
+            submitted_init: submitted,
+            backup_leader,
+            mut quotes,
+            mut pending_quotes,
+            mut sigs,
+            mut pending_sigs,
+            mut scratch,
+        )
+        if settled {
+            fallback_round = next_round
+            println!(
+                "node ",
+                config.node_id,
+                " confirmed round ",
+                round_id,
+                " settled on-chain",
+            )
+            ffi::telemetry_set_phase(
+                round_id,
+                phase: "settled".span(),
+                local_prices,
+                group_medians,
+                round_ts,
+            )
+        } else {
+            eprintln!(
+                "node ",
+                config.node_id,
+                " round ",
+                round_id,
+                " did not confirm within timeout",
+            )
+            ffi::telemetry_set_phase(
+                round_id,
+                phase: "timeout_settle".span(),
+                local_prices,
+                group_medians,
+                round_ts,
+            )
+        }
+        completed_rounds += 1
+    }
+
+    0
+}

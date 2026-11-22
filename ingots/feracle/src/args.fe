@@ -1,0 +1,115 @@
+//! CLI `FromArg` decoders for oracle node flags.
+
+use std::net::SocketAddr
+use cli::FromArg
+use feracle_core::parse_fixed_hex
+use super::feeds::{FeedKind, FeedSource}
+
+pub enum PeerBackend {
+    Libp2p,
+    Tcp,
+    Udp,
+}
+
+impl Copy for PeerBackend {}
+
+impl FromArg for PeerBackend {
+    fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
+        if raw_span == "libp2p" {
+            Result::Ok(PeerBackend::Libp2p)
+        } else if raw_span == "tcp" {
+            Result::Ok(PeerBackend::Tcp)
+        } else if raw_span == "udp" {
+            Result::Ok(PeerBackend::Udp)
+        } else {
+            Result::Err(format!("expected p2p backend: libp2p, tcp, or udp"))
+        }
+    }
+}
+
+pub struct HexKey32 { pub raw: MemBuffer, pub prefixed: MemBuffer }
+
+impl FromArg for HexKey32 {
+    fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
+        match parse_fixed_hex(raw_span, expected_bytes: 32) {
+            Option::Some((raw, prefixed)) => Result::Ok(Self { raw, prefixed }),
+            Option::None => Result::Err(format!("expected 32-byte hex private key")),
+        }
+    }
+}
+
+pub struct HexAddr20 { pub raw: MemBuffer, pub prefixed: MemBuffer }
+
+impl FromArg for HexAddr20 {
+    fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
+        match parse_fixed_hex(raw_span, expected_bytes: 20) {
+            Option::Some((raw, prefixed)) => Result::Ok(Self { raw, prefixed }),
+            Option::None => Result::Err(format!("expected 20-byte hex EVM address")),
+        }
+    }
+}
+
+pub struct RpcEndpoint { pub url: MemBuffer, pub addr: SocketAddr }
+
+impl FromArg for RpcEndpoint {
+    fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
+        let start: usize = if raw_span.starts_with("http://") {
+            7
+        } else if raw_span.starts_with("https://") {
+            8
+        } else {
+            0
+        }
+        let after_scheme = raw_span.tail(start)
+        let host_len = match after_scheme.index_of(b'/') {
+            Option::Some(slash) => slash,
+            Option::None => after_scheme.len(),
+        }
+        let Option::Some(addr) = SocketAddr::parse(after_scheme.head(host_len)) else {
+            return Result::Err(
+                format!("expected URL with IP:PORT (e.g. http://127.0.0.1:8545)"),
+            )
+        }
+        Result::Ok(Self { url: MemBuffer::from_span(raw_span), addr })
+    }
+}
+
+pub struct FeedSources { pub list: MemVec<FeedSource> }
+
+impl FromArg for FeedSources {
+    fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
+        var out = MemVec<FeedSource>::new()
+        for part in raw_span.split(b',') {
+            let entry = part.trim()
+            if entry.is_empty() {
+                continue
+            }
+            let Option::Some(eq_pos) = entry.index_of(b'=') else {
+                return Result::Err(format!("expected provider=host:port entries"))
+            }
+            let kind_span = entry.head(eq_pos).trim()
+            let addr_span = entry.tail(eq_pos + 1).trim()
+            let kind = if kind_span == "hyperliquid" {
+                FeedKind::Hyperliquid
+            } else if kind_span == "binance" {
+                FeedKind::Binance
+            } else if kind_span == "coinbase" {
+                FeedKind::Coinbase
+            } else {
+                return Result::Err(
+                    format!(
+                        "unknown provider (expected hyperliquid, binance, or coinbase)",
+                    ),
+                )
+            }
+            let Option::Some(addr) = SocketAddr::parse(addr_span) else {
+                return Result::Err(format!("invalid source IP:PORT address"))
+            }
+            out.push(FeedSource { kind, addr })
+        }
+        if out.is_empty() {
+            return Result::Err(format!("at least one price feed source is required"))
+        }
+        Result::Ok(Self { list: out })
+    }
+}

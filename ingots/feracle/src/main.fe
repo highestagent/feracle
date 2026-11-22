@@ -1,0 +1,84 @@
+//! Oracle node binary entrypoint.
+
+use std::env::{Args, Env}
+use std::io::{Stderr, Stdout}
+use std::net::Net
+use std::process::Spawn
+use std::time::Clock
+use cli::{Cli, Matches}
+use super::config::{build_cli, load_config}
+use super::consensus
+use super::network::PeerSession
+
+pub fn run() -> i32
+uses (
+    args: Args,
+    env: Env,
+    out: mut Stdout,
+    err: mut Stderr,
+    net: mut Net,
+    clock: Clock,
+    proc: mut Spawn,
+)
+{
+    build_cli()
+        .run(
+            |matches: Matches| -> i32 {
+                let config = match (with (Cli = matches) {
+                    load_config()
+                }) {
+                    Result::Ok(cfg) => cfg,
+                    Result::Err(cli_err) => {
+                        eprintln!(cli_err)
+                        return cli_err.exit_code()
+                    },
+                }
+
+                let label = PeerSession::backend_label(config.p2p_backend)
+                println!(
+                    "node ",
+                    config.node_id,
+                    " starting ",
+                    label,
+                    " on port ",
+                    config.p2p_port,
+                )
+                var peer = match PeerSession::start(config) {
+                    Result::Ok(s) => s,
+                    Result::Err(err_msg) => {
+                        eprintln!(err_msg)
+                        return 1
+                    },
+                }
+                if config.telemetry_port > 0 {
+                    println!(
+                        "node ",
+                        config.node_id,
+                        " telemetry HTTP/SSE listening on 127.0.0.1:",
+                        config.telemetry_port,
+                    )
+                }
+
+                // Wait up to 5s for 2 direct peers, or up to 15s total for >= 1 peer.
+                let mesh_wait_start = clock.instant()
+                while true {
+                    let peers = peer.peer_count()
+                    let elapsed = clock.instant().duration_since(mesh_wait_start).as_secs()
+                    if peers >= 2 || (elapsed >= 5 && peers >= 1) || elapsed >= 15 {
+                        break
+                    }
+                    peer.step(timeout_ms: 50)
+                }
+                println!(
+                    "node ",
+                    config.node_id,
+                    " mesh ready with peer_count=",
+                    peer.peer_count(),
+                )
+
+                let exit_code = consensus::run(config, mut peer)
+                peer.stop()
+                exit_code
+            },
+        )
+}

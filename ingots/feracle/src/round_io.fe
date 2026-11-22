@@ -1,0 +1,226 @@
+//! Round gossip polling, signature sorting, and phase wait loops.
+
+use std::io::{Stderr, Stdout}
+use std::net::Net
+use std::process::Spawn
+use std::time::Clock
+use feracle_core::{QuoteMsg, SigMsg, add_sig_dedup, decode_quote, decode_sig_msg, prices_eq}
+use super::config::NodeConfig
+use super::ffi
+use super::network::PeerSession
+use super::submit::{query_current_round, submit_medians}
+
+pub fn poll_all_messages(
+    peer: mut PeerSession,
+    round_id: u64,
+    _ quotes: mut MemVec<QuoteMsg>,
+    _ pending_quotes: mut MemVec<QuoteMsg>,
+    _ sigs: mut MemVec<SigMsg>,
+    _ pending_sigs: mut MemVec<SigMsg>,
+    accept_sigs: bool,
+    expected_prices: [u64; 20],
+    expected_ts: u64,
+    _ scratch: mut MemBuffer,
+) {
+    while peer.poll_into(mut scratch) {
+        let span = scratch.span()
+        match decode_quote(span) {
+            Option::Some(q) => {
+                if q.round_id == round_id {
+                    if quotes.len() < 3 {
+                        quotes.push(q)
+                    }
+                } else if q.round_id > round_id {
+                    pending_quotes.push(q)
+                }
+            },
+            Option::None => {
+                if let Option::Some(s) = decode_sig_msg(span) {
+                    if s.round_id == round_id {
+                        if accept_sigs
+                            && prices_eq(s.median_prices, expected_prices)
+                            && s.timestamp == expected_ts {
+                            add_sig_dedup(mut sigs, s)
+                        } else if !accept_sigs {
+                            add_sig_dedup(mut pending_sigs, s)
+                        }
+                    } else if s.round_id > round_id {
+                        add_sig_dedup(mut pending_sigs, s)
+                    }
+                }
+            },
+        }
+    }
+}
+
+pub fn wait_for_quotes(
+    config: NodeConfig,
+    peer: mut PeerSession,
+    round_id: u64,
+    quote_frame: MemSpan,
+    quotes: mut MemVec<QuoteMsg>,
+    pending_quotes: mut MemVec<QuoteMsg>,
+    pending_sigs: mut MemVec<SigMsg>,
+    scratch: mut MemBuffer,
+)
+uses (net: mut Net, clock: Clock)
+{
+    let zero_prices: [u64; 20] = [0; 20]
+    var dummy_sigs = MemVec<SigMsg>::new()
+    let start = clock.instant()
+    var last_pub = start
+    while quotes.len() < 3 {
+        let now_inst = clock.instant()
+        if now_inst.duration_since(start).as_secs() >= config.round_timeout_secs {
+            break
+        }
+        if now_inst.duration_since(last_pub).as_secs() >= 2 {
+            let _ = peer.publish(quote_frame)
+            last_pub = now_inst
+        }
+        poll_all_messages(
+            mut peer,
+            round_id,
+            mut quotes,
+            mut pending_quotes,
+            mut dummy_sigs,
+            mut pending_sigs,
+            accept_sigs: false,
+            expected_prices: zero_prices,
+            expected_ts: 0,
+            mut scratch,
+        )
+        if quotes.len() >= 3 { break }
+        peer.step(timeout_ms: 50)
+    }
+}
+
+pub fn wait_for_sigs(
+    config: NodeConfig,
+    peer: mut PeerSession,
+    round_id: u64,
+    sig_frame: MemSpan,
+    expected_prices: [u64; 20],
+    expected_ts: u64,
+    quotes: mut MemVec<QuoteMsg>,
+    pending_quotes: mut MemVec<QuoteMsg>,
+    sigs: mut MemVec<SigMsg>,
+    pending_sigs: mut MemVec<SigMsg>,
+    scratch: mut MemBuffer,
+)
+uses (net: mut Net, clock: Clock)
+{
+    let start = clock.instant()
+    var last_pub = start
+    while sigs.len() < 3 {
+        let now_inst = clock.instant()
+        if now_inst.duration_since(start).as_secs() >= config.round_timeout_secs {
+            break
+        }
+        if now_inst.duration_since(last_pub).as_secs() >= 2 {
+            let _ = peer.publish(sig_frame)
+            last_pub = now_inst
+        }
+        poll_all_messages(
+            mut peer,
+            round_id,
+            mut quotes,
+            mut pending_quotes,
+            mut sigs,
+            mut pending_sigs,
+            accept_sigs: true,
+            expected_prices,
+            expected_ts,
+            mut scratch,
+        )
+        if sigs.len() >= 3 { break }
+        peer.step(timeout_ms: 50)
+    }
+}
+
+pub fn wait_for_settlement(
+    config: NodeConfig,
+    peer: mut PeerSession,
+    round_id: u64,
+    sig_frame: MemSpan,
+    group_medians: [u64; 20],
+    round_ts: u64,
+    sorted_sigs: [SigMsg; 3],
+    submitted_init: bool,
+    backup_leader: u64,
+    quotes: mut MemVec<QuoteMsg>,
+    pending_quotes: mut MemVec<QuoteMsg>,
+    sigs: mut MemVec<SigMsg>,
+    pending_sigs: mut MemVec<SigMsg>,
+    scratch: mut MemBuffer,
+) -> (bool, u64)
+uses (out: mut Stdout, err: mut Stderr, net: mut Net, clock: Clock, proc: mut Spawn)
+{
+    let start = clock.instant()
+    var last_pub = start
+    var submitted = submitted_init
+    while true {
+        let now_inst = clock.instant()
+        let elapsed = now_inst.duration_since(start).as_secs()
+        if now_inst.duration_since(last_pub).as_secs() >= 2 {
+            let _ = peer.publish(sig_frame)
+            last_pub = now_inst
+        }
+        poll_all_messages(
+            mut peer,
+            round_id,
+            mut quotes,
+            mut pending_quotes,
+            mut sigs,
+            mut pending_sigs,
+            accept_sigs: true,
+            expected_prices: group_medians,
+            expected_ts: round_ts,
+            mut scratch,
+        )
+
+        if let Option::Some(onchain_round) = query_current_round(
+            rpc_addr: config.rpc_addr,
+            contract_0x: config.contract_0x.span(),
+        ) {
+            if onchain_round > round_id {
+                return (true, onchain_round)
+            }
+        }
+
+        if elapsed >= config.round_timeout_secs && !submitted && config.node_id == backup_leader {
+            eprintln!(
+                "node ",
+                config.node_id,
+                " failover submitting round ",
+                round_id,
+            )
+            ffi::telemetry_set_phase(
+                round_id,
+                phase: "failover_submitting".span(),
+                local_prices: group_medians,
+                group_medians,
+                round_ts,
+            )
+            let fb_start = clock.instant()
+            let ok = submit_medians(
+                rpc_url: config.rpc_url.span(),
+                privkey_0x: config.privkey_0x.span(),
+                contract_0x: config.contract_0x.span(),
+                round_id,
+                prices: group_medians,
+                timestamp: round_ts,
+                sigs: sorted_sigs,
+            )
+            let fb_ms = clock.instant().duration_since(fb_start).as_millis()
+            ffi::telemetry_record_event(kind: if ok { 2 } else { 3 }, value: fb_ms)
+            submitted = ok
+        }
+
+        if elapsed >= config.round_timeout_secs * 2 {
+            return (false, 0)
+        }
+        peer.step(timeout_ms: 150)
+    }
+    (false, 0)
+}

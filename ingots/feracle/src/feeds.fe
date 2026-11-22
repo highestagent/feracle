@@ -1,0 +1,257 @@
+use core::num::IntDowncast
+use std::io::Stderr
+use std::net::{Net, SocketAddr}
+use std::time::Clock
+use feracle_core::{
+    ASSET_COUNT,
+    asset_id_from_symbol,
+    json_get_str_bounds,
+    json_next_array_elem,
+    median_of_three,
+    parse_decimal_1e8_span,
+    write_asset_symbol,
+}
+use super::http::http_request
+
+pub enum FeedKind {
+    Hyperliquid,
+    Binance,
+    Coinbase,
+}
+
+impl Copy for FeedKind {}
+
+pub fn feed_kind_name(_ kind: FeedKind) -> MemBuffer {
+    match kind {
+        FeedKind::Hyperliquid => format!("hyperliquid"),
+        FeedKind::Binance => format!("binance"),
+        FeedKind::Coinbase => format!("coinbase"),
+    }
+}
+
+pub struct FeedSource { pub kind: FeedKind, pub addr: SocketAddr }
+
+impl Copy for FeedSource {}
+
+pub struct FeedReport {
+    pub kind: FeedKind,
+    pub addr: SocketAddr,
+    pub price: u64,
+    pub assets_ok: u32,
+    pub ok: bool,
+    pub latency_ms: u64,
+}
+
+impl Copy for FeedReport {}
+
+fn fetch_hyperliquid_all(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
+uses (net: mut Net)
+{
+    let hl_body = "{\"type\":\"allMids\"}"
+    let req = format!(
+        "POST /info HTTP/1.1\r\nHost: ",
+        source.addr,
+        "\r\nContent-Type: application/json\r\nContent-Length: ",
+        hl_body.len(),
+        "\r\nConnection: close\r\n\r\n",
+        hl_body,
+    )
+    let Option::Some(body) = http_request(addr: source.addr, request_bytes: req.span()) else {
+        return 0
+    }
+    var count: u32 = 0
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        var sym = MemBuffer::with_capacity(8)
+        write_asset_symbol(i, mut sym)
+        if let Option::Some((off, len)) = json_get_str_bounds(body.span(), sym.span()) {
+            let val_span = body.span().slice(offset: off, len)
+            if let Option::Some(price) = parse_decimal_1e8_span(val_span) {
+                if price > 0 {
+                    out_prices[i] = price
+                    count += 1
+                }
+            }
+        }
+        i += 1
+    }
+    count
+}
+
+fn fetch_binance_all(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
+uses (net: mut Net)
+{
+    var req = MemBuffer::with_capacity(512)
+    req.extend_from("GET /api/v3/ticker/price?symbols=%5B".span())
+    var idx: usize = 0
+    while idx < ASSET_COUNT {
+        if idx > 0 { req.push(b',') }
+        req.extend_from("%22".span())
+        write_asset_symbol(idx, mut req)
+        req.extend_from("USDT%22".span())
+        idx += 1
+    }
+    write!(
+        mut req,
+        "%5D HTTP/1.1\r\nHost: ",
+        source.addr,
+        "\r\nConnection: close\r\n\r\n",
+    )
+
+    let Option::Some(body) = http_request(addr: source.addr, request_bytes: req.span()) else {
+        return 0
+    }
+    let span = body.span()
+    var count: u32 = 0
+    var cursor: usize = 0
+    while true {
+        let Option::Some((obj_off, obj_len)) = json_next_array_elem(span, mut cursor) else {
+            break
+        }
+        let obj = span.slice(offset: obj_off, len: obj_len)
+        if let Option::Some((soff, slen)) = json_get_str_bounds(obj, "symbol".span()) {
+            let sym_full = obj.slice(offset: soff, len: slen)
+            if sym_full.len() > 4 && sym_full.ends_with("USDT") {
+                let base_sym = sym_full.head(sym_full.len() - 4)
+                if let Option::Some(asset_id) = asset_id_from_symbol(base_sym) {
+                    if let Option::Some((poff, plen)) = json_get_str_bounds(obj, "price".span()) {
+                        let p_span = obj.slice(offset: poff, len: plen)
+                        if let Option::Some(price) = parse_decimal_1e8_span(p_span) {
+                            if price > 0 && out_prices[asset_id] == 0 {
+                                out_prices[asset_id] = price
+                                count += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+fn fetch_coinbase_all(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
+uses (net: mut Net)
+{
+    var count: u32 = 0
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        var req = MemBuffer::with_capacity(160)
+        req.extend_from("GET /products/".span())
+        write_asset_symbol(i, mut req)
+        write!(
+            mut req,
+            "-USD/ticker HTTP/1.1\r\nHost: ",
+            source.addr,
+            "\r\nUser-Agent: fe-oracle/1.0\r\nConnection: close\r\n\r\n",
+        )
+        if let Option::Some(body) = http_request(addr: source.addr, request_bytes: req.span()) {
+            if let Option::Some((off, len)) = json_get_str_bounds(body.span(), "price".span()) {
+                let val_span = body.span().slice(offset: off, len)
+                if let Option::Some(price) = parse_decimal_1e8_span(val_span) {
+                    if price > 0 {
+                        out_prices[i] = price
+                        count += 1
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    count
+}
+
+pub fn fetch_source_prices(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
+uses (net: mut Net)
+{
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        out_prices[i] = 0
+        i += 1
+    }
+    match source.kind {
+        FeedKind::Hyperliquid => fetch_hyperliquid_all(source, mut out_prices),
+        FeedKind::Binance => fetch_binance_all(source, mut out_prices),
+        FeedKind::Coinbase => fetch_coinbase_all(source, mut out_prices),
+    }
+}
+
+pub fn fetch_local_medians_detailed(
+    _ sources: MemSlice<FeedSource>,
+    _ reports: mut MemVec<FeedReport>,
+) -> Option<[u64; 20]>
+uses (net: mut Net, err: mut Stderr, clock: Clock)
+{
+    reports.clear()
+    var counts: [usize; 20] = [0; 20]
+    var s0: [u64; 20] = [0; 20]
+    var s1: [u64; 20] = [0; 20]
+    var s2: [u64; 20] = [0; 20]
+
+    var i: usize = 0
+    while i < sources.len() {
+        let src = sources.at(i)
+        var fetched: [u64; 20] = [0; 20]
+        let started = clock.instant()
+        let assets_ok = fetch_source_prices(src, mut fetched)
+        let latency_ms = clock.instant().duration_since(started).as_millis()
+        let ok = assets_ok > 0
+        if !ok {
+            eprintln!(
+                "warning: failed to fetch feed source index=",
+                i,
+                " addr=",
+                src.addr,
+            )
+        }
+        reports
+            .push(
+                FeedReport {
+                    kind: src.kind,
+                    addr: src.addr,
+                    price: fetched[0],
+                    assets_ok,
+                    ok,
+                    latency_ms,
+                },
+            )
+
+        var a: usize = 0
+        while a < ASSET_COUNT {
+            let p = fetched[a]
+            if p > 0 {
+                let c = counts[a]
+                if c == 0 {
+                    s0[a] = p
+                    counts[a] = 1
+                } else if c == 1 {
+                    s1[a] = p
+                    counts[a] = 2
+                } else if c == 2 {
+                    s2[a] = p
+                    counts[a] = 3
+                }
+            }
+            a += 1
+        }
+        i += 1
+    }
+
+    var out: [u64; 20] = [0; 20]
+    var a: usize = 0
+    while a < ASSET_COUNT {
+        let c = counts[a]
+        if c == 0 {
+            return Option::None
+        } else if c == 1 {
+            out[a] = s0[a]
+        } else if c == 2 {
+            let avg: u128 = ((s0[a] as u128) + (s1[a] as u128)) / (2 as u128)
+            out[a] = avg.downcast_unchecked()
+        } else {
+            out[a] = median_of_three(s0[a], s1[a], s2[a])
+        }
+        a += 1
+    }
+    Option::Some(out)
+}

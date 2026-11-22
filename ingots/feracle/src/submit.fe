@@ -1,0 +1,145 @@
+use std::io::{Stderr, Stdout}
+use std::net::{Net, SocketAddr}
+use std::process::{Command, Redirect, Spawn}
+use std::time::Duration
+use feracle_core::{
+    ASSET_COUNT,
+    SEL_CURRENT_ROUND,
+    SEL_LATEST_PRICES,
+    SigMsg,
+    decode_latest_prices_abi_hex,
+    json_get_str_bounds,
+    parse_abi_word_u64,
+    push_hex_32,
+}
+use super::http::http_request
+
+fn eth_call_raw(rpc_addr: SocketAddr, contract_0x: MemSpan, selector_0x: String<10>) -> Option<
+    MemBuffer,
+>
+uses (net: mut Net)
+{
+    let rpc_body = format!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"",
+        contract_0x,
+        "\",\"data\":\"",
+        selector_0x,
+        "\"},\"latest\"]}",
+    )
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: ",
+        rpc_addr,
+        "\r\nContent-Type: application/json\r\nContent-Length: ",
+        rpc_body.len(),
+        "\r\nConnection: close\r\n\r\n",
+        rpc_body,
+    )
+    let resp_body = http_request(addr: rpc_addr, request_bytes: req.span())?
+    let (off, len) = json_get_str_bounds(resp_body.span(), "result".span())?
+    let res_hex = resp_body.span().slice(offset: off, len)
+    if !res_hex.starts_with("0x") {
+        return Option::None
+    }
+    Option::Some(MemBuffer::from_span(res_hex.tail(2)))
+}
+
+pub fn query_current_round(rpc_addr: SocketAddr, contract_0x: MemSpan) -> Option<u64>
+uses (net: mut Net)
+{
+    let raw_hex = eth_call_raw(rpc_addr, contract_0x, selector_0x: SEL_CURRENT_ROUND)?
+    parse_abi_word_u64(raw_hex.span(), word_idx: 0)
+}
+
+pub fn query_latest_prices(rpc_addr: SocketAddr, contract_0x: MemSpan) -> Option<([u64; 20], u64)>
+uses (net: mut Net)
+{
+    let raw_hex = eth_call_raw(rpc_addr, contract_0x, selector_0x: SEL_LATEST_PRICES)?
+    decode_latest_prices_abi_hex(raw_hex.span())
+}
+
+fn format_prices_array(_ prices: [u64; 20]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    out.push(b'[')
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        if i > 0 { out.push(b',') }
+        write!(mut out, prices[i])
+        i += 1
+    }
+    out.push(b']')
+    out
+}
+
+fn format_sigs_tuple(_ sigs: [SigMsg; 3]) -> MemBuffer {
+    var out = MemBuffer::empty()
+    out.push(b'[')
+    var i: usize = 0
+    while i < 3 {
+        if i > 0 { out.push(b',') }
+        let sig = sigs[i]
+        out.push(b'(')
+        write!(mut out, sig.v, ",")
+        push_hex_32(mut out, sig.r)
+        out.push(b',')
+        push_hex_32(mut out, sig.s)
+        out.push(b')')
+        i += 1
+    }
+    out.push(b']')
+    out
+}
+
+pub fn submit_medians(
+    rpc_url: MemSpan,
+    privkey_0x: MemSpan,
+    contract_0x: MemSpan,
+    round_id: u64,
+    prices: [u64; 20],
+    timestamp: u64,
+    sigs: [SigMsg; 3],
+) -> bool
+uses (proc: mut Spawn, out: mut Stdout, err: mut Stderr)
+{
+    let prices_arg = format_prices_array(prices)
+    let sigs_arg = format_sigs_tuple(sigs)
+    let cmd = Command::new("cast")
+        .arg("send")
+        .arg("--rpc-url")
+        .arg(rpc_url)
+        .arg("--private-key")
+        .arg(privkey_0x)
+        .arg(contract_0x)
+        .arg(
+            "submitMedians(uint256,uint256[20],uint256,(uint8,uint256,uint256)[3])",
+        )
+        .arg(round_id)
+        .arg(prices_arg)
+        .arg(timestamp)
+        .arg(sigs_arg)
+        .stdout(Redirect::Capture)
+        .stderr(Redirect::Capture)
+        .timeout(Duration::from_secs(15))
+
+    match proc.output(cmd) {
+        Result::Ok(output) => {
+            if output.status.success() {
+                println!(
+                    "submitted round ",
+                    round_id,
+                    " assets=20 btc=",
+                    prices[0],
+                    " ts=",
+                    timestamp,
+                )
+                true
+            } else {
+                eprintln!("cast send failed (", output.status, "): ", output.stderr)
+                false
+            }
+        },
+        Result::Err(e) => {
+            eprintln!("failed to spawn cast send: ", e)
+            false
+        },
+    }
+}

@@ -1,0 +1,19 @@
+use std::env::{Args, Env}
+use std::io::{Stderr, Stdout}
+use std::net::Net
+use std::process::Spawn
+use std::time::Clock
+
+pub fn main() -> i32
+uses (
+    args: Args,
+    env: Env,
+    out: mut Stdout,
+    err: mut Stderr,
+    net: mut Net,
+    clock: Clock,
+    proc: mut Spawn,
+)
+{
+    main::run()
+}

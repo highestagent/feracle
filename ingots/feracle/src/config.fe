@@ -1,0 +1,182 @@
+//! Oracle node CLI specification and `NodeConfig` loader.
+
+use std::net::SocketAddr
+use cli::{App, Arg, Cli, CliError}
+use super::args::{FeedSources, HexAddr20, HexKey32, PeerBackend, RpcEndpoint}
+use super::feeds::FeedSource
+
+pub struct NodeConfig {
+    pub node_id: u64,
+    pub p2p_backend: PeerBackend,
+    pub p2p_port: u16,
+    pub lan_discovery_port: u16,
+    pub telemetry_port: u16,
+    pub bootstrap: MemBuffer,
+    pub sources: MemVec<FeedSource>,
+    pub privkey32: MemBuffer,
+    pub privkey_0x: MemBuffer,
+    pub rpc_url: MemBuffer,
+    pub rpc_addr: SocketAddr,
+    pub chain_id: u64,
+    pub contract20: MemBuffer,
+    pub contract_0x: MemBuffer,
+    pub rounds: u64,
+    pub round_timeout_secs: u64,
+}
+
+pub fn build_cli() -> App {
+    App::new("feracle")
+        .version("0.1.0")
+        .about(
+            "Decentralized price oracle node with selectable libp2p, TCP, and UDP networking",
+        )
+        .arg_required_else_help()
+        .arg(
+            Arg::option("node-id")
+                .short(b'n')
+                .value_name("0|1|2")
+                .env("ORACLE_NODE_ID")
+                .required()
+                .help("Zero-based oracle node index"),
+        )
+        .arg(
+            Arg::option("p2p-backend")
+                .value_name("libp2p|tcp|udp")
+                .env("ORACLE_P2P_BACKEND")
+                .default_value("libp2p")
+                .help("P2P peer networking backend"),
+        )
+        .arg(
+            Arg::option("p2p-port")
+                .short(b'p')
+                .value_name("PORT")
+                .env("ORACLE_P2P_PORT")
+                .required()
+                .help("Local P2P listen port"),
+        )
+        .arg(
+            Arg::option("lan-discovery-port")
+                .value_name("PORT")
+                .env("ORACLE_LAN_DISCOVERY_PORT")
+                .default_value("0")
+                .help(
+                    "Optional UDP broadcast LAN discovery port (udp backend; 0 = disabled)",
+                ),
+        )
+        .arg(
+            Arg::option("bootstrap")
+                .short(b'b')
+                .value_name("MULTIADDRS")
+                .env("ORACLE_BOOTSTRAP")
+                .help(
+                    "Comma-separated bootstrap peers (multiaddrs or host:port)",
+                ),
+        )
+        .arg(
+            Arg::option("sources")
+                .short(b's')
+                .value_name("SPEC")
+                .env("ORACLE_SOURCES")
+                .required()
+                .help("Comma-separated provider=host:port feed list"),
+        )
+        .arg(
+            Arg::option("privkey-hex")
+                .short(b'k')
+                .value_name("HEX")
+                .env("ORACLE_PRIVKEY_HEX")
+                .required()
+                .sensitive()
+                .help("32-byte hex ECDSA signing key"),
+        )
+        .arg(
+            Arg::option("rpc-url")
+                .short(b'r')
+                .value_name("URL")
+                .env("ORACLE_RPC_URL")
+                .required()
+                .help("EVM JSON-RPC endpoint URL"),
+        )
+        .arg(
+            Arg::option("chain-id")
+                .short(b'c')
+                .value_name("ID")
+                .env("ORACLE_CHAIN_ID")
+                .required()
+                .help("Target EVM chain ID"),
+        )
+        .arg(
+            Arg::option("contract")
+                .value_name("ADDR")
+                .env("ORACLE_CONTRACT")
+                .required()
+                .help("Deployed OffchainMedianOracle contract address"),
+        )
+        .arg(
+            Arg::option("rounds")
+                .value_name("N")
+                .env("ORACLE_ROUNDS")
+                .default_value("0")
+                .help("Number of rounds to execute (0 = infinite)"),
+        )
+        .arg(
+            Arg::option("round-timeout-secs")
+                .value_name("SECS")
+                .env("ORACLE_ROUND_TIMEOUT_SECS")
+                .default_value("15")
+                .help("Per-phase round timeout in seconds"),
+        )
+        .arg(
+            Arg::option("telemetry-port")
+                .value_name("PORT")
+                .env("ORACLE_TELEMETRY_PORT")
+                .default_value("0")
+                .help("Optional local HTTP/SSE telemetry port (0 = disabled)"),
+        )
+}
+
+pub fn load_config() -> Result<CliError, NodeConfig> uses (cli: Cli) {
+    let node_id: u64 = cli::require("node-id")?
+    if node_id >= feracle_core::NODE_COUNT {
+        return Result::Err(
+            CliError::InvalidValue {
+                arg: format!("--node-id"),
+                value: format!(node_id),
+                detail: format!("must be 0, 1, or 2"),
+            },
+        )
+    }
+    let p2p_backend: PeerBackend = cli::get_or("p2p-backend", default: PeerBackend::Libp2p)?
+    let p2p_port: u16 = cli::require("p2p-port")?
+    let lan_discovery_port: u16 = cli::get_or("lan-discovery-port", default: 0)?
+    let telemetry_port: u16 = cli::get_or("telemetry-port", default: 0)?
+    let bootstrap: MemBuffer = cli::get_or("bootstrap", default: MemBuffer::empty())?
+    let feed_sources: FeedSources = cli::require("sources")?
+    let privkey: HexKey32 = cli::require("privkey-hex")?
+    let rpc: RpcEndpoint = cli::require("rpc-url")?
+    let chain_id: u64 = cli::require("chain-id")?
+    let contract_addr: HexAddr20 = cli::require("contract")?
+    let rounds: u64 = cli::get_or("rounds", default: 0)?
+    let round_timeout_secs: u64 = cli::get_or("round-timeout-secs", default: 15)?
+
+    Result::Ok(
+        NodeConfig {
+            node_id,
+            p2p_backend,
+            p2p_port,
+            lan_discovery_port,
+            telemetry_port,
+            bootstrap,
+            sources: feed_sources.list,
+            privkey32: privkey.raw,
+            privkey_0x: privkey.prefixed,
+            rpc_url: rpc.url,
+            rpc_addr: rpc.addr,
+            chain_id,
+            contract20: contract_addr.raw,
+            contract_0x: contract_addr.prefixed,
+            rounds,
+            round_timeout_secs,
+        },
+    )
+}

@@ -1,0 +1,11 @@
+[ingot]
+name = "feracle"
+version = "0.1.0"
+
+[dependencies]
+cli = { path = "../cli" }
+feracle_core = { path = "../core" }
+p2p = { path = "../p2p" }
+p2p_libp2p = { path = "../p2p_libp2p", allow_unsafe = true }
+p2p_tcp = { path = "../p2p_tcp" }
+p2p_udp = { path = "../p2p_udp" }
