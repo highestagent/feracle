@@ -83,7 +83,50 @@ let config = with (Cli = matches) { load_config() }
 11. **`infra/` & `scripts/`**:
     - `infra/mock_feeds.py` (`[Python 3]`): Local mock HTTP servers matching Hyperliquid, Binance, and Coinbase JSON schemas (with configurable `--outlier-port` fault injection)
     - `infra/Caddyfile`: Optional local TLS proxy for live exchange feeds (`:9001`–`:9003`)
-    - `scripts/build-feracle.sh`, `scripts/build-wasm.sh`, `scripts/e2e.sh`, `scripts/e2e-telemetry.sh`, `scripts/dev-telemetry.sh`
+    - `scripts/install.sh`, `scripts/build-feracle.sh`, `scripts/build-wasm.sh`, `scripts/e2e.sh`, `scripts/e2e-telemetry.sh`, `scripts/dev-telemetry.sh`
+
+## Install & Run
+
+### Run from prebuilt binaries
+
+Install `feracle`, `feracle-telemetry`, and the local devnet runner (`feracle-demo`) into `~/.local/bin` with one command (downloads the release archive for `linux-x86_64`, `linux-arm64`, or `darwin-arm64`, or falls back to building from source if no release tarball matches):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/highestagent/feracle/main/scripts/install.sh | bash
+```
+
+Optional installer flags: `--prefix <DIR>`, `--version <TAG>`, `--archive <PATH>` (to install a downloaded CI artifact `.tar.gz`), and `--install-foundry` (installs `anvil` and `cast` if missing). Make sure `~/.local/bin` is on your `PATH`, then run:
+
+```bash
+feracle                      # print node CLI flags & env vars
+feracle-telemetry --help     # inspect WASM telemetry host options (requires Node.js >= 20)
+feracle-demo                 # launch local Anvil + 3 nodes + telemetry TUI (requires Foundry & Python 3)
+feracle-demo --backend udp   # switch P2P transport (libp2p | tcp | udp)
+```
+
+### Build from source
+
+Prerequisites: `fe` (auto-installed via `feup` by `scripts/install.sh` if absent), Rust `cargo`, and `Node.js >= 20` (plus Foundry and `python3` for local devnet/E2E runs).
+
+Clone and install to `~/.local/bin`:
+
+```bash
+git clone https://github.com/highestagent/feracle.git
+cd feracle
+./scripts/install.sh --from-source
+```
+
+Or build artifacts in-place under `out/` and `ingots/evm/out/`:
+
+```bash
+fe build --emit abi,bytecode --out-dir ingots/evm/out ingots/evm
+./scripts/build-wasm.sh
+./scripts/build-feracle.sh
+
+./out/feracle                              # run native node (prints CLI help with no args)
+node telemetry/host.mjs --help             # run WASM telemetry collector directly
+./scripts/dev-telemetry.sh                 # launch local Anvil + 3 nodes + telemetry TUI
+```
 
 ## Native Linking (`libp2p_shim.a`)
 
