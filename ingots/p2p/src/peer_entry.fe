@@ -1,0 +1,86 @@
+//! Compact peer records shared by membership gossip (UDP) and peer
+//! exchange (TCP).
+//!
+//! A list is `[count u8]` followed by `count` 14-byte entries:
+//! `[tag u64][ipv4 u32][port u16]`. IPv6 peers are skipped on encode.
+
+use core::num::IntDowncast
+use std::net::{IpAddr, Ipv4Addr, SocketAddr}
+
+pub const PEER_ENTRY_LEN: usize = 14
+const MAX_ENTRIES: usize = 32
+
+pub struct PeerEntry { pub tag: u64, pub addr: SocketAddr }
+
+impl Copy for PeerEntry {}
+
+fn ipv4_bits(_ addr: SocketAddr) -> Option<u32> {
+    match addr.ip() {
+        IpAddr::V4(v4) => Option::Some(v4.to_bits()),
+        IpAddr::V6(_) => Option::None,
+    }
+}
+
+/// Fills in an advertised wildcard address (`0.0.0.0:port`) with the IP the
+/// peer was actually observed at, keeping the advertised port.
+pub fn normalize_addr(advertised: SocketAddr, observed: SocketAddr) -> SocketAddr {
+    match ipv4_bits(advertised) {
+        Option::Some(bits) => {
+            if bits == 0 {
+                SocketAddr::new(observed.ip(), advertised.port())
+            } else {
+                advertised
+            }
+        },
+        Option::None => advertised,
+    }
+}
+
+/// Appends a counted entry list to `out`; returns how many were written.
+pub fn encode_entries(_ entries: MemVec<PeerEntry>, _ out: mut MemBuffer) -> usize {
+    let count_at = out.len()
+    out.push(0)
+    var written: usize = 0
+    var i: usize = 0
+    while i < entries.len() && written < MAX_ENTRIES {
+        let entry = entries[i]
+        i += 1
+        let Option::Some(bits) = ipv4_bits(entry.addr) else {
+            continue
+        }
+        let at = out.len()
+        out.resize(at + PEER_ENTRY_LEN)
+        out.write_be<u64>(offset: at, value: entry.tag)
+        out.write_be<u32>(offset: at + 8, value: bits)
+        out.write_be<u16>(offset: at + 12, value: entry.addr.port())
+        written += 1
+    }
+    out[count_at] = written.downcast_unchecked()
+    written
+}
+
+/// Decodes a counted entry list starting at `offset`, appending to `out`.
+/// Returns the number of bytes consumed, or `None` if truncated.
+pub fn decode_entries(_ bytes: MemSpan, offset: usize, _ out: mut MemVec<PeerEntry>) -> Option<
+    usize,
+> {
+    if offset >= bytes.len() {
+        return Option::None
+    }
+    let count = bytes.byte_at(offset) as usize
+    let needed = 1 + count * PEER_ENTRY_LEN
+    if offset + needed > bytes.len() {
+        return Option::None
+    }
+    var i: usize = 0
+    while i < count {
+        let at = offset + 1 + i * PEER_ENTRY_LEN
+        let ip = Ipv4Addr::from_bits(bytes.read_be<u32>(at + 8))
+        let port = bytes.read_be<u16>(at + 12)
+        out.push(
+            PeerEntry { tag: bytes.read_be<u64>(at), addr: SocketAddr::new(IpAddr::V4(ip), port) },
+        )
+        i += 1
+    }
+    Option::Some(needed)
+}

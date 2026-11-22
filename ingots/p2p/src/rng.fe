@@ -1,0 +1,30 @@
+//! Tiny non-cryptographic PRNG (xorshift64*) for peer sampling.
+//!
+//! Only used to pick gossip targets; never for keys or nonces.
+
+use core::num::IntDowncast
+
+pub struct Rng { state: u64 }
+
+impl Copy for Rng {}
+
+impl Rng {
+    pub fn new(_ seed: u64) -> Self {
+        Rng { state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } }
+    }
+
+    pub fn next_u64(mut self) -> u64 {
+        var x = self.state
+        x ^= x >> 12
+        x ^= x << 25
+        x ^= x >> 27
+        self.state = x
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    /// Uniform-ish index in `0..bound` (`bound` must be non-zero).
+    pub fn below(mut self, _ bound: usize) -> usize {
+        let b: u64 = bound.downcast_unchecked()
+        (self.next_u64() % b).downcast_unchecked()
+    }
+}

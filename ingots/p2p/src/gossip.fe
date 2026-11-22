@@ -1,0 +1,116 @@
+//! Shared per-node gossip engine state and non-blocking error classification.
+
+use std::io::{Error, ErrorKind}
+use std::net::SocketAddr
+use std::time::Clock
+use super::envelope::{Header, KIND_DATA, encode_frame, frame_len, set_ttl}
+use super::inbox::Inbox
+use super::peer_entry::PeerEntry
+use super::peers::PeerBook
+use super::rng::Rng
+use super::seen::SeenCache
+use super::transport::{Delivery, GossipConfig, Stats}
+
+pub fn is_would_block(_ err: Error) -> bool {
+    match err.kind() {
+        ErrorKind::WouldBlock => true,
+        _ => false,
+    }
+}
+
+pub struct GossipCore {
+    pub self_tag: u64,
+    pub seq: u64,
+    pub listen_port: u16,
+    pub gossip: GossipConfig,
+    pub book: PeerBook,
+    pub seen: SeenCache,
+    pub inbox: Inbox,
+    pub rng: Rng,
+    pub stats: Stats,
+}
+
+impl GossipCore {
+    pub fn new(self_tag: u64, listen_port: u16, rng_salt: u64, gossip: GossipConfig) -> Self
+    uses (clock: Clock)
+    {
+        GossipCore {
+            self_tag,
+            seq: clock.now().as_micros() << 8,
+            listen_port,
+            gossip,
+            book: PeerBook::new(self_tag),
+            seen: SeenCache::new(gossip.seen_capacity),
+            inbox: Inbox::new(gossip.inbox_capacity),
+            rng: Rng::new(self_tag ^ rng_salt),
+            stats: Stats::zero(),
+        }
+    }
+
+    pub fn next_seq(mut self) -> u64 {
+        self.seq += 1
+        self.seq
+    }
+
+    /// Encodes a fresh `KIND_DATA` frame, records it in `seen`, and bumps `data_tx`.
+    pub fn prepare_publish(mut self, _ payload: MemSpan, _ out_frame: mut MemBuffer) -> bool {
+        let seq = self.next_seq()
+        let hdr = Header::new(
+            kind: KIND_DATA,
+            origin: self.self_tag,
+            seq,
+            ttl: self.gossip.ttl,
+        )
+        out_frame.clear()
+        if !encode_frame(hdr, payload, mut out_frame) {
+            return false
+        }
+        let _ = self.seen.insert(hdr.id())
+        self.stats.data_tx += 1
+        true
+    }
+
+    /// Deduplicates an inbound `KIND_DATA` frame and pushes it to `inbox`.
+    /// Returns `true` and fills `fwd_out` (with decremented `ttl`) iff it should be forwarded.
+    pub fn accept_data(
+        mut self,
+        hdr: Header,
+        raw: MemSpan,
+        from: SocketAddr,
+        _ fwd_out: mut MemBuffer,
+    ) -> bool {
+        if raw.len() < frame_len(hdr) {
+            return false
+        }
+        if !self.seen.insert(hdr.id()) {
+            self.stats.dup_dropped += 1
+            return false
+        }
+        self.stats.data_rx += 1
+        let payload = raw.slice(offset: hdr.payload_offset(), len: hdr.payload_len())
+        self.inbox.push(
+                payload,
+                Delivery { origin: hdr.origin, seq: hdr.seq, from },
+            )
+        self.stats.inbox_dropped = self.inbox.dropped()
+        if hdr.ttl <= 1 {
+            return false
+        }
+        fwd_out.clear()
+        fwd_out.extend_from(raw.head(frame_len(hdr)))
+        set_ttl(mut fwd_out, hdr.ttl - 1)
+        true
+    }
+
+    pub fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
+        self.inbox.pop_into(mut out)
+    }
+
+    pub fn peer_count(self) -> usize {
+        self.book.alive_count()
+    }
+
+    pub fn peer_entries(self) -> MemVec<PeerEntry> {
+        self.book.alive_entries(exclude_tag: self.self_tag)
+    }
+}

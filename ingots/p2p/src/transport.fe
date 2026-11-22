@@ -1,0 +1,116 @@
+//! Common `Transport` interface, configuration, statistics, and fanout selection.
+
+use std::net::{Net, SocketAddr}
+use std::time::Clock
+use super::peer_entry::PeerEntry
+use super::peers::PeerBook
+use super::rng::Rng
+
+/// Metadata attached to each received application payload.
+pub struct Delivery { pub origin: u64, pub seq: u64, pub from: SocketAddr }
+
+impl Copy for Delivery {}
+
+/// Cumulative counters exposed by a transport.
+pub struct Stats {
+    pub frames_tx: u64,
+    pub frames_rx: u64,
+    pub data_tx: u64,
+    pub data_rx: u64,
+    pub dup_dropped: u64,
+    pub inbox_dropped: u64,
+}
+
+impl Copy for Stats {}
+
+impl Stats {
+    pub fn zero() -> Self {
+        Stats {
+            frames_tx: 0,
+            frames_rx: 0,
+            data_tx: 0,
+            data_rx: 0,
+            dup_dropped: 0,
+            inbox_dropped: 0,
+        }
+    }
+}
+
+/// Shared tuning parameters across UDP and TCP transports.
+pub struct GossipConfig {
+    pub fanout: usize,
+    pub ttl: u8,
+    pub seen_capacity: usize,
+    pub inbox_capacity: usize,
+    pub heartbeat_ms: u64,
+    pub suspect_ms: u64,
+    pub dead_ms: u64,
+    pub reconnect_base_ms: u64,
+    pub reconnect_max_ms: u64,
+}
+
+impl Copy for GossipConfig {}
+
+impl GossipConfig {
+    pub fn default() -> Self {
+        GossipConfig {
+            fanout: 3,
+            ttl: 4,
+            seen_capacity: 1024,
+            inbox_capacity: 128,
+            heartbeat_ms: 1000,
+            suspect_ms: 4000,
+            dead_ms: 8000,
+            reconnect_base_ms: 250,
+            reconnect_max_ms: 4000,
+        }
+    }
+}
+
+/// Common non-blocking gossip transport interface implemented by `p2p_udp` and `p2p_tcp`.
+pub trait Transport {
+    fn local_addr(self) -> SocketAddr
+    fn self_tag(self) -> u64
+    fn publish(mut self, _ payload: MemSpan) -> bool
+    uses (net: mut Net, clock: Clock)
+    fn poll(mut self, timeout_ms: u64) -> usize uses (net: mut Net, clock: Clock)
+    fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery>
+    fn peer_count(self) -> usize
+    fn peer_entries(self) -> MemVec<PeerEntry>
+    fn stats(self) -> Stats
+    fn add_seed(mut self, _ addr: SocketAddr)
+}
+
+/// Appends up to `fanout` distinct alive peer indices in `book`, skipping `exclude_tag`.
+pub fn pick_fanout(
+    book: PeerBook,
+    exclude_tag: u64,
+    fanout: usize,
+    rng: mut Rng,
+    _ out: mut MemVec<usize>,
+) {
+    if fanout == 0 { return }
+    var candidates = MemVec<usize>::new()
+    var i: usize = 0
+    while i < book.len() {
+        let peer = book.get(i)
+        if peer.is_alive() && peer.tag != exclude_tag {
+            candidates.push(i)
+        }
+        i += 1
+    }
+    let limit = if fanout < candidates.len() {
+        fanout
+    } else {
+        candidates.len()
+    }
+    var chosen: usize = 0
+    while chosen < limit {
+        let pick = chosen + rng.below(candidates.len() - chosen)
+        if pick != chosen {
+            candidates.swap(chosen, pick)
+        }
+        out.push(candidates[chosen])
+        chosen += 1
+    }
+}

@@ -1,0 +1,91 @@
+//! Millisecond timekeeping for single-threaded reactors.
+
+use std::time::{Clock, Instant}
+
+/// Monotonic milliseconds since the reactor started.
+pub struct MonoClock { origin: Instant }
+
+impl Copy for MonoClock {}
+
+impl MonoClock {
+    pub fn start() -> Self uses (clock: Clock) {
+        MonoClock { origin: clock.instant() }
+    }
+
+    pub fn now_ms(self) -> u64 uses (clock: Clock) {
+        clock.instant().duration_since(self.origin).as_millis()
+    }
+}
+
+/// A fixed-period timer polled by the reactor loop.
+pub struct Ticker { period_ms: u64, next_ms: u64 }
+
+impl Copy for Ticker {}
+
+impl Ticker {
+    /// Fires first at `now_ms`, then every `period_ms`.
+    pub fn new(period_ms: u64, now_ms: u64) -> Self {
+        Ticker { period_ms, next_ms: now_ms }
+    }
+
+    /// `true` once per elapsed period; missed periods coalesce into one.
+    pub fn due(mut self, _ now_ms: u64) -> bool {
+        if now_ms < self.next_ms {
+            return false
+        }
+        self.next_ms = now_ms + self.period_ms
+        true
+    }
+
+    pub fn ms_until(self, _ now_ms: u64) -> u64 {
+        if now_ms >= self.next_ms {
+            0
+        } else {
+            self.next_ms - now_ms
+        }
+    }
+}
+
+/// Exponential retry delay: `base`, `2*base`, ... capped at `max`.
+pub struct Backoff { base_ms: u64, max_ms: u64, delay_ms: u64, next_at_ms: u64, failures: u32 }
+
+impl Copy for Backoff {}
+
+impl Backoff {
+    pub fn new(base_ms: u64, max_ms: u64) -> Self {
+        Backoff { base_ms, max_ms, delay_ms: base_ms, next_at_ms: 0, failures: 0 }
+    }
+
+    /// Whether an attempt may be made now.
+    pub fn ready(self, _ now_ms: u64) -> bool {
+        now_ms >= self.next_at_ms
+    }
+
+    /// Records a failed attempt and schedules the next one.
+    pub fn fail(mut self, _ now_ms: u64) {
+        self.next_at_ms = now_ms + self.delay_ms
+        self.failures += 1
+        let doubled = self.delay_ms * 2
+        self.delay_ms = if doubled > self.max_ms {
+            self.max_ms
+        } else {
+            doubled
+        }
+    }
+
+    /// Defers the next attempt by the base delay without escalating.
+    pub fn defer(mut self, _ now_ms: u64) {
+        self.next_at_ms = now_ms + self.base_ms
+    }
+
+    /// Clears escalation after a success.
+    pub fn reset(mut self) {
+        self.delay_ms = self.base_ms
+        self.next_at_ms = 0
+        self.failures = 0
+    }
+
+    pub fn failures(self) -> u32 {
+        self.failures
+    }
+}

@@ -1,0 +1,29 @@
+//! Shared, transport-agnostic peer-to-peer facilities.
+//!
+//! `p2p` knows nothing about any application: payloads are opaque bytes.
+//! Concrete transports (`udp`, `tcp`) build on these pieces and expose the
+//! common `Transport` trait so callers can swap them freely.
+
+pub use envelope::{
+    Header,
+    HEADER_LEN,
+    KIND_DATA,
+    MAGIC,
+    MAX_PAYLOAD,
+    VERSION,
+    decode_header,
+    decode_u16_payload,
+    encode_frame,
+    encode_u16_frame,
+    frame_len,
+    set_ttl,
+}
+pub use gossip::{GossipCore, is_would_block}
+pub use inbox::Inbox
+pub use peer_entry::{PEER_ENTRY_LEN, PeerEntry, decode_entries, encode_entries, normalize_addr}
+pub use peers::{Liveness, Peer, PeerBook}
+pub use rng::Rng
+pub use seeds::{format_peer_tag, format_peers_csv, make_ephemeral_tag, parse_seeds}
+pub use seen::SeenCache
+pub use timer::{Backoff, MonoClock, Ticker}
+pub use transport::{Delivery, GossipConfig, Stats, Transport, pick_fanout}

@@ -1,0 +1,102 @@
+//! Seed list parsing (`ip:port` and `/ip4/<ip>/(tcp|udp)/<port>`) and peer tag formatting.
+
+use core::num::IntDowncast
+use core::text::parse_uint
+use std::net::{IpAddr, Ipv4Addr, SocketAddr}
+use std::time::Clock
+use super::peer_entry::PeerEntry
+
+pub fn make_ephemeral_tag(node_id: u64, listen_port: u16) -> u64
+uses (clock: Clock)
+{
+    let salt = clock.now().as_secs() & 0xffff
+    ((node_id + 1) << 32) | (salt << 16) | (listen_port as u64)
+}
+
+pub fn format_peers_csv(entries: MemVec<PeerEntry>, prefix: MemSpan, _ out: mut MemBuffer) {
+    out.clear()
+    var i: usize = 0
+    while i < entries.len() {
+        if i > 0 { out.push(b',') }
+        format_peer_tag(entries[i].tag, prefix, mut out)
+        i += 1
+    }
+}
+
+fn hex_char(_ nibble: u8) -> u8 {
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + (nibble - 10)
+    }
+}
+
+/// Appends `<prefix>-<16-char-lowercase-hex-tag>` to `out`.
+pub fn format_peer_tag(_ tag: u64, prefix: MemSpan, _ out: mut MemBuffer) {
+    out.extend_from(prefix)
+    out.push(b'-')
+    var shift: u64 = 60
+    var i: usize = 0
+    while i < 16 {
+        let nibble: u8 = ((tag >> shift) & 0x0f).downcast_unchecked()
+        out.push(hex_char(nibble))
+        if shift >= 4 { shift -= 4 }
+        i += 1
+    }
+}
+
+fn parse_ipv4_multiaddr(_ entry: MemSpan) -> Option<SocketAddr> {
+    if !entry.starts_with("/ip4/") {
+        return Option::None
+    }
+    let after_ip4 = entry.tail(5)
+    let Option::Some(ip_end) = after_ip4.index_of(b'/') else {
+        return Option::None
+    }
+    let Option::Some(ip) = Ipv4Addr::parse(after_ip4.head(ip_end)) else {
+        return Option::None
+    }
+    let proto_and_port = after_ip4.tail(ip_end + 1)
+    if !proto_and_port.starts_with("tcp/") && !proto_and_port.starts_with("udp/") {
+        return Option::None
+    }
+    let rest = proto_and_port.tail(4)
+    let port_len = match rest.index_of(b'/') {
+        Option::Some(slash) => slash,
+        Option::None => rest.len(),
+    }
+    if port_len == 0 {
+        return Option::None
+    }
+    let Option::Some(port_word) = parse_uint(rest.head(port_len)) else {
+        return Option::None
+    }
+    if port_word == 0 || port_word > 65535 {
+        return Option::None
+    }
+    let port: u16 = port_word.downcast_truncate()
+    Option::Some(SocketAddr::new(IpAddr::V4(ip), port))
+}
+
+fn parse_one_seed(_ entry: MemSpan) -> Option<SocketAddr> {
+    match SocketAddr::parse(entry) {
+        Option::Some(addr) => Option::Some(addr),
+        Option::None => parse_ipv4_multiaddr(entry),
+    }
+}
+
+/// Parses comma-separated seeds (`ip:port` or `/ip4/<ip>/(tcp|udp)/<port>`) into `out`.
+/// Empty entries are skipped; returns `false` if any non-empty entry fails to parse.
+pub fn parse_seeds(_ spec: MemSpan, _ out: mut MemVec<SocketAddr>) -> bool {
+    for raw in spec.split(b',') {
+        let entry = raw.trim()
+        if entry.is_empty() {
+            continue
+        }
+        let Option::Some(addr) = parse_one_seed(entry) else {
+            return false
+        }
+        out.push(addr)
+    }
+    true
+}

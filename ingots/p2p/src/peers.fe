@@ -1,0 +1,179 @@
+//! Table of known peers with liveness, shared by every transport.
+
+use std::net::SocketAddr
+use super::peer_entry::PeerEntry
+
+pub enum Liveness {
+    Alive,
+    Suspect,
+}
+
+impl Copy for Liveness {}
+
+pub struct Peer {
+    pub tag: u64,
+    pub addr: SocketAddr,
+    pub liveness: Liveness,
+    pub last_seen_ms: u64,
+    pub suspect_since_ms: u64,
+}
+
+impl Copy for Peer {}
+
+impl Peer {
+    pub fn is_alive(self) -> bool {
+        match self.liveness {
+            Liveness::Alive => true,
+            Liveness::Suspect => false,
+        }
+    }
+
+    pub fn entry(self) -> PeerEntry {
+        PeerEntry { tag: self.tag, addr: self.addr }
+    }
+}
+
+pub struct PeerBook { peers: MemVec<Peer>, self_tag: u64 }
+
+impl PeerBook {
+    pub fn new(self_tag: u64) -> Self {
+        PeerBook { peers: MemVec::new(), self_tag }
+    }
+
+    pub fn len(self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.peers.is_empty()
+    }
+
+    pub fn get(self, _ index: usize) -> Peer {
+        self.peers[index]
+    }
+
+    pub fn find_tag(self, _ tag: u64) -> Option<usize> {
+        var i: usize = 0
+        while i < self.peers.len() {
+            if self.peers[i].tag == tag {
+                return Option::Some(i)
+            }
+            i += 1
+        }
+        Option::None
+    }
+
+    pub fn find_addr(self, _ addr: SocketAddr) -> Option<usize> {
+        var i: usize = 0
+        while i < self.peers.len() {
+            if self.peers[i].addr == addr {
+                return Option::Some(i)
+            }
+            i += 1
+        }
+        Option::None
+    }
+
+    /// First-hand evidence: the peer spoke to us. Marks it alive and fresh.
+    /// Returns `true` if the peer was not known before.
+    pub fn observe(mut self, tag: u64, addr: SocketAddr, now_ms: u64) -> bool {
+        if tag == self.self_tag {
+            return false
+        }
+        match self.find_tag(tag) {
+            Option::Some(i) => {
+                let p = mut self.peers[i]
+                p.addr = addr
+                p.liveness = Liveness::Alive
+                p.last_seen_ms = now_ms
+                false
+            },
+            Option::None => {
+                self.peers
+                    .push(
+                        Peer {
+                            tag,
+                            addr,
+                            liveness: Liveness::Alive,
+                            last_seen_ms: now_ms,
+                            suspect_since_ms: 0,
+                        },
+                    )
+                true
+            },
+        }
+    }
+
+    /// Second-hand evidence (gossip): adds unknown peers but never refreshes
+    /// known ones, so hearsay cannot keep a dead peer alive.
+    pub fn learn(mut self, tag: u64, addr: SocketAddr, now_ms: u64) -> bool {
+        if tag == self.self_tag || self.find_tag(tag).is_some() {
+            return false
+        }
+        self.peers
+            .push(
+                Peer {
+                    tag,
+                    addr,
+                    liveness: Liveness::Alive,
+                    last_seen_ms: now_ms,
+                    suspect_since_ms: 0,
+                },
+            )
+        true
+    }
+
+    pub fn suspect(mut self, _ index: usize, now_ms: u64) {
+        let p = mut self.peers[index]
+        if p.is_alive() {
+            p.liveness = Liveness::Suspect
+            p.suspect_since_ms = now_ms
+        }
+    }
+
+    pub fn remove(mut self, _ index: usize) -> Peer {
+        self.peers.swap_remove(index)
+    }
+
+    /// Drops peers suspected for longer than `grace_ms`; returns how many.
+    pub fn expire(mut self, now_ms: u64, grace_ms: u64) -> usize {
+        var removed: usize = 0
+        var i: usize = 0
+        while i < self.peers.len() {
+            let p = self.peers[i]
+            if !p.is_alive() && now_ms >= p.suspect_since_ms + grace_ms {
+                let _ = self.peers.swap_remove(i)
+                removed += 1
+            } else {
+                i += 1
+            }
+        }
+        removed
+    }
+
+    pub fn alive_count(self) -> usize {
+        var n: usize = 0
+        var i: usize = 0
+        while i < self.peers.len() {
+            if self.peers[i].is_alive() {
+                n += 1
+            }
+            i += 1
+        }
+        n
+    }
+
+    /// Alive peers as wire entries, skipping `exclude_tag`.
+    pub fn alive_entries(self, exclude_tag: u64) -> MemVec<PeerEntry> {
+        var out = MemVec<PeerEntry>::new()
+        var i: usize = 0
+        while i < self.peers.len() {
+            let p = self.peers[i]
+            if p.is_alive() && p.tag != exclude_tag {
+                out.push(p.entry())
+            }
+            i += 1
+        }
+        out
+    }
+}

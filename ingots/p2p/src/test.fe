@@ -1,0 +1,261 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr}
+use std::time::Clock
+use super::{
+    Backoff,
+    Delivery,
+    GossipConfig,
+    GossipCore,
+    HEADER_LEN,
+    Header,
+    Inbox,
+    KIND_DATA,
+    MAGIC,
+    MAX_PAYLOAD,
+    PEER_ENTRY_LEN,
+    PeerBook,
+    PeerEntry,
+    Rng,
+    SeenCache,
+    Ticker,
+    VERSION,
+    decode_entries,
+    decode_header,
+    decode_u16_payload,
+    encode_entries,
+    encode_frame,
+    encode_u16_frame,
+    format_peer_tag,
+    format_peers_csv,
+    frame_len,
+    make_ephemeral_tag,
+    normalize_addr,
+    parse_seeds,
+    pick_fanout,
+    set_ttl,
+}
+
+#[test]
+fn test_envelope_roundtrip_and_bounds() {
+    let payload = "hello-p2p".span()
+    let hdr = Header::new(
+        kind: KIND_DATA,
+        origin: 0x0102030405060708,
+        seq: 42,
+        ttl: 4,
+    )
+    var buf = MemBuffer::empty()
+    assert!(encode_frame(hdr, payload, mut buf))
+    assert!(buf.len() == HEADER_LEN + payload.len())
+
+    let decoded = decode_header(buf.span()).unwrap()
+    assert!(decoded.is_data())
+    assert!(decoded.origin == hdr.origin)
+    assert!(decoded.seq == 42)
+    assert!(decoded.ttl == 4)
+    assert!(decoded.payload_len() == payload.len())
+    assert!(frame_len(decoded) == buf.len())
+    assert!(
+        buf.slice(
+                offset: decoded.payload_offset(),
+                len: decoded.payload_len(),
+            ) == payload,
+    )
+
+    set_ttl(mut buf, 2)
+    let modified = decode_header(buf.span()).unwrap()
+    assert!(modified.ttl == 2)
+
+    buf[0] = 0
+    assert!(decode_header(buf.span()).is_none())
+    buf[0] = (MAGIC >> 8) as u8
+    buf[2] = VERSION + 1
+    assert!(decode_header(buf.span()).is_none())
+
+    let too_big = MemBuffer::new(MAX_PAYLOAD + 1)
+    assert!(!encode_frame(hdr, too_big.span(), mut buf))
+}
+
+#[test]
+fn test_peer_entries_and_normalize() {
+    let observed = SocketAddr::parse("127.0.0.1:41000").unwrap()
+    let wildcard = SocketAddr::parse("0.0.0.0:7001").unwrap()
+    let resolved = normalize_addr(advertised: wildcard, observed: observed)
+    assert!(resolved == SocketAddr::parse("127.0.0.1:7001").unwrap())
+
+    let explicit = SocketAddr::parse("10.0.0.5:7002").unwrap()
+    assert!(
+        normalize_addr(advertised: explicit, observed: observed) == explicit,
+    )
+
+    var entries = MemVec<PeerEntry>::new()
+    entries.push(PeerEntry { tag: 11, addr: resolved })
+    entries.push(PeerEntry { tag: 22, addr: explicit })
+    var wire = MemBuffer::empty()
+    let written = encode_entries(entries, mut wire)
+    assert!(written == 2)
+    assert!(wire.len() == 1 + 2 * PEER_ENTRY_LEN)
+
+    var decoded = MemVec<PeerEntry>::new()
+    let consumed = decode_entries(wire.span(), offset: 0, mut decoded).unwrap()
+    assert!(consumed == wire.len())
+    assert!(decoded.len() == 2)
+    assert!(decoded[0].tag == 11 && decoded[0].addr == resolved)
+    assert!(decoded[1].tag == 22 && decoded[1].addr == explicit)
+}
+
+#[test]
+fn test_seen_cache_and_inbox() {
+    var seen = SeenCache::new(3)
+    assert!(seen.insert(101))
+    assert!(!seen.insert(101))
+    assert!(seen.insert(102))
+    assert!(seen.insert(103))
+    assert!(seen.len() == 3)
+    assert!(seen.insert(104))
+    assert!(seen.len() == 3)
+    assert!(!seen.contains(101))
+    assert!(seen.contains(104))
+
+    var inbox = Inbox::new(2)
+    let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)
+    inbox.push("one".span(), Delivery { origin: 1, seq: 1, from: src })
+    inbox.push("two".span(), Delivery { origin: 1, seq: 2, from: src })
+    inbox.push("three".span(), Delivery { origin: 1, seq: 3, from: src })
+    assert!(inbox.len() == 2)
+    assert!(inbox.dropped() == 1)
+
+    var out = MemBuffer::empty()
+    let d1 = inbox.pop_into(mut out).unwrap()
+    assert!(d1.seq == 2 && out == "two")
+    let d2 = inbox.pop_into(mut out).unwrap()
+    assert!(d2.seq == 3 && out == "three")
+    assert!(inbox.pop_into(mut out).is_none())
+}
+
+#[test]
+fn test_timers_peer_book_and_fanout() {
+    var ticker = Ticker::new(period_ms: 100, now_ms: 500)
+    assert!(ticker.ms_until(500) == 0)
+    assert!(ticker.due(500))
+    assert!(!ticker.due(550))
+    assert!(ticker.ms_until(550) == 50)
+    assert!(ticker.due(600))
+
+    var backoff = Backoff::new(base_ms: 100, max_ms: 350)
+    assert!(backoff.ready(0))
+    backoff.fail(10)
+    assert!(!backoff.ready(109))
+    assert!(backoff.ready(110))
+    backoff.fail(110)
+    assert!(!backoff.ready(309))
+    assert!(backoff.ready(310))
+    backoff.fail(310)
+    assert!(backoff.ready(660))
+    backoff.reset()
+    assert!(backoff.failures() == 0 && backoff.ready(0))
+
+    var book = PeerBook::new(self_tag: 1)
+    let a2 = SocketAddr::parse("127.0.0.1:7002").unwrap()
+    let a3 = SocketAddr::parse("127.0.0.1:7003").unwrap()
+    let a4 = SocketAddr::parse("127.0.0.1:7004").unwrap()
+    assert!(!book.observe(tag: 1, addr: a2, now_ms: 10))
+    assert!(book.observe(tag: 2, addr: a2, now_ms: 10))
+    assert!(book.learn(tag: 3, addr: a3, now_ms: 10))
+    assert!(book.learn(tag: 4, addr: a4, now_ms: 10))
+    assert!(book.alive_count() == 3)
+
+    let idx2 = book.find_tag(2).unwrap()
+    book.suspect(idx2, now_ms: 100)
+    assert!(book.alive_count() == 2)
+    assert!(book.expire(now_ms: 300, grace_ms: 150) == 1)
+    assert!(book.find_tag(2).is_none())
+
+    var rng = Rng::new(77)
+    var picks = MemVec<usize>::new()
+    pick_fanout(book, exclude_tag: 3, fanout: 3, rng: mut rng, mut picks)
+    assert!(picks.len() == 1)
+    assert!(book.get(picks[0]).tag == 4)
+}
+
+#[test]
+fn test_parse_seeds_and_format_tag() {
+    var seeds = MemVec<SocketAddr>::new()
+    let spec = "127.0.0.1:7001, /ip4/127.0.0.1/tcp/7002 , /ip4/10.0.0.9/udp/7003/p2p/12D3KooWabc,"
+        .span()
+    assert!(parse_seeds(spec, mut seeds))
+    assert!(seeds.len() == 3)
+    assert!(seeds[0] == SocketAddr::parse("127.0.0.1:7001").unwrap())
+    assert!(seeds[1] == SocketAddr::parse("127.0.0.1:7002").unwrap())
+    assert!(seeds[2] == SocketAddr::parse("10.0.0.9:7003").unwrap())
+
+    var bad = MemVec<SocketAddr>::new()
+    assert!(!parse_seeds("/ip4/not-an-ip/tcp/7001".span(), mut bad))
+
+    var tag_buf = MemBuffer::empty()
+    format_peer_tag(0x0123456789abcdef, prefix: "fe-tcp".span(), mut tag_buf)
+    assert!(tag_buf == "fe-tcp-0123456789abcdef")
+}
+
+#[test]
+fn test_gossip_core_u16_and_csv() uses (clock: Clock) {
+    var u16_frame = MemBuffer::empty()
+    encode_u16_frame(kind: 0x10, origin: 7, seq: 9, 7001, mut u16_frame)
+    let hdr_u16 = decode_header(u16_frame.span()).unwrap()
+    assert!(
+        hdr_u16.kind == 0x10 && hdr_u16.origin == 7 && hdr_u16.seq == 9,
+    )
+    let port_val = decode_u16_payload(
+        u16_frame.span().slice(
+                offset: hdr_u16.payload_offset(),
+                len: hdr_u16.payload_len(),
+            ),
+    )
+        .unwrap()
+    assert!(port_val == 7001)
+
+    let tag = make_ephemeral_tag(node_id: 1, listen_port: 7002)
+    assert!((tag >> 32) == 2 && (tag & 0xffff) == 7002)
+
+    var core_a = GossipCore::new(
+        self_tag: 1,
+        listen_port: 7001,
+        rng_salt: 11,
+        gossip: GossipConfig::default(),
+    )
+    var core_b = GossipCore::new(
+        self_tag: 2,
+        listen_port: 7002,
+        rng_salt: 22,
+        gossip: GossipConfig::default(),
+    )
+
+    let from_a = SocketAddr::parse("127.0.0.1:7001").unwrap()
+    assert!(core_b.book.observe(tag: 1, addr: from_a, now_ms: 10))
+    var csv = MemBuffer::empty()
+    format_peers_csv(
+        entries: core_b.peer_entries(),
+        prefix: "fe-udp".span(),
+        mut csv,
+    )
+    assert!(csv == "fe-udp-0000000000000001")
+
+    var frame = MemBuffer::empty()
+    assert!(core_a.prepare_publish("payload-1".span(), mut frame))
+    assert!(core_a.stats.data_tx == 1)
+    let hdr = decode_header(frame.span()).unwrap()
+
+    var fwd = MemBuffer::empty()
+    assert!(
+        core_b.accept_data(hdr, raw: frame.span(), from: from_a, mut fwd),
+    )
+    assert!(decode_header(fwd.span()).unwrap().ttl == hdr.ttl - 1)
+    // Duplicate rejected
+    assert!(
+        !core_b.accept_data(hdr, raw: frame.span(), from: from_a, mut fwd),
+    )
+    assert!(core_b.stats.data_rx == 1 && core_b.stats.dup_dropped == 1)
+
+    var out = MemBuffer::empty()
+    let d = core_b.recv(mut out).unwrap()
+    assert!(d.origin == 1 && out == "payload-1")
+}

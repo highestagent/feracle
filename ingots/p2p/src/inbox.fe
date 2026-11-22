@@ -1,0 +1,73 @@
+//! Bounded FIFO of delivered application payloads.
+//!
+//! When full, the oldest payload is dropped so a stalled reader can never
+//! exhaust memory.
+
+use super::transport::Delivery
+
+pub struct Inbox {
+    payloads: MemVec<MemBuffer>,
+    meta: MemVec<Delivery>,
+    head: usize,
+    len: usize,
+    capacity: usize,
+    dropped: u64,
+}
+
+impl Inbox {
+    pub fn new(_ capacity: usize) -> Self {
+        assert!(capacity > 0, "an Inbox needs room")
+        Inbox {
+            payloads: MemVec::with_capacity(capacity),
+            meta: MemVec::with_capacity(capacity),
+            head: 0,
+            len: 0,
+            capacity,
+            dropped: 0,
+        }
+    }
+
+    pub fn push(mut self, _ payload: MemSpan, _ delivery: Delivery) {
+        if self.len == self.capacity {
+            self.head = (self.head + 1) % self.capacity
+            self.len -= 1
+            self.dropped += 1
+        }
+        let slot = (self.head + self.len) % self.capacity
+        let buf = MemBuffer::from_span(payload)
+        if slot < self.payloads.len() {
+            let _ = self.payloads.replace(slot, buf)
+            self.meta.set(slot, delivery)
+        } else {
+            self.payloads.push(buf)
+            self.meta.push(delivery)
+        }
+        self.len += 1
+    }
+
+    /// Moves the oldest payload into `out` (replacing its contents).
+    pub fn pop_into(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
+        if self.len == 0 {
+            return Option::None
+        }
+        let slot = self.head
+        let payload = self.payloads.replace(slot, MemBuffer::empty())
+        out.clear()
+        out.extend_from(payload.span())
+        self.head = (self.head + 1) % self.capacity
+        self.len -= 1
+        Option::Some(self.meta[slot])
+    }
+
+    pub fn len(self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn dropped(self) -> u64 {
+        self.dropped
+    }
+}

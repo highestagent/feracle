@@ -1,0 +1,129 @@
+//! The common frame envelope every transport speaks.
+//!
+//! ```text
+//! offset  size  field
+//! 0       2     magic   0xFE50
+//! 2       1     version
+//! 3       1     kind    (0x01 data, 0x10-0x1F udp, 0x20-0x2F tcp)
+//! 4       8     origin  tag of the node that created the frame
+//! 12      8     seq     origin-local sequence number
+//! 20      1     ttl     remaining forwarding hops
+//! 21      2     len     payload length
+//! 23      len   payload
+//! ```
+//!
+//! `(origin, seq)` is the frame's identity for deduplication. The header is
+//! self-delimiting, so stream transports need no extra length prefix.
+
+use core::num::IntDowncast
+
+pub const MAGIC: u16 = 0xFE50
+pub const VERSION: u8 = 1
+pub const HEADER_LEN: usize = 23
+/// Largest payload a frame carries; keeps any frame inside one UDP datagram.
+pub const MAX_PAYLOAD: usize = 1200
+/// Application data; every other kind is transport control traffic.
+pub const KIND_DATA: u8 = 0x01
+
+const TTL_OFFSET: usize = 20
+
+pub struct Header { pub kind: u8, pub origin: u64, pub seq: u64, pub ttl: u8, pub len: u16 }
+
+impl Copy for Header {}
+
+impl Header {
+    pub fn new(kind: u8, origin: u64, seq: u64, ttl: u8) -> Self {
+        Header { kind, origin, seq, ttl, len: 0 }
+    }
+
+    /// The frame's network-wide identity.
+    pub fn id(self) -> u128 {
+        let hi: u128 = self.origin as u128
+        (hi << 64) | (self.seq as u128)
+    }
+
+    pub fn is_data(self) -> bool {
+        self.kind == KIND_DATA
+    }
+
+    /// Offset of the payload inside an encoded frame.
+    pub fn payload_offset(self) -> usize {
+        HEADER_LEN
+    }
+
+    pub fn payload_len(self) -> usize {
+        self.len as usize
+    }
+}
+
+/// Total encoded length of a frame with this header.
+pub fn frame_len(_ header: Header) -> usize {
+    HEADER_LEN + header.payload_len()
+}
+
+/// Appends `header` + `payload` to `out`; `false` if the payload is too large.
+pub fn encode_frame(_ header: Header, _ payload: MemSpan, _ out: mut MemBuffer) -> bool {
+    if payload.len() > MAX_PAYLOAD {
+        return false
+    }
+    let start = out.len()
+    out.resize(start + HEADER_LEN)
+    out.write_be<u16>(offset: start, value: MAGIC)
+    out[start + 2] = VERSION
+    out[start + 3] = header.kind
+    out.write_be<u64>(offset: start + 4, value: header.origin)
+    out.write_be<u64>(offset: start + 12, value: header.seq)
+    out[start + TTL_OFFSET] = header.ttl
+    out.write_be<u16>(
+        offset: start + 21,
+        value: payload.len().downcast_unchecked(),
+    )
+    out.extend_from(payload)
+    true
+}
+
+/// Parses and validates a header. The payload may still be incomplete;
+/// check `bytes.len() >= frame_len(header)` before reading it.
+pub fn decode_header(_ bytes: MemSpan) -> Option<Header> {
+    if bytes.len() < HEADER_LEN {
+        return Option::None
+    }
+    if bytes.read_be<u16>(0) != MAGIC || bytes.byte_at(2) != VERSION {
+        return Option::None
+    }
+    let len = bytes.read_be<u16>(21)
+    if len as usize > MAX_PAYLOAD {
+        return Option::None
+    }
+    Option::Some(
+        Header {
+            kind: bytes.byte_at(3),
+            origin: bytes.read_be<u64>(4),
+            seq: bytes.read_be<u64>(12),
+            ttl: bytes.byte_at(TTL_OFFSET),
+            len,
+        },
+    )
+}
+
+/// Rewrites the hop budget of an encoded frame in place before forwarding.
+pub fn set_ttl(_ frame: mut MemBuffer, _ ttl: u8) {
+    if frame.len() > TTL_OFFSET {
+        frame[TTL_OFFSET] = ttl
+    }
+}
+
+pub fn encode_u16_frame(kind: u8, origin: u64, seq: u64, _ value: u16, _ out: mut MemBuffer) {
+    out.clear()
+    var payload = MemBuffer::new(2)
+    payload.write_be<u16>(offset: 0, value)
+    let hdr = Header::new(kind, origin, seq, ttl: 1)
+    let _ = encode_frame(hdr, payload.span(), mut out)
+}
+
+pub fn decode_u16_payload(_ payload: MemSpan) -> Option<u16> {
+    if payload.len() < 2 {
+        return Option::None
+    }
+    Option::Some(payload.read_be<u16>(0))
+}
