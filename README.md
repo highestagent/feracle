@@ -4,6 +4,9 @@ Feracle is a decentralized price oracle with both on-chain settlement and off-ch
 
 ![Fe 26.7.0](https://img.shields.io/badge/Fe-26.7.0-4A6FA5?style=flat&labelColor=2A2D36)
 
+> [!IMPORTANT]
+> Feracle is experimental, unaudited software. It intentionally omits many safeguards required in a production decentralized oracle network—such as staking/slashing, Sybil-resistant membership, HSM key management, and governance fail-safes—and should not be used in production with real funds.
+
 ## The problem
 
 Decentralized price oracles split their stack across different toolchains—Solidity on-chain, Go or Rust off-chain, and TypeScript for monitoring. Protocol engineers and oracle operators end up re-implementing ABI framing, fixed-point math, and tolerance checks in three languages, creating silent parity bugs and heavy operational glue.
