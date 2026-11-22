@@ -1,0 +1,174 @@
+//! Depth-aware, zero-allocation JSON span scanner.
+
+use core::num::IntDowncast
+use core::text::parse_uint
+use super::hex::is_ascii_ws
+
+fn skip_ws(_ s: MemSpan, start: usize) -> usize {
+    var i = start
+    while i < s.len() && is_ascii_ws(s.byte_at(i)) {
+        i += 1
+    }
+    i
+}
+
+fn scan_json_string_end(_ s: MemSpan, quote_pos: usize) -> Option<usize> {
+    if quote_pos >= s.len() || s.byte_at(quote_pos) != b'"' {
+        return Option::None
+    }
+    var i = quote_pos + 1
+    while i < s.len() {
+        let ch = s.byte_at(i)
+        if ch == b'\\' {
+            if i + 1 >= s.len() {
+                return Option::None
+            }
+            i += 2
+            continue
+        }
+        if ch == b'"' {
+            return Option::Some(i)
+        }
+        i += 1
+    }
+    Option::None
+}
+
+fn scan_json_value_end(_ s: MemSpan, start: usize) -> Option<usize> {
+    if start >= s.len() {
+        return Option::None
+    }
+    let ch = s.byte_at(start)
+    if ch == b'"' {
+        let end_q = scan_json_string_end(s, quote_pos: start)?
+        return Option::Some(end_q + 1)
+    }
+    if ch == b'{' || ch == b'[' {
+        var depth: usize = 0
+        var i = start
+        while i < s.len() {
+            let b = s.byte_at(i)
+            if b == b'"' {
+                let end_q = scan_json_string_end(s, quote_pos: i)?
+                i = end_q + 1
+                continue
+            }
+            if b == b'{' || b == b'[' {
+                depth += 1
+            } else if b == b'}' || b == b']' {
+                if depth == 0 {
+                    return Option::None
+                }
+                depth -= 1
+                if depth == 0 {
+                    return Option::Some(i + 1)
+                }
+            }
+            i += 1
+        }
+        return Option::None
+    }
+    var i = start
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if b == b',' || b == b'}' || b == b']' || is_ascii_ws(b) {
+            break
+        }
+        i += 1
+    }
+    if i == start {
+        Option::None
+    } else {
+        Option::Some(i)
+    }
+}
+
+fn find_json_field_bounds(_ obj: MemSpan, _ key: MemSpan) -> Option<(usize, usize)> {
+    let start = skip_ws(obj, start: 0)
+    if start >= obj.len() || obj.byte_at(start) != b'{' {
+        return Option::None
+    }
+    var i = start + 1
+    while i < obj.len() {
+        i = skip_ws(obj, start: i)
+        if i >= obj.len() {
+            return Option::None
+        }
+        let b = obj.byte_at(i)
+        if b == b'}' {
+            return Option::None
+        }
+        if b == b',' {
+            i += 1
+            continue
+        }
+        if b != b'"' {
+            return Option::None
+        }
+        let key_end_q = scan_json_string_end(obj, quote_pos: i)?
+        let field_key = obj.slice(offset: i + 1, len: key_end_q - (i + 1))
+        var pos = skip_ws(obj, start: key_end_q + 1)
+        if pos >= obj.len() || obj.byte_at(pos) != b':' {
+            return Option::None
+        }
+        pos = skip_ws(obj, start: pos + 1)
+        let val_end = scan_json_value_end(obj, start: pos)?
+        if field_key == key {
+            return Option::Some((pos, val_end - pos))
+        }
+        i = val_end
+    }
+    Option::None
+}
+
+pub fn json_get_raw(_ obj: MemSpan, _ key: MemSpan) -> Option<(usize, usize)> {
+    find_json_field_bounds(obj, key)
+}
+
+pub fn json_get_str_bounds(_ obj: MemSpan, _ key: MemSpan) -> Option<(usize, usize)> {
+    let (off, len) = find_json_field_bounds(obj, key)?
+    if len < 2 || obj.byte_at(off) != b'"' || obj.byte_at(off + len - 1) != b'"' {
+        return Option::None
+    }
+    Option::Some((off + 1, len - 2))
+}
+
+pub fn json_get_u64(_ obj: MemSpan, _ key: MemSpan) -> Option<u64> {
+    let (off, len) = find_json_field_bounds(obj, key)?
+    let tok = obj.slice(offset: off, len)
+    let val: u256 = parse_uint(tok)?
+    val.downcast()
+}
+
+pub fn json_get_bool(_ obj: MemSpan, _ key: MemSpan) -> Option<bool> {
+    let (off, len) = find_json_field_bounds(obj, key)?
+    let tok = obj.slice(offset: off, len)
+    if tok == "true" {
+        Option::Some(true)
+    } else if tok == "false" {
+        Option::Some(false)
+    } else {
+        Option::None
+    }
+}
+
+pub fn json_next_array_elem(_ arr: MemSpan, _ cursor: mut usize) -> Option<(usize, usize)> {
+    if cursor == 0 {
+        let start = skip_ws(arr, start: 0)
+        if start >= arr.len() || arr.byte_at(start) != b'[' {
+            return Option::None
+        }
+        cursor = start + 1
+    }
+    var i = skip_ws(arr, start: cursor)
+    while i < arr.len() && arr.byte_at(i) == b',' {
+        i = skip_ws(arr, start: i + 1)
+    }
+    if i >= arr.len() || arr.byte_at(i) == b']' {
+        cursor = arr.len()
+        return Option::None
+    }
+    let end = scan_json_value_end(arr, start: i)?
+    cursor = end
+    Option::Some((i, end - i))
+}

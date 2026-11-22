@@ -1,0 +1,99 @@
+//! Canonical Top-20 asset registry and oracle protocol parameters.
+
+pub const ASSET_COUNT: usize = 20
+pub const NODE_COUNT: u64 = 3
+pub const QUORUM: usize = 3
+pub const MAX_TOLERANCE_BPS: u64 = 100
+pub const PRICE_SCALE: u64 = 100_000_000
+
+pub fn write_asset_symbol(_ asset_id: usize, _ out: mut MemBuffer) {
+    if asset_id == 0 {
+        out.extend_from("BTC".span())
+    } else if asset_id == 1 {
+        out.extend_from("ETH".span())
+    } else if asset_id == 2 {
+        out.extend_from("SOL".span())
+    } else if asset_id == 3 {
+        out.extend_from("XRP".span())
+    } else if asset_id == 4 {
+        out.extend_from("BNB".span())
+    } else if asset_id == 5 {
+        out.extend_from("DOGE".span())
+    } else if asset_id == 6 {
+        out.extend_from("ADA".span())
+    } else if asset_id == 7 {
+        out.extend_from("TRX".span())
+    } else if asset_id == 8 {
+        out.extend_from("AVAX".span())
+    } else if asset_id == 9 {
+        out.extend_from("LINK".span())
+    } else if asset_id == 10 {
+        out.extend_from("SUI".span())
+    } else if asset_id == 11 {
+        out.extend_from("DOT".span())
+    } else if asset_id == 12 {
+        out.extend_from("HBAR".span())
+    } else if asset_id == 13 {
+        out.extend_from("BCH".span())
+    } else if asset_id == 14 {
+        out.extend_from("LTC".span())
+    } else if asset_id == 15 {
+        out.extend_from("UNI".span())
+    } else if asset_id == 16 {
+        out.extend_from("NEAR".span())
+    } else if asset_id == 17 {
+        out.extend_from("APT".span())
+    } else if asset_id == 18 {
+        out.extend_from("ARB".span())
+    } else if asset_id == 19 {
+        out.extend_from("AAVE".span())
+    } else {
+        out.extend_from("UNK".span())
+    }
+}
+
+pub fn asset_id_from_symbol(_ sym: MemSpan) -> Option<usize> {
+    if sym == "BTC" {
+        Option::Some(0)
+    } else if sym == "ETH" {
+        Option::Some(1)
+    } else if sym == "SOL" {
+        Option::Some(2)
+    } else if sym == "XRP" {
+        Option::Some(3)
+    } else if sym == "BNB" {
+        Option::Some(4)
+    } else if sym == "DOGE" {
+        Option::Some(5)
+    } else if sym == "ADA" {
+        Option::Some(6)
+    } else if sym == "TRX" {
+        Option::Some(7)
+    } else if sym == "AVAX" {
+        Option::Some(8)
+    } else if sym == "LINK" {
+        Option::Some(9)
+    } else if sym == "SUI" {
+        Option::Some(10)
+    } else if sym == "DOT" {
+        Option::Some(11)
+    } else if sym == "HBAR" {
+        Option::Some(12)
+    } else if sym == "BCH" {
+        Option::Some(13)
+    } else if sym == "LTC" {
+        Option::Some(14)
+    } else if sym == "UNI" {
+        Option::Some(15)
+    } else if sym == "NEAR" {
+        Option::Some(16)
+    } else if sym == "APT" {
+        Option::Some(17)
+    } else if sym == "ARB" {
+        Option::Some(18)
+    } else if sym == "AAVE" {
+        Option::Some(19)
+    } else {
+        Option::None
+    }
+}

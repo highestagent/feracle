@@ -1,0 +1,213 @@
+//! Big-endian oracle wire codecs and signer quorum sorting.
+
+use super::assets::ASSET_COUNT
+
+pub const MSG_TYPE_QUOTE: u8 = 0
+pub const MSG_TYPE_SIG: u8 = 1
+pub const QUOTE_FRAME_LEN: usize = 177
+pub const SIG_FRAME_LEN: usize = 262
+
+pub struct QuoteMsg { pub round_id: u64, pub timestamp: u64, pub prices: [u64; 20] }
+
+impl Copy for QuoteMsg {}
+
+pub struct SigMsg {
+    pub round_id: u64,
+    pub timestamp: u64,
+    pub median_prices: [u64; 20],
+    pub signer_addr: [u8; 20],
+    pub v: u8,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
+}
+
+impl Copy for SigMsg {}
+
+pub fn write_prices_be(_ out: mut MemBuffer, offset: usize, _ prices: [u64; 20]) {
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        out.write_be<u64>(offset: offset + i * 8, value: prices[i])
+        i += 1
+    }
+}
+
+pub fn read_prices_be(_ data: MemSpan, offset: usize) -> [u64; 20] {
+    var out: [u64; 20] = [0; 20]
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        out[i] = data.read_be<u64>(offset + i * 8)
+        i += 1
+    }
+    out
+}
+
+pub fn encode_prices_be160(_ prices: [u64; 20]) -> MemBuffer {
+    var buf = MemBuffer::new(160)
+    write_prices_be(mut buf, offset: 0, prices)
+    buf
+}
+
+pub fn encode_quote_buf(_ q: QuoteMsg) -> MemBuffer {
+    var buf = MemBuffer::new(QUOTE_FRAME_LEN)
+    buf[0] = MSG_TYPE_QUOTE
+    buf.write_be<u64>(offset: 1, value: q.round_id)
+    buf.write_be<u64>(offset: 9, value: q.timestamp)
+    write_prices_be(mut buf, offset: 17, q.prices)
+    buf
+}
+
+pub fn encode_quote(_ q: QuoteMsg) -> [u8; 177] {
+    let buf = encode_quote_buf(q)
+    var out: [u8; 177] = [0; 177]
+    var i: usize = 0
+    while i < QUOTE_FRAME_LEN {
+        out[i] = buf[i]
+        i += 1
+    }
+    out
+}
+
+pub fn decode_quote(_ data: MemSpan) -> Option<QuoteMsg> {
+    if data.len() != QUOTE_FRAME_LEN || data.byte_at(0) != MSG_TYPE_QUOTE {
+        return Option::None
+    }
+    Option::Some(
+        QuoteMsg {
+            round_id: data.read_be<u64>(1),
+            timestamp: data.read_be<u64>(9),
+            prices: read_prices_be(data, offset: 17),
+        },
+    )
+}
+
+pub fn decode_quote_array(_ raw: [u8; 177]) -> Option<QuoteMsg> {
+    var buf = MemBuffer::new(QUOTE_FRAME_LEN)
+    var i: usize = 0
+    while i < QUOTE_FRAME_LEN {
+        buf[i] = raw[i]
+        i += 1
+    }
+    decode_quote(buf.span())
+}
+
+pub fn encode_sig_msg_buf(_ m: SigMsg) -> MemBuffer {
+    var buf = MemBuffer::new(SIG_FRAME_LEN)
+    buf[0] = MSG_TYPE_SIG
+    buf.write_be<u64>(offset: 1, value: m.round_id)
+    buf.write_be<u64>(offset: 9, value: m.timestamp)
+    write_prices_be(mut buf, offset: 17, m.median_prices)
+    var i: usize = 0
+    while i < 20 {
+        buf[177 + i] = m.signer_addr[i]
+        i += 1
+    }
+    buf[197] = m.v
+    var j: usize = 0
+    while j < 32 {
+        buf[198 + j] = m.r[j]
+        buf[230 + j] = m.s[j]
+        j += 1
+    }
+    buf
+}
+
+pub fn encode_sig_msg(_ m: SigMsg) -> [u8; 262] {
+    let buf = encode_sig_msg_buf(m)
+    var out: [u8; 262] = [0; 262]
+    var i: usize = 0
+    while i < SIG_FRAME_LEN {
+        out[i] = buf[i]
+        i += 1
+    }
+    out
+}
+
+pub fn decode_sig_msg(_ data: MemSpan) -> Option<SigMsg> {
+    if data.len() != SIG_FRAME_LEN || data.byte_at(0) != MSG_TYPE_SIG {
+        return Option::None
+    }
+    let median_prices = read_prices_be(data, offset: 17)
+    var signer_addr: [u8; 20] = [0; 20]
+    var i: usize = 0
+    while i < 20 {
+        signer_addr[i] = data.byte_at(177 + i)
+        i += 1
+    }
+    let v = data.byte_at(197)
+    var r: [u8; 32] = [0; 32]
+    var s: [u8; 32] = [0; 32]
+    var j: usize = 0
+    while j < 32 {
+        r[j] = data.byte_at(198 + j)
+        s[j] = data.byte_at(230 + j)
+        j += 1
+    }
+    Option::Some(
+        SigMsg {
+            round_id: data.read_be<u64>(1),
+            timestamp: data.read_be<u64>(9),
+            median_prices,
+            signer_addr,
+            v,
+            r,
+            s,
+        },
+    )
+}
+
+pub fn decode_sig_msg_array(_ raw: [u8; 262]) -> Option<SigMsg> {
+    var buf = MemBuffer::new(SIG_FRAME_LEN)
+    var i: usize = 0
+    while i < SIG_FRAME_LEN {
+        buf[i] = raw[i]
+        i += 1
+    }
+    decode_sig_msg(buf.span())
+}
+
+pub fn compare_addr20(_ a: [u8; 20], _ b: [u8; 20]) -> i8 {
+    var i: usize = 0
+    while i < 20 {
+        if a[i] < b[i] { return -1 }
+        if a[i] > b[i] { return 1 }
+        i += 1
+    }
+    0
+}
+
+pub fn addr20_eq(_ a: [u8; 20], _ b: [u8; 20]) -> bool {
+    compare_addr20(a, b) == 0
+}
+
+pub fn add_sig_dedup(_ list: mut MemVec<SigMsg>, _ sig_msg: SigMsg) {
+    var i: usize = 0
+    while i < list.len() {
+        let existing = list[i]
+        if existing.round_id == sig_msg.round_id
+            && addr20_eq(existing.signer_addr, sig_msg.signer_addr) {
+            return
+        }
+        i += 1
+    }
+    list.push(sig_msg)
+}
+
+pub fn sort_three_sigs(_ input: [SigMsg; 3]) -> [SigMsg; 3] {
+    var arr = input
+    if compare_addr20(arr[0].signer_addr, arr[1].signer_addr) > 0 {
+        let tmp = arr[0]
+        arr[0] = arr[1]
+        arr[1] = tmp
+    }
+    if compare_addr20(arr[1].signer_addr, arr[2].signer_addr) > 0 {
+        let tmp = arr[1]
+        arr[1] = arr[2]
+        arr[2] = tmp
+    }
+    if compare_addr20(arr[0].signer_addr, arr[1].signer_addr) > 0 {
+        let tmp = arr[0]
+        arr[0] = arr[1]
+        arr[1] = tmp
+    }
+    arr
+}

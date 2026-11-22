@@ -1,0 +1,62 @@
+//! Canonical Solidity ABI selectors and 32-byte ABI word hex decoders.
+
+use super::assets::ASSET_COUNT
+use super::hex::{hex_nibble, normalize_addr20_hex}
+
+pub const SEL_SUBMIT_MEDIANS: String<10> = "0x6d2b8b3f"
+pub const SEL_LATEST_PRICES: String<10> = "0xda8fa900"
+pub const SEL_LATEST_PRICE: String<10> = "0x174ed5cc"
+pub const SEL_ASSET_COUNT: String<10> = "0xeafe7a74"
+pub const SEL_CURRENT_ROUND: String<10> = "0x8a19c8bc"
+pub const SEL_OWNER: String<10> = "0x8da5cb5b"
+pub const SEL_IS_ORACLE: String<10> = "0xa97e5c93"
+
+pub fn parse_abi_word_u64(_ hex_no_0x: MemSpan, word_idx: usize) -> Option<u64> {
+    let start = word_idx * 64
+    if start + 64 > hex_no_0x.len() {
+        return Option::None
+    }
+    let word = hex_no_0x.slice(offset: start, len: 64)
+    var i: usize = 0
+    while i < 48 {
+        if word.byte_at(i) != b'0' {
+            return Option::None
+        }
+        i += 1
+    }
+    var acc: u64 = 0
+    while i < 64 {
+        let d = hex_nibble(word.byte_at(i))? as u64
+        acc = (acc << 4) | d
+        i += 1
+    }
+    Option::Some(acc)
+}
+
+pub fn parse_abi_word_bool(_ hex_no_0x: MemSpan, word_idx: usize) -> Option<bool> {
+    let v = parse_abi_word_u64(hex_no_0x, word_idx)?
+    Option::Some(v != 0)
+}
+
+pub fn parse_abi_word_addr20(_ hex_no_0x: MemSpan, word_idx: usize, _ out: mut MemBuffer) -> bool {
+    let start = word_idx * 64
+    if start + 64 > hex_no_0x.len() {
+        return false
+    }
+    let addr_hex = hex_no_0x.slice(offset: start + 24, len: 40)
+    normalize_addr20_hex(addr_hex, mut out)
+}
+
+pub fn decode_latest_prices_abi_hex(_ hex_no_0x: MemSpan) -> Option<([u64; 20], u64)> {
+    if hex_no_0x.len() < 1344 {
+        return Option::None
+    }
+    var prices: [u64; 20] = [0; 20]
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        prices[i] = parse_abi_word_u64(hex_no_0x, word_idx: i)?
+        i += 1
+    }
+    let last_updated = parse_abi_word_u64(hex_no_0x, word_idx: ASSET_COUNT)?
+    Option::Some((prices, last_updated))
+}

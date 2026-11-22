@@ -1,0 +1,200 @@
+//! Target-independent integer oracle math, tolerance checks, and decimal parsing.
+
+use core::num::{Bounded, IntDowncast}
+use core::text::Text
+use super::assets::{ASSET_COUNT, PRICE_SCALE}
+
+pub fn median_of_three(_ a: u64, _ b: u64, _ c: u64) -> u64 {
+    if a <= b {
+        if b <= c { b } else if a <= c { c } else { a }
+    } else {
+        if a <= c { a } else if b <= c { c } else { b }
+    }
+}
+
+pub fn median_u64(_ values: [u64; 3]) -> u64 {
+    median_of_three(values[0], values[1], values[2])
+}
+
+pub fn median_prices_3(_ a: [u64; 20], _ b: [u64; 20], _ c: [u64; 20]) -> [u64; 20] {
+    var out: [u64; 20] = [0; 20]
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        out[i] = median_of_three(a[i], b[i], c[i])
+        i += 1
+    }
+    out
+}
+
+pub fn prices_eq(_ a: [u64; 20], _ b: [u64; 20]) -> bool {
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+pub fn all_prices_nonzero(_ prices: [u64; 20]) -> bool {
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        if prices[i] == 0 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+pub fn within_tolerance_bps(local: u64, proposed: u64, max_bps: u64) -> bool {
+    if local == 0 {
+        return proposed == 0
+    }
+    let diff: u128 = if proposed >= local {
+        (proposed - local) as u128
+    } else {
+        (local - proposed) as u128
+    }
+    let lhs: u128 = diff * (10_000 as u128)
+    let rhs: u128 = (local as u128) * (max_bps as u128)
+    lhs <= rhs
+}
+
+pub fn first_tolerance_breach_asset(local: [u64; 20], proposed: [u64; 20], max_bps: u64) -> Option<
+    usize,
+> {
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        if !within_tolerance_bps(local: local[i], proposed: proposed[i], max_bps) {
+            return Option::Some(i)
+        }
+        i += 1
+    }
+    Option::None
+}
+
+pub fn within_tolerance_all_bps(local: [u64; 20], proposed: [u64; 20], max_bps: u64) -> bool {
+    first_tolerance_breach_asset(local, proposed, max_bps).is_none()
+}
+
+pub fn signed_bps_diff(val: u64, base: u64) -> i64 {
+    if base == 0 { return 0 }
+    if val >= base {
+        let diff = (val - base) as u128
+        let bps = (diff * (10_000 as u128)) / (base as u128)
+        if bps > 999_999_999 {
+            return 999_999_999
+        }
+        let u: u64 = bps.downcast_unchecked()
+        u.downcast_unchecked()
+    } else {
+        let diff = (base - val) as u128
+        let bps = (diff * (10_000 as u128)) / (base as u128)
+        if bps > 999_999_999 {
+            return -999_999_999
+        }
+        let u: u64 = bps.downcast_unchecked()
+        let signed: i64 = u.downcast_unchecked()
+        (0 as i64) - signed
+    }
+}
+
+pub fn abs_i64(_ x: i64) -> u64 {
+    if x < 0 {
+        ((0 as i64) - x).downcast_unchecked()
+    } else {
+        x.downcast_unchecked()
+    }
+}
+
+pub fn worst_quote_deviation(_ prices: [u64; 20], _ medians: [u64; 20]) -> (usize, i64) {
+    var worst_idx: usize = 0
+    var worst_bps: i64 = 0
+    var worst_abs: u64 = 0
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        let bps = signed_bps_diff(val: prices[i], base: medians[i])
+        let ab = abs_i64(bps)
+        if ab > worst_abs {
+            worst_abs = ab
+            worst_bps = bps
+            worst_idx = i
+        }
+        i += 1
+    }
+    (worst_idx, worst_bps)
+}
+
+pub fn leader_index(round_id: u64, node_count: u64) -> u64 {
+    assert!(node_count > 0)
+    round_id % node_count
+}
+
+pub fn parse_decimal_1e8<T: Text>(_ text: T) -> Option<u64> {
+    let len = text.text_len()
+    if len == 0 {
+        return Option::None
+    }
+
+    var whole: u128 = 0
+    var frac: u128 = 0
+    var frac_digits: usize = 0
+    var seen_dot = false
+    var seen_whole_digit = false
+    var seen_frac_digit = false
+    let max_u64: u128 = u64::max() as u128
+
+    var i: usize = 0
+    while i < len {
+        let ch = text.text_byte(i)
+        if ch == b'.' {
+            if seen_dot || !seen_whole_digit {
+                return Option::None
+            }
+            seen_dot = true
+        } else if ch >= b'0' && ch <= b'9' {
+            let digit: u128 = (ch - b'0') as u128
+            if !seen_dot {
+                seen_whole_digit = true
+                whole = whole * (10 as u128) + digit
+                if whole * (PRICE_SCALE as u128) > max_u64 {
+                    return Option::None
+                }
+            } else {
+                seen_frac_digit = true
+                if frac_digits < 8 {
+                    frac = frac * (10 as u128) + digit
+                    frac_digits += 1
+                }
+            }
+        } else {
+            return Option::None
+        }
+        i += 1
+    }
+
+    if !seen_whole_digit {
+        return Option::None
+    }
+    if seen_dot && !seen_frac_digit {
+        return Option::None
+    }
+
+    var scale_rem: usize = 8 - frac_digits
+    while scale_rem > 0 {
+        frac = frac * (10 as u128)
+        scale_rem -= 1
+    }
+
+    let total: u128 = whole * (PRICE_SCALE as u128) + frac
+    if total > max_u64 {
+        return Option::None
+    }
+    Option::Some(total.downcast_unchecked())
+}
+
+pub fn parse_decimal_1e8_span(_ span: MemSpan) -> Option<u64> {
+    parse_decimal_1e8(span)
+}

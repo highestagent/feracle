@@ -1,0 +1,307 @@
+use core::num::IntDowncast
+use super::{
+    ASSET_COUNT,
+    QuoteMsg,
+    SEL_CURRENT_ROUND,
+    SEL_LATEST_PRICES,
+    SigMsg,
+    add_sig_dedup,
+    addr20_eq,
+    all_prices_nonzero,
+    asset_id_from_symbol,
+    compare_addr20,
+    decode_hex_bytes,
+    decode_latest_prices_abi_hex,
+    decode_quote,
+    decode_quote_array,
+    decode_sig_msg,
+    decode_sig_msg_array,
+    encode_prices_be160,
+    encode_quote,
+    encode_quote_buf,
+    encode_sig_msg,
+    encode_sig_msg_buf,
+    first_tolerance_breach_asset,
+    format_hex_addr,
+    json_get_bool,
+    json_get_str_bounds,
+    json_get_u64,
+    json_next_array_elem,
+    leader_index,
+    median_of_three,
+    median_prices_3,
+    median_u64,
+    normalize_addr20_hex,
+    parse_abi_word_bool,
+    parse_abi_word_u64,
+    parse_decimal_1e8,
+    parse_fixed_hex,
+    parse_hex_addr20,
+    parse_hex_u64,
+    prices_eq,
+    push_hex_32,
+    signed_bps_diff,
+    sort_three_sigs,
+    to_ascii_lower,
+    within_tolerance_all_bps,
+    within_tolerance_bps,
+    worst_quote_deviation,
+    write_asset_symbol,
+}
+
+#[test]
+fn test_asset_symbols_and_lookup() {
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        var buf = MemBuffer::empty()
+        write_asset_symbol(i, mut buf)
+        let id = asset_id_from_symbol(buf.span()).unwrap()
+        assert!(id == i)
+        i += 1
+    }
+    assert!(asset_id_from_symbol("BTC".span()) == Option::Some(0))
+    assert!(asset_id_from_symbol("AAVE".span()) == Option::Some(19))
+    assert!(asset_id_from_symbol("UNKNOWN".span()).is_none())
+
+    var unk = MemBuffer::empty()
+    write_asset_symbol(20, mut unk)
+    assert!(unk.span() == "UNK")
+}
+
+#[test]
+fn test_median_of_three_and_batch_medians() {
+    assert!(median_of_three(10, 20, 30) == 20)
+    assert!(median_of_three(30, 10, 20) == 20)
+    assert!(median_of_three(50, 50, 10) == 50)
+    assert!(
+        median_u64([9245050000000, 99999900000000, 9244800000000]) == 9245050000000,
+    )
+
+    var p0: [u64; 20] = [100; 20]
+    var p1: [u64; 20] = [200; 20]
+    var p2: [u64; 20] = [300; 20]
+    p0[1] = 342_050_000_000
+    p1[1] = 9_999_900_000_000
+    p2[1] = 342_210_000_000
+    let med = median_prices_3(p0, p1, p2)
+    assert!(
+        med[0] == 200 && med[1] == 342_210_000_000 && med[19] == 200,
+    )
+    assert!(all_prices_nonzero(med))
+    var zeroed = med
+    zeroed[19] = 0
+    assert!(!all_prices_nonzero(zeroed))
+}
+
+#[test]
+fn test_within_tolerance_and_signed_bps() {
+    assert!(
+        within_tolerance_bps(local: 10_000, proposed: 10_100, max_bps: 100),
+    )
+    assert!(
+        !within_tolerance_bps(local: 10_000, proposed: 10_101, max_bps: 100),
+    )
+    assert!(
+        within_tolerance_bps(local: 10_000, proposed: 9_900, max_bps: 100),
+    )
+    assert!(
+        !within_tolerance_bps(local: 10_000, proposed: 9_899, max_bps: 100),
+    )
+
+    var a: [u64; 20] = [10_000; 20]
+    var b: [u64; 20] = [10_050; 20]
+    assert!(
+        within_tolerance_all_bps(local: a, proposed: b, max_bps: 100),
+    )
+    b[7] = 10_101
+    assert!(
+        first_tolerance_breach_asset(local: a, proposed: b, max_bps: 100) == Option::Some(7),
+    )
+    assert!(
+        !within_tolerance_all_bps(local: a, proposed: b, max_bps: 100),
+    )
+
+    assert!(signed_bps_diff(val: 10_250, base: 10_000) == 250)
+    assert!(signed_bps_diff(val: 9_750, base: 10_000) == -250)
+    b[7] = 9_500
+    let (w_idx, w_bps) = worst_quote_deviation(b, a)
+    assert!(w_idx == 7 && w_bps == -500)
+}
+
+#[test]
+fn test_parse_decimal_1e8() {
+    assert!(
+        parse_decimal_1e8("92450.25") == Option::Some(9_245_025_000_000),
+    )
+    assert!(
+        parse_decimal_1e8("92450") == Option::Some(9_245_000_000_000),
+    )
+    assert!(parse_decimal_1e8("0.00451234") == Option::Some(451_234))
+    assert!(
+        parse_decimal_1e8("1.1234567899") == Option::Some(112_345_678),
+    )
+    assert!(parse_decimal_1e8("") == Option::None)
+    assert!(parse_decimal_1e8(".5") == Option::None)
+    assert!(parse_decimal_1e8("92450.") == Option::None)
+}
+
+#[test]
+fn test_quote_and_sig_wire_and_quorum() {
+    var prices: [u64; 20] = [500_000_000; 20]
+    prices[0] = 9_245_025_000_000
+    prices[19] = 31_850_000_000
+
+    let be160 = encode_prices_be160(prices)
+    assert!(
+        be160.len() == 160 && be160.read_be<u64>(0) == 9_245_025_000_000,
+    )
+
+    let q = QuoteMsg { round_id: 0x0102030405060708, timestamp: 1_795_250_000, prices }
+    let q_raw = encode_quote(q)
+    let q_buf = encode_quote_buf(q)
+    assert!(q_buf.len() == 177 && q_raw[0] == 0x00 && q_raw[8] == 0x08)
+    assert!(
+        prices_eq(decode_quote(q_buf.span()).unwrap().prices, prices),
+    )
+    assert!(
+        prices_eq(decode_quote_array(q_raw).unwrap().prices, prices),
+    )
+
+    var s0_addr: [u8; 20] = [0; 20]
+    s0_addr[0] = 0x70
+    var s1_addr: [u8; 20] = [0; 20]
+    s1_addr[0] = 0x3c
+    var s2_addr: [u8; 20] = [0; 20]
+    s2_addr[0] = 0xf3
+    let r: [u8; 32] = [0xaa; 32]
+    let s: [u8; 32] = [0xbb; 32]
+
+    let m0 = SigMsg {
+        round_id: 7,
+        timestamp: 100,
+        median_prices: prices,
+        signer_addr: s0_addr,
+        v: 28,
+        r,
+        s,
+    }
+    let m1 = SigMsg {
+        round_id: 7,
+        timestamp: 100,
+        median_prices: prices,
+        signer_addr: s1_addr,
+        v: 27,
+        r,
+        s,
+    }
+    let m2 = SigMsg {
+        round_id: 7,
+        timestamp: 100,
+        median_prices: prices,
+        signer_addr: s2_addr,
+        v: 27,
+        r,
+        s,
+    }
+
+    let m0_raw = encode_sig_msg(m0)
+    let m0_buf = encode_sig_msg_buf(m0)
+    assert!(m0_buf.len() == 262 && m0_raw[197] == 28)
+    assert!(
+        addr20_eq(
+            decode_sig_msg(m0_buf.span()).unwrap().signer_addr,
+            s0_addr,
+        ),
+    )
+    assert!(decode_sig_msg_array(m0_raw).unwrap().v == 28)
+
+    var list = MemVec<SigMsg>::new()
+    add_sig_dedup(mut list, m0)
+    add_sig_dedup(mut list, m0)
+    add_sig_dedup(mut list, m1)
+    add_sig_dedup(mut list, m2)
+    assert!(list.len() == 3)
+    let sorted = sort_three_sigs([list[0], list[1], list[2]])
+    assert!(
+        compare_addr20(sorted[0].signer_addr, sorted[1].signer_addr) < 0,
+    )
+    assert!(
+        compare_addr20(sorted[1].signer_addr, sorted[2].signer_addr) < 0,
+    )
+}
+
+#[test]
+fn test_hex_abi_and_json_helpers() {
+    assert!(leader_index(round_id: 4, node_count: 3) == 1)
+    assert!(to_ascii_lower(b'Z') == b'z')
+    assert!(
+        SEL_CURRENT_ROUND == "0x8a19c8bc" && SEL_LATEST_PRICES == "0xda8fa900",
+    )
+
+    let addr_in = "0xF39FD6E51AAD88F6F4CE6AB8827279CFFFB92266".span()
+    let addr = parse_hex_addr20(addr_in).unwrap()
+    assert!(addr[0] == 0xf3 && addr[19] == 0x66)
+    assert!(
+        format_hex_addr(addr) == "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+    )
+
+    var norm = MemBuffer::empty()
+    assert!(normalize_addr20_hex(addr_in, mut norm))
+    assert!(norm == "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")
+
+    let (raw_k, pref_k) = parse_fixed_hex(addr_in, expected_bytes: 20).unwrap()
+    assert!(raw_k.len() == 20 && pref_k.span().starts_with("0x"))
+    assert!(parse_hex_u64("0x1a".span()) == Option::Some(26))
+
+    var decoded = MemBuffer::empty()
+    assert!(decode_hex_bytes("0xdeadbeef".span(), mut decoded))
+    assert!(
+        decoded.len() == 4 && decoded[0] == 0xde && decoded[3] == 0xef,
+    )
+
+    var hex32 = MemBuffer::empty()
+    let r: [u8; 32] = [0x0f; 32]
+    push_hex_32(mut hex32, r)
+    assert!(hex32.len() == 66 && hex32.span().starts_with("0x0f"))
+
+    var abi_hex = MemBuffer::with_capacity(21 * 64)
+    var w: usize = 0
+    while w < 20 {
+        abi_hex
+            .extend_from(
+                "0000000000000000000000000000000000000000000000000000000000000064".span(),
+            )
+        w += 1
+    }
+    abi_hex.extend_from(
+            "0000000000000000000000000000000000000000000000000000000000000001".span(),
+        )
+    assert!(
+        parse_abi_word_u64(abi_hex.span(), word_idx: 0) == Option::Some(100),
+    )
+    assert!(
+        parse_abi_word_bool(abi_hex.span(), word_idx: 20) == Option::Some(true),
+    )
+    let (prices, ts) = decode_latest_prices_abi_hex(abi_hex.span()).unwrap()
+    assert!(prices[0] == 100 && prices[19] == 100 && ts == 1)
+
+    let j = "{\"id\":5,\"ok\":true,\"result\":\"0x2a\",\"arr\":[10,{\"symbol\":\"BTC\",\"price\":\"92450\"}]}"
+        .span()
+    assert!(json_get_u64(j, "id".span()) == Option::Some(5))
+    assert!(json_get_bool(j, "ok".span()) == Option::Some(true))
+    let (ro, rl) = json_get_str_bounds(j, "result".span()).unwrap()
+    assert!(j.slice(offset: ro, len: rl) == "0x2a")
+}
+
+#[test]
+fn test_json_array_iteration() {
+    let arr = "[{\"symbol\":\"BTC\"},{\"symbol\":\"ETH\"}]".span()
+    var cursor: usize = 0
+    let (o0, l0) = json_next_array_elem(arr, mut cursor).unwrap()
+    let (so0, sl0) = json_get_str_bounds(arr.slice(offset: o0, len: l0), "symbol".span()).unwrap()
+    assert!(arr.slice(offset: o0 + so0, len: sl0) == "BTC")
+    let (o1, l1) = json_next_array_elem(arr, mut cursor).unwrap()
+    let (so1, sl1) = json_get_str_bounds(arr.slice(offset: o1, len: l1), "symbol".span()).unwrap()
+    assert!(arr.slice(offset: o1 + so1, len: sl1) == "ETH")
+    assert!(json_next_array_elem(arr, mut cursor).is_none())
+}

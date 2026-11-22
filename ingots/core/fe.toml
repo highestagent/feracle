@@ -1,0 +1,4 @@
+# Ingot name is `feracle_core` so it never shadows Fe's builtin `core` ingot.
+[ingot]
+name = "feracle_core"
+version = "0.1.0"

@@ -1,0 +1,161 @@
+//! Shared ASCII, hex encoding/decoding, and fixed-size EVM hex address helpers.
+
+pub fn to_ascii_lower(_ b: u8) -> u8 {
+    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
+}
+
+pub fn is_ascii_ws(_ b: u8) -> bool {
+    b == b' ' || b == b'\t' || b == b'\r' || b == b'\n'
+}
+
+pub fn hex_nibble(_ b: u8) -> Option<u8> {
+    if b >= b'0' && b <= b'9' {
+        Option::Some(b - b'0')
+    } else if b >= b'a' && b <= b'f' {
+        Option::Some(b - b'a' + 10)
+    } else if b >= b'A' && b <= b'F' {
+        Option::Some(b - b'A' + 10)
+    } else {
+        Option::None
+    }
+}
+
+pub fn hex_char(_ nibble: u8) -> u8 {
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + (nibble - 10)
+    }
+}
+
+pub fn strip_0x_offset(_ trimmed: MemSpan) -> usize {
+    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+        2
+    } else {
+        0
+    }
+}
+
+pub fn push_hex_bytes(_ out: mut MemBuffer, _ bytes: MemSpan) {
+    var i: usize = 0
+    while i < bytes.len() {
+        let b = bytes.byte_at(i)
+        out.push(hex_char(b >> 4))
+        out.push(hex_char(b & 0x0f))
+        i += 1
+    }
+}
+
+pub fn push_hex_32(_ out: mut MemBuffer, _ arr: [u8; 32]) {
+    out.extend_from("0x".span())
+    var i: usize = 0
+    while i < 32 {
+        let b = arr[i]
+        out.push(hex_char(b >> 4))
+        out.push(hex_char(b & 0x0f))
+        i += 1
+    }
+}
+
+pub fn push_addr20_hex(_ addr: [u8; 20], _ out: mut MemBuffer) {
+    out.extend_from("0x".span())
+    var i: usize = 0
+    while i < 20 {
+        let b = addr[i]
+        out.push(hex_char(b >> 4))
+        out.push(hex_char(b & 0x0f))
+        i += 1
+    }
+}
+
+pub fn format_hex_addr(_ addr: [u8; 20]) -> MemBuffer {
+    var out = MemBuffer::with_capacity(42)
+    push_addr20_hex(addr, mut out)
+    out
+}
+
+pub fn parse_fixed_hex(_ input: MemSpan, expected_bytes: usize) -> Option<(MemBuffer, MemBuffer)> {
+    let hex_part = input.tail(strip_0x_offset(input))
+    if hex_part.len() != expected_bytes * 2 {
+        return Option::None
+    }
+    var raw = MemBuffer::new(expected_bytes)
+    var prefixed = MemBuffer::with_capacity(2 + expected_bytes * 2)
+    prefixed.extend_from("0x".span())
+    prefixed.extend_from(hex_part)
+
+    var i: usize = 0
+    while i < expected_bytes {
+        let hi = hex_nibble(hex_part.byte_at(i * 2))?
+        let lo = hex_nibble(hex_part.byte_at(i * 2 + 1))?
+        raw[i] = (hi << 4) | lo
+        i += 1
+    }
+    Option::Some((raw, prefixed))
+}
+
+pub fn parse_hex_addr20(_ span: MemSpan) -> Option<[u8; 20]> {
+    let trimmed = span.trim()
+    let raw = trimmed.tail(strip_0x_offset(trimmed))
+    if raw.len() != 40 {
+        return Option::None
+    }
+    var out: [u8; 20] = [0; 20]
+    var i: usize = 0
+    while i < 20 {
+        let hi = hex_nibble(raw.byte_at(i * 2))?
+        let lo = hex_nibble(raw.byte_at(i * 2 + 1))?
+        out[i] = (hi << 4) | lo
+        i += 1
+    }
+    Option::Some(out)
+}
+
+pub fn normalize_addr20_hex(_ span: MemSpan, _ out: mut MemBuffer) -> bool {
+    let Option::Some(addr) = parse_hex_addr20(span) else {
+        return false
+    }
+    push_addr20_hex(addr, mut out)
+    true
+}
+
+pub fn parse_hex_u64(_ span: MemSpan) -> Option<u64> {
+    let trimmed = span.trim()
+    let raw = trimmed.tail(strip_0x_offset(trimmed))
+    if raw.is_empty() || raw.len() > 16 {
+        return Option::None
+    }
+    var acc: u64 = 0
+    var i: usize = 0
+    while i < raw.len() {
+        let d = hex_nibble(raw.byte_at(i))? as u64
+        acc = (acc << 4) | d
+        i += 1
+    }
+    Option::Some(acc)
+}
+
+pub fn decode_hex_bytes(_ span: MemSpan, _ out: mut MemBuffer) -> bool {
+    out.clear()
+    let trimmed = span.trim()
+    let raw = trimmed.tail(strip_0x_offset(trimmed))
+    if raw.len() % 2 != 0 {
+        return false
+    }
+    let byte_len = raw.len() / 2
+    out.reserve(byte_len)
+    var i: usize = 0
+    while i < byte_len {
+        let Option::Some(hi) = hex_nibble(raw.byte_at(i * 2)) else {
+            out.clear()
+            return false
+        }
+        let Option::Some(lo) = hex_nibble(raw.byte_at(i * 2 + 1)) else {
+            out.clear()
+            return false
+        }
+        out.push((hi << 4) | lo)
+        i += 1
+    }
+    true
+}
