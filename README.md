@@ -187,3 +187,7 @@ caddy run --config infra/Caddyfile
 ```
 
 Point the three oracle nodes at `127.0.0.1:9001`, `127.0.0.1:9002`, and `127.0.0.1:9003` against a local `anvil` node to fetch live market prices from Hyperliquid, Binance, and Coinbase. (Automated E2E runs do not require `caddy` and use `infra/mock_feeds.py`.)
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
