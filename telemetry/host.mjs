@@ -23,11 +23,11 @@ function printHelp() {
 Usage: node telemetry/host.mjs [OPTIONS]
 
 Options:
-  --rpc-url <URL>        EVM JSON-RPC endpoint URL [env: ORACLE_RPC_URL] [default: ${DEFAULT_RPC_URL}]
-  --contract <ADDR>      Deployed OffchainMedianOracle address (required) [env: ORACLE_CONTRACT]
-  --oracles <CSV>        Comma-separated oracle addresses (up to 3) [env: ORACLE_ORACLES]
-  --nodes <CSV>          Optional comma-separated node telemetry URLs (e.g. http://127.0.0.1:9101,...)
-  --wasm <PATH>          Path to compiled Fe WASM module [default: ${DEFAULT_WASM_PATH}]
+  --rpc-url <URL>        EVM JSON-RPC endpoint URL [env: FERACLE_RPC_URL] [default: ${DEFAULT_RPC_URL}]
+  --contract <ADDR>      Deployed OffchainMedianOracle address (required) [env: FERACLE_CONTRACT]
+  --oracles <CSV>        Comma-separated oracle addresses (up to 3) [env: FERACLE_ORACLES]
+  --nodes <CSV>          Optional comma-separated node telemetry URLs (e.g. http://127.0.0.1:9101,...) [env: FERACLE_NODES]
+  --wasm <PATH>          Path to compiled Fe WASM module [env: FERACLE_WASM] [default: ${DEFAULT_WASM_PATH}]
   --interval-ms <MS>     Poll & refresh interval in milliseconds [default: 1000]
   --mode <MODE>          Output mode: tui | json | prometheus [default: tui]
   --once                 Run one collection cycle, print output once, and exit
@@ -39,11 +39,11 @@ Options:
 
 function parseCliArgs(argv) {
   const opts = {
-    rpcUrl: process.env.ORACLE_RPC_URL || DEFAULT_RPC_URL,
-    contract: process.env.ORACLE_CONTRACT || "",
-    oracles: process.env.ORACLE_ORACLES || DEFAULT_ORACLES,
-    nodes: process.env.ORACLE_NODES || "",
-    wasm: process.env.ORACLE_WASM || DEFAULT_WASM_PATH,
+    rpcUrl: process.env.FERACLE_RPC_URL || DEFAULT_RPC_URL,
+    contract: process.env.FERACLE_CONTRACT || "",
+    oracles: process.env.FERACLE_ORACLES || DEFAULT_ORACLES,
+    nodes: process.env.FERACLE_NODES || "",
+    wasm: process.env.FERACLE_WASM || DEFAULT_WASM_PATH,
     intervalMs: 1000,
     mode: "tui",
     once: false,
@@ -107,7 +107,7 @@ function parseCliArgs(argv) {
     opts.ansi = false;
   }
   if (!opts.contract) {
-    console.error("Missing required --contract <ADDR> (or ORACLE_CONTRACT)");
+    console.error("Missing required --contract <ADDR> (or FERACLE_CONTRACT)");
     process.exit(2);
   }
   if (!["tui", "json", "prometheus"].includes(opts.mode)) {

@@ -35,14 +35,14 @@ pub fn build_cli() -> App {
             Arg::option("node-id")
                 .short(b'n')
                 .value_name("0|1|2")
-                .env("ORACLE_NODE_ID")
+                .env("FERACLE_NODE_ID")
                 .required()
                 .help("Zero-based oracle node index"),
         )
         .arg(
             Arg::option("p2p-backend")
                 .value_name("libp2p|tcp|udp")
-                .env("ORACLE_P2P_BACKEND")
+                .env("FERACLE_P2P_BACKEND")
                 .default_value("libp2p")
                 .help("P2P peer networking backend"),
         )
@@ -50,14 +50,14 @@ pub fn build_cli() -> App {
             Arg::option("p2p-port")
                 .short(b'p')
                 .value_name("PORT")
-                .env("ORACLE_P2P_PORT")
+                .env("FERACLE_P2P_PORT")
                 .required()
                 .help("Local P2P listen port"),
         )
         .arg(
             Arg::option("lan-discovery-port")
                 .value_name("PORT")
-                .env("ORACLE_LAN_DISCOVERY_PORT")
+                .env("FERACLE_LAN_DISCOVERY_PORT")
                 .default_value("0")
                 .help(
                     "Optional UDP broadcast LAN discovery port (udp backend; 0 = disabled)",
@@ -67,7 +67,7 @@ pub fn build_cli() -> App {
             Arg::option("bootstrap")
                 .short(b'b')
                 .value_name("MULTIADDRS")
-                .env("ORACLE_BOOTSTRAP")
+                .env("FERACLE_BOOTSTRAP")
                 .help(
                     "Comma-separated bootstrap peers (multiaddrs or host:port)",
                 ),
@@ -76,7 +76,7 @@ pub fn build_cli() -> App {
             Arg::option("sources")
                 .short(b's')
                 .value_name("SPEC")
-                .env("ORACLE_SOURCES")
+                .env("FERACLE_SOURCES")
                 .required()
                 .help("Comma-separated provider=host:port feed list"),
         )
@@ -84,7 +84,7 @@ pub fn build_cli() -> App {
             Arg::option("privkey-hex")
                 .short(b'k')
                 .value_name("HEX")
-                .env("ORACLE_PRIVKEY_HEX")
+                .env("FERACLE_PRIVKEY_HEX")
                 .required()
                 .sensitive()
                 .help("32-byte hex ECDSA signing key"),
@@ -93,7 +93,7 @@ pub fn build_cli() -> App {
             Arg::option("rpc-url")
                 .short(b'r')
                 .value_name("URL")
-                .env("ORACLE_RPC_URL")
+                .env("FERACLE_RPC_URL")
                 .required()
                 .help("EVM JSON-RPC endpoint URL"),
         )
@@ -101,35 +101,35 @@ pub fn build_cli() -> App {
             Arg::option("chain-id")
                 .short(b'c')
                 .value_name("ID")
-                .env("ORACLE_CHAIN_ID")
+                .env("FERACLE_CHAIN_ID")
                 .required()
                 .help("Target EVM chain ID"),
         )
         .arg(
             Arg::option("contract")
                 .value_name("ADDR")
-                .env("ORACLE_CONTRACT")
+                .env("FERACLE_CONTRACT")
                 .required()
                 .help("Deployed OffchainMedianOracle contract address"),
         )
         .arg(
             Arg::option("rounds")
                 .value_name("N")
-                .env("ORACLE_ROUNDS")
+                .env("FERACLE_ROUNDS")
                 .default_value("0")
                 .help("Number of rounds to execute (0 = infinite)"),
         )
         .arg(
             Arg::option("round-timeout-secs")
                 .value_name("SECS")
-                .env("ORACLE_ROUND_TIMEOUT_SECS")
+                .env("FERACLE_ROUND_TIMEOUT_SECS")
                 .default_value("15")
                 .help("Per-phase round timeout in seconds"),
         )
         .arg(
             Arg::option("telemetry-port")
                 .value_name("PORT")
-                .env("ORACLE_TELEMETRY_PORT")
+                .env("FERACLE_TELEMETRY_PORT")
                 .default_value("0")
                 .help("Optional local HTTP/SSE telemetry port (0 = disabled)"),
         )

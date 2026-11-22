@@ -480,8 +480,8 @@ fn test_cli_capability_injection() {
 fn test_arg_required_else_help() {
     let app = App::new("feracle")
         .arg_required_else_help()
-        .arg(Arg::option("node-id").env("ORACLE_NODE_ID").required())
-        .arg(Arg::option("port").env("ORACLE_P2P_PORT").required())
+        .arg(Arg::option("node-id").env("FERACLE_NODE_ID").required())
+        .arg(Arg::option("port").env("FERACLE_P2P_PORT").required())
 
     var out_bare = BufferOutput::new()
     let code_bare = app
@@ -513,7 +513,7 @@ fn test_arg_required_else_help() {
     var out_env = BufferOutput::new()
     let code_env = app
         .run_io(
-            MemoryInput::new("feracle").env("ORACLE_NODE_ID", "1").env("ORACLE_P2P_PORT", "7002"),
+            MemoryInput::new("feracle").env("FERACLE_NODE_ID", "1").env("FERACLE_P2P_PORT", "7002"),
             mut out_env,
             |m: Matches| -> i32 {
                 assert!(m.require<u64>("node-id").unwrap() == 1)

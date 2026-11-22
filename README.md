@@ -45,7 +45,7 @@ let config = with (Cli = matches) { load_config() }
 ### Off-Chain Node & Networking (`[Native]`)
 
 1. **`ingots/feracle/`** — Standalone oracle node executable (`out/feracle`):
-   - Parses CLI configuration (`--p2p-backend libp2p|tcp|udp`, `--lan-discovery-port`, `--telemetry-port`) with `ORACLE_*` environment variable fallbacks
+   - Parses CLI configuration (`--p2p-backend libp2p|tcp|udp`, `--lan-discovery-port`, `--telemetry-port`) with `FERACLE_*` environment variable fallbacks
    - Fetches market quotes over HTTP/1.1 (`std::net::TcpStream` + `std::io::BufReader`) from Hyperliquid, Binance, and Coinbase and computes per-asset local medians
    - Executes the 3-phase consensus protocol: Quote gossip -> per-asset `±100 bps` tolerance guard and ECDSA signing -> sorted 3-of-3 quorum collection and single-leader batch submission via `cast send` (with backup-leader failover), pumping non-blocking `Poller` reactors throughout waits
    - Reads on-chain `currentRound()` and `latestPrices()` via JSON-RPC `eth_call`
