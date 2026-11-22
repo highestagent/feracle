@@ -1,0 +1,301 @@
+use std::env::{Args, Env}
+use std::io::{Display, Stderr, Stdout}
+use super::error::CliError
+use super::help::{render_help_for, render_version_for}
+use super::io::{HostInput, HostOutput, Input, Output}
+use super::matches::Matches
+use super::parser::parse_app
+
+/// Argument kind in a declarative CLI specification.
+pub enum ArgKind {
+    Flag,
+    Option,
+    Multi,
+    Positional,
+}
+
+impl Copy for ArgKind {}
+
+impl core::ops::Eq for ArgKind {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (Self::Flag, Self::Flag) => true,
+            (Self::Option, Self::Option) => true,
+            (Self::Multi, Self::Multi) => true,
+            (Self::Positional, Self::Positional) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Specification of a single CLI flag, option, multi-option, or positional argument.
+pub struct Arg {
+    pub id: MemBuffer,
+    pub kind: ArgKind,
+    pub short: Option<u8>,
+    pub long: Option<MemBuffer>,
+    pub value_name: Option<MemBuffer>,
+    pub help: Option<MemBuffer>,
+    pub env_var: Option<MemBuffer>,
+    pub default_val: Option<MemBuffer>,
+    pub required: bool,
+    pub allow_override: bool,
+    pub sensitive: bool,
+    pub multiple: bool,
+    pub delimiter: Option<u8>,
+    pub possible_values: MemVec<MemBuffer>,
+    pub conflicts: MemVec<MemBuffer>,
+    pub requires: MemVec<MemBuffer>,
+}
+
+impl Arg {
+    fn make(_ id: own MemBuffer, _ kind: ArgKind, has_long: bool) -> Self {
+        let long = if has_long {
+            Option::Some(MemBuffer::from_span(id.span()))
+        } else {
+            Option::None
+        }
+        Self {
+            id,
+            kind,
+            short: Option::None,
+            long,
+            value_name: Option::None,
+            help: Option::None,
+            env_var: Option::None,
+            default_val: Option::None,
+            required: false,
+            allow_override: false,
+            sensitive: false,
+            multiple: false,
+            delimiter: Option::None,
+            possible_values: MemVec<MemBuffer>::new(),
+            conflicts: MemVec<MemBuffer>::new(),
+            requires: MemVec<MemBuffer>::new(),
+        }
+    }
+
+    /// A boolean / countable switch (`--verbose`, `-vv`). Defaults `--<id>`.
+    pub fn flag<T: Display>(_ id: T) -> Self {
+        Self::make(format!(id), ArgKind::Flag, has_long: true)
+    }
+
+    /// A single-value option (`--port 8080`, `--port=8080`, `-p 8080`). Defaults `--<id>`.
+    pub fn option<T: Display>(_ id: T) -> Self {
+        Self::make(format!(id), ArgKind::Option, has_long: true)
+    }
+
+    /// A repeatable option (`--tag a --tag b`, or `--tag a,b` with `.delimiter(b',')`).
+    pub fn multi<T: Display>(_ id: T) -> Self {
+        Self::make(format!(id), ArgKind::Multi, has_long: true)
+    }
+
+    /// A positional argument.
+    pub fn positional<T: Display>(_ id: T) -> Self {
+        Self::make(format!(id), ArgKind::Positional, has_long: false)
+    }
+
+    /// Short single-byte option name (e.g. `b'p'` for `-p`).
+    pub fn short(var own self, _ ch: u8) -> Self {
+        self.short = Option::Some(ch)
+        self
+    }
+
+    /// Overrides the long flag name (without leading `--`).
+    pub fn long<T: Display>(var own self, _ name: T) -> Self {
+        self.long = Option::Some(format!(name))
+        self
+    }
+
+    /// Disables the automatic `--<id>` long flag (useful for short-only flags).
+    pub fn no_long(var own self) -> Self {
+        self.long = Option::None
+        self
+    }
+
+    /// Placeholder label rendered in `--help` (e.g. `PORT` -> `<PORT>`).
+    pub fn value_name<T: Display>(var own self, _ label: T) -> Self {
+        self.value_name = Option::Some(format!(label))
+        self
+    }
+
+    /// Help description shown in `--help`.
+    pub fn help<T: Display>(var own self, _ desc: T) -> Self {
+        self.help = Option::Some(format!(desc))
+        self
+    }
+
+    /// Environment variable fallback checked when the argument is omitted on CLI.
+    pub fn env<T: Display>(var own self, _ var_name: T) -> Self {
+        self.env_var = Option::Some(format!(var_name))
+        self
+    }
+
+    /// Default string value applied if neither CLI nor env supplies a value.
+    pub fn default_value<T: Display>(var own self, _ val: T) -> Self {
+        self.default_val = Option::Some(format!(val))
+        self
+    }
+
+    /// Marks the argument as mandatory.
+    pub fn required(var own self) -> Self {
+        self.required = true
+        self
+    }
+
+    /// Allows repeated CLI occurrences of an `Option` to override the earlier value.
+    pub fn allow_override(var own self) -> Self {
+        self.allow_override = true
+        self
+    }
+
+    /// Redacts the supplied value in parse diagnostics.
+    pub fn sensitive(var own self) -> Self {
+        self.sensitive = true
+        self
+    }
+
+    /// Allows a trailing `Positional` argument to consume multiple tokens.
+    pub fn multiple(var own self) -> Self {
+        self.multiple = true
+        self
+    }
+
+    /// Splits each supplied value on `sep` for `Multi` options.
+    pub fn delimiter(var own self, _ sep: u8) -> Self {
+        self.delimiter = Option::Some(sep)
+        self
+    }
+
+    /// Restricts accepted values to an explicit whitelist (repeatable).
+    pub fn possible_value<T: Display>(var own self, _ val: T) -> Self {
+        self.possible_values.push(format!(val))
+        self
+    }
+
+    /// Declares mutual exclusion with another argument id.
+    pub fn conflicts_with<T: Display>(var own self, _ other: T) -> Self {
+        self.conflicts.push(format!(other))
+        self
+    }
+
+    /// Declares that providing this argument requires `other` to also be present.
+    pub fn requires<T: Display>(var own self, _ other: T) -> Self {
+        self.requires.push(format!(other))
+        self
+    }
+}
+
+/// Declarative command/subcommand specification.
+pub struct App {
+    pub name: MemBuffer,
+    pub version: Option<MemBuffer>,
+    pub about: Option<MemBuffer>,
+    pub args: MemVec<Arg>,
+    pub subcommands: MemVec<App>,
+    pub subcommand_required: bool,
+    pub arg_required_else_help: bool,
+}
+
+impl App {
+    pub fn new<T: Display>(_ name: T) -> Self {
+        Self {
+            name: format!(name),
+            version: Option::None,
+            about: Option::None,
+            args: MemVec<Arg>::new(),
+            subcommands: MemVec<App>::new(),
+            subcommand_required: false,
+            arg_required_else_help: false,
+        }
+    }
+    pub fn version<T: Display>(var own self, _ ver: T) -> Self {
+        self.version = Option::Some(format!(ver))
+        self
+    }
+    pub fn about<T: Display>(var own self, _ desc: T) -> Self {
+        self.about = Option::Some(format!(desc))
+        self
+    }
+    pub fn arg(var own self, _ arg: own Arg) -> Self {
+        self.args.push(arg)
+        self
+    }
+    pub fn subcommand(var own self, _ sub: own App) -> Self {
+        self.subcommands.push(sub)
+        self
+    }
+    pub fn subcommand_required(var own self) -> Self {
+        self.subcommand_required = true
+        self
+    }
+    pub fn arg_required_else_help(var own self) -> Self {
+        self.arg_required_else_help = true
+        self
+    }
+
+    /// Renders full help text for this command.
+    pub fn render_help(self) -> MemBuffer {
+        render_help_for(self, breadcrumb: self.name.span())
+    }
+
+    /// Renders version string (`<name> <version>`).
+    pub fn render_version(self) -> MemBuffer {
+        render_version_for(self, breadcrumb: self.name.span())
+    }
+
+    /// Parses using any custom `Input` implementation (`HostInput`, `MemoryInput`, ...).
+    pub fn parse_with<I: Input>(self, _ input: I) -> Result<CliError, Matches>
+    uses I::E
+    {
+        parse_app(self, input)
+    }
+
+    /// Parses directly from host process `Args` and `Env`.
+    pub fn parse(self) -> Result<CliError, Matches> uses (args: Args, env: Env) {
+        self.parse_with(HostInput {})
+    }
+
+    /// Parses using `input`, handles `--help`/`--version`/errors via `output`, and
+    /// invokes effect-polymorphic `action(matches)` on success.
+    pub fn run_io<I: Input, O: Output, F: Fn(Matches) -> i32>(
+        self,
+        _ input: I,
+        _ output: mut O,
+        _ action: F,
+    ) -> i32
+    uses (I::E, O::E, F::E)
+    {
+        match self.parse_with(input) {
+            Result::Ok(matches) => action(matches),
+            Result::Err(err) => {
+                let text = format!(err)
+                if err.is_info() {
+                    output.write_stdout(text.span())
+                } else {
+                    output.write_stderr(text.span())
+                }
+                err.exit_code()
+            },
+        }
+    }
+
+    /// Parses host `Args` + `Env`, reports help/version/errors on `Stdout`/`Stderr`,
+    /// and invokes `action(matches)` with full effect propagation.
+    pub fn run<F: Fn(Matches) -> i32>(self, _ action: F) -> i32
+    uses (args: Args, env: Env, out: mut Stdout, err: mut Stderr, F::E)
+    {
+        match self.parse() {
+            Result::Ok(matches) => action(matches),
+            Result::Err(cli_err) => {
+                let text = format!(cli_err)
+                if cli_err.is_info() {
+                    let _ = out.write_stdout(text.span())
+                } else {
+                    let _ = err.write_stderr(text.span())
+                }
+                cli_err.exit_code()
+            },
+        }
+    }
+}

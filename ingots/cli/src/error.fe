@@ -1,0 +1,248 @@
+use std::io::Display
+
+/// Structured outcome from parsing CLI arguments.
+///
+/// `HelpRequested` and `VersionRequested` are clean exit outcomes (`exit_code == 0`);
+/// all other variants represent validation/syntax errors (`exit_code == 2`).
+#[must_use]
+pub enum CliError {
+    HelpRequested(MemBuffer),
+    VersionRequested(MemBuffer),
+    UnknownFlag {
+        pub flag: MemBuffer,
+        pub suggestion: Option<MemBuffer>,
+    },
+    UnknownSubcommand {
+        pub name: MemBuffer,
+        pub suggestion: Option<MemBuffer>,
+    },
+    MissingValue { pub arg: MemBuffer },
+    UnexpectedValue { pub flag: MemBuffer },
+    MissingRequired { pub arg: MemBuffer },
+    UnexpectedPositional { pub value: MemBuffer },
+    DuplicateArg { pub arg: MemBuffer },
+    InvalidValue {
+        pub arg: MemBuffer,
+        pub value: MemBuffer,
+        pub detail: MemBuffer,
+    },
+    InvalidChoice {
+        pub arg: MemBuffer,
+        pub value: MemBuffer,
+        pub allowed: MemBuffer,
+    },
+    Conflict {
+        pub arg: MemBuffer,
+        pub other: MemBuffer,
+    },
+    MissingDependency {
+        pub arg: MemBuffer,
+        pub requires: MemBuffer,
+    },
+    MissingSubcommand { pub command: MemBuffer },
+}
+
+impl CliError {
+    /// Returns `true` when parsing halted cleanly for `--help` or `--version`.
+    pub fn is_info(self) -> bool {
+        match self {
+            Self::HelpRequested(_) => true,
+            Self::VersionRequested(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Standard UNIX exit code (`0` for help/version, `2` for usage errors).
+    pub fn exit_code(self) -> i32 {
+        if self.is_info() { 0 } else { 2 }
+    }
+}
+
+impl Display for CliError {
+    fn fmt(self, _ out: mut MemBuffer) {
+        match self {
+            Self::HelpRequested(ref text) => out.extend_from(text.span()),
+            Self::VersionRequested(ref text) => out.extend_from(text.span()),
+            Self::UnknownFlag { ref flag, ref suggestion } => {
+                writeln!(mut out, "error: unexpected argument '", flag, "' found")
+                if let Option::Some(ref tip) = suggestion {
+                    writeln!(mut out, "  tip: a similar argument exists: '", tip, "'")
+                }
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::UnknownSubcommand { ref name, ref suggestion } => {
+                writeln!(mut out, "error: unrecognized subcommand '", name, "'")
+                if let Option::Some(ref tip) = suggestion {
+                    writeln!(mut out, "  tip: a similar subcommand exists: '", tip, "'")
+                }
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::MissingValue { ref arg } => {
+                writeln!(
+                    mut out,
+                    "error: a value is required for '",
+                    arg,
+                    "' but none was supplied",
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::UnexpectedValue { ref flag } => {
+                writeln!(
+                    mut out,
+                    "error: unexpected value passed to flag '",
+                    flag,
+                    "'",
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::MissingRequired { ref arg } => {
+                writeln!(
+                    mut out,
+                    "error: the following required argument was not provided: ",
+                    arg,
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::UnexpectedPositional { ref value } => {
+                writeln!(mut out, "error: unexpected argument '", value, "' found")
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::DuplicateArg { ref arg } => {
+                writeln!(
+                    mut out,
+                    "error: the argument '",
+                    arg,
+                    "' cannot be used multiple times",
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::InvalidValue { ref arg, ref value, ref detail } => {
+                writeln!(
+                    mut out,
+                    "error: invalid value '",
+                    value,
+                    "' for '",
+                    arg,
+                    "': ",
+                    detail,
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::InvalidChoice { ref arg, ref value, ref allowed } => {
+                writeln!(
+                    mut out,
+                    "error: invalid value '",
+                    value,
+                    "' for '",
+                    arg,
+                    "' [possible values: ",
+                    allowed,
+                    "]",
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::Conflict { ref arg, ref other } => {
+                writeln!(
+                    mut out,
+                    "error: the argument '",
+                    arg,
+                    "' cannot be used with '",
+                    other,
+                    "'",
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::MissingDependency { ref arg, ref requires } => {
+                writeln!(
+                    mut out,
+                    "error: the argument '",
+                    arg,
+                    "' requires '",
+                    requires,
+                    "'",
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+            Self::MissingSubcommand { ref command } => {
+                writeln!(
+                    mut out,
+                    "error: '",
+                    command,
+                    "' requires a subcommand but one was not provided",
+                )
+                writeln!(mut out, "\nFor more information, try '--help'.")
+            },
+        }
+    }
+}
+
+/// Computes Levenshtein edit distance between two byte spans.
+pub fn levenshtein(_ a: MemSpan, _ b: MemSpan) -> usize {
+    let m = a.len()
+    let n = b.len()
+    if m == 0 { return n }
+    if n == 0 { return m }
+
+    var prev = MemVec<usize>::with_capacity(n + 1)
+    var curr = MemVec<usize>::with_capacity(n + 1)
+    var j: usize = 0
+    while j <= n {
+        prev.push(j)
+        curr.push(0)
+        j += 1
+    }
+
+    var i: usize = 0
+    while i < m {
+        curr[0] = i + 1
+        var k: usize = 0
+        while k < n {
+            let cost: usize = if a.byte_at(i) == b.byte_at(k) { 0 } else { 1 }
+            let del_cost = prev[k + 1] + 1
+            let ins_cost = curr[k] + 1
+            let sub_cost = prev[k] + cost
+            var best = if del_cost < ins_cost {
+                del_cost
+            } else {
+                ins_cost
+            }
+            if sub_cost < best {
+                best = sub_cost
+            }
+            curr[k + 1] = best
+            k += 1
+        }
+        var copy_idx: usize = 0
+        while copy_idx <= n {
+            prev[copy_idx] = curr[copy_idx]
+            copy_idx += 1
+        }
+        i += 1
+    }
+
+    prev[n]
+}
+
+/// Finds the closest candidate to `needle` within `max_dist` edit distance.
+pub fn closest_match(
+    _ needle: MemSpan,
+    _ candidates: MemSlice<MemBuffer>,
+    max_dist: usize,
+) -> Option<MemBuffer> {
+    var best_dist = max_dist + 1
+    var best_idx: Option<usize> = Option::None
+    var i: usize = 0
+    while i < candidates.len() {
+        let cand = candidates.at(i).span()
+        let dist = levenshtein(needle, cand)
+        if dist < best_dist {
+            best_dist = dist
+            best_idx = Option::Some(i)
+        }
+        i += 1
+    }
+    match best_idx {
+        Option::Some(idx) => Option::Some(MemBuffer::from_span(candidates.at(idx).span())),
+        Option::None => Option::None,
+    }
+}

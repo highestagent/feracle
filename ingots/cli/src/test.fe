@@ -1,0 +1,527 @@
+use std::net::{Ipv4Addr, SocketAddr}
+use super::{
+    App,
+    Arg,
+    BufferOutput,
+    Cli,
+    CliError,
+    FromArg,
+    Matches,
+    MemoryInput,
+    ValueSource,
+    get,
+    get_many,
+    get_or,
+    require,
+}
+
+struct Endpoint { host_port: SocketAddr, tls: bool }
+
+impl FromArg for Endpoint {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let tls = if raw.starts_with("tls://") {
+            true
+        } else if raw.starts_with("tcp://") {
+            false
+        } else {
+            return Result::Err(format!("expected tcp:// or tls:// prefix"))
+        }
+        let addr_span = raw.tail(6)
+        match SocketAddr::parse(addr_span) {
+            Option::Some(host_port) => Result::Ok(Endpoint { host_port, tls }),
+            Option::None => Result::Err(format!("invalid host:port in endpoint")),
+        }
+    }
+}
+
+fn build_sample_app() -> App {
+    App::new("ferry")
+        .version("1.2.3")
+        .about("Generic file transfer utility")
+        .arg(
+            Arg::flag("verbose").short(b'v').help("Increase verbosity"),
+        )
+        .arg(
+            Arg::flag("force").short(b'f').help("Overwrite destination"),
+        )
+        .arg(
+            Arg::option("port")
+                .short(b'p')
+                .value_name("PORT")
+                .env("FERRY_PORT")
+                .default_value("8080")
+                .help("Listening TCP port"),
+        )
+        .arg(
+            Arg::option("mode")
+                .possible_value("fast")
+                .possible_value("safe")
+                .default_value("safe")
+                .help("Transfer mode"),
+        )
+        .arg(
+            Arg::multi("tag").short(b't').delimiter(b',').help("Metadata tags"),
+        )
+        .arg(
+            Arg::option("secret").sensitive().help("API secret integer"),
+        )
+        .arg(Arg::option("bind").help("Bind IP address"))
+        .arg(Arg::option("endpoint").help("Custom endpoint"))
+        .arg(
+            Arg::flag("json").conflicts_with("yaml").help("JSON output"),
+        )
+        .arg(Arg::flag("yaml").help("YAML output"))
+        .arg(
+            Arg::option("tls-cert").requires("tls-key").help("TLS certificate"),
+        )
+        .arg(Arg::option("tls-key").help("TLS private key"))
+        .arg(Arg::positional("target").help("Destination path"))
+        .arg(
+            Arg::positional("extra").multiple().help("Additional items"),
+        )
+}
+
+#[test]
+fn test_long_short_bundled_and_double_dash() {
+    let app = build_sample_app()
+    let input = MemoryInput::new("ferry")
+        .arg("-vvf")
+        .arg("-p7001")
+        .arg("--mode=fast")
+        .arg("-t")
+        .arg("alpha,beta")
+        .arg("--tag")
+        .arg("gamma")
+        .arg("--")
+        .arg("-dash-file")
+        .arg("second")
+        .arg("third")
+
+    let matches = app.parse_with(input).unwrap()
+    assert!(matches.program() == "ferry")
+    assert!(matches.flag("verbose"))
+    assert!(matches.count("verbose") == 2)
+    assert!(matches.flag("force"))
+    assert!(matches.require<u16>("port").unwrap() == 7001)
+    assert!(
+        matches.value_source("port").unwrap() == ValueSource::CommandLine,
+    )
+    assert!(matches.raw("mode").unwrap() == "fast")
+
+    let tags = matches.raw_many("tag")
+    assert!(tags.len() == 3)
+    assert!(tags[0] == "alpha")
+    assert!(tags[1] == "beta")
+    assert!(tags[2] == "gamma")
+
+    assert!(
+        matches.positional<MemBuffer>(0).unwrap().unwrap() == "-dash-file",
+    )
+    assert!(matches.positional_count() == 3)
+    let extras = matches.raw_many("extra")
+    assert!(extras.len() == 2)
+    assert!(extras[0] == "second")
+    assert!(extras[1] == "third")
+}
+
+#[test]
+fn test_short_eq_and_override_precedence() {
+    let app = App::new("cfg")
+        .arg(
+            Arg::option("port").short(b'p').env("CFG_PORT").default_value("3000").allow_override(),
+        )
+        .arg(
+            Arg::option("host").env("CFG_HOST").default_value("127.0.0.1"),
+        )
+
+    // 1. Default only
+    let m_def = app.parse_with(MemoryInput::new("cfg")).unwrap()
+    assert!(m_def.require<u16>("port").unwrap() == 3000)
+    assert!(
+        m_def.value_source("port").unwrap() == ValueSource::Default,
+    )
+    assert!(
+        m_def.require<Ipv4Addr>("host").unwrap() == Ipv4Addr::LOCALHOST,
+    )
+    assert!(
+        m_def.value_source("host").unwrap() == ValueSource::Default,
+    )
+
+    // 2. Env overrides Default
+    let app2 = App::new("cfg")
+        .arg(
+            Arg::option("port").short(b'p').env("CFG_PORT").default_value("3000").allow_override(),
+        )
+        .arg(
+            Arg::option("host").env("CFG_HOST").default_value("127.0.0.1"),
+        )
+    let m_env = app2
+        .parse_with(
+            MemoryInput::new("cfg").env("CFG_PORT", "4000").env("CFG_HOST", "10.0.0.1"),
+        )
+        .unwrap()
+    assert!(m_env.require<u16>("port").unwrap() == 4000)
+    assert!(m_env.value_source("port").unwrap() == ValueSource::Env)
+    assert!(m_env.raw("host").unwrap() == "10.0.0.1")
+    assert!(m_env.value_source("host").unwrap() == ValueSource::Env)
+
+    // 3. CLI overrides Env + repeated allow_override
+    let app3 = App::new("cfg")
+        .arg(
+            Arg::option("port").short(b'p').env("CFG_PORT").default_value("3000").allow_override(),
+        )
+    let m_cli = app3
+        .parse_with(
+            MemoryInput::new("cfg")
+                .env("CFG_PORT", "4000")
+                .arg("-p=5000")
+                .arg("--port")
+                .arg("6000"),
+        )
+        .unwrap()
+    assert!(m_cli.require<u16>("port").unwrap() == 6000)
+    assert!(
+        m_cli.value_source("port").unwrap() == ValueSource::CommandLine,
+    )
+}
+
+#[test]
+fn test_from_arg_builtins_and_custom() {
+    let app = build_sample_app()
+    let input = MemoryInput::new("ferry")
+        .arg("--bind")
+        .arg("127.0.0.1")
+        .arg("--endpoint")
+        .arg("tls://127.0.0.1:9443")
+
+    let matches = app.parse_with(input).unwrap()
+    let ip: Ipv4Addr = matches.require("bind").unwrap()
+    assert!(ip == Ipv4Addr::LOCALHOST)
+
+    let ep: Endpoint = matches.require("endpoint").unwrap()
+    assert!(ep.tls)
+    assert!(ep.host_port.port() == 9443)
+
+    // Custom closure parser with parse_with / require_with
+    let custom = matches
+        .require_with(
+            "bind",
+            |raw: MemBuffer| -> Result<MemBuffer, bool> {
+                Result::Ok(raw == "127.0.0.1")
+            },
+        )
+        .unwrap()
+    assert!(custom)
+
+    // Built-in signed, bool, and overflow rejection
+    let app_num = App::new("num")
+        .arg(Arg::option("signed"))
+        .arg(Arg::option("flag-val"))
+        .arg(Arg::option("tiny"))
+    let m_num = app_num
+        .parse_with(
+            MemoryInput::new("num")
+                .arg("--signed")
+                .arg("-42")
+                .arg("--flag-val")
+                .arg("YES")
+                .arg("--tiny")
+                .arg("256"),
+        )
+        .unwrap()
+    assert!(m_num.require<i64>("signed").unwrap() == -42)
+    assert!(m_num.require<bool>("flag-val").unwrap())
+    match m_num.require<u8>("tiny") {
+        Result::Err(CliError::InvalidValue { .. }) => {},
+        _ => assert!(false),
+    }
+}
+
+#[test]
+fn test_validation_errors_and_sensitive_redaction() {
+    // MissingRequired
+    let app_req = App::new("req").arg(Arg::option("token").required())
+    match app_req.parse_with(MemoryInput::new("req")) {
+        Result::Err(CliError::MissingRequired { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // MissingValue
+    match build_sample_app().parse_with(MemoryInput::new("ferry").arg("--port")) {
+        Result::Err(CliError::MissingValue { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // UnexpectedValue on boolean Flag
+    match build_sample_app().parse_with(MemoryInput::new("ferry").arg("--force=yes")) {
+        Result::Err(CliError::UnexpectedValue { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // DuplicateArg when allow_override is false
+    match build_sample_app()
+        .parse_with(
+            MemoryInput::new("ferry").arg("--port").arg("1").arg("--port").arg("2"),
+        ) {
+        Result::Err(CliError::DuplicateArg { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // InvalidChoice
+    match build_sample_app().parse_with(MemoryInput::new("ferry").arg("--mode").arg("turbo")) {
+        Result::Err(CliError::InvalidChoice { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // Conflict
+    match build_sample_app().parse_with(MemoryInput::new("ferry").arg("--json").arg("--yaml")) {
+        Result::Err(CliError::Conflict { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // MissingDependency
+    match build_sample_app()
+        .parse_with(
+            MemoryInput::new("ferry").arg("--tls-cert").arg("cert.pem"),
+        ) {
+        Result::Err(CliError::MissingDependency { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // Sensitive value redaction on invalid typed parse
+    let m_sec = build_sample_app()
+        .parse_with(
+            MemoryInput::new("ferry").arg("--secret").arg("super-secret-xyz"),
+        )
+        .unwrap()
+    match m_sec.require<u64>("secret") {
+        Result::Err(CliError::InvalidValue { value, .. }) => {
+            assert!(value == "<redacted>")
+        },
+        _ => assert!(false),
+    }
+}
+
+#[test]
+fn test_typo_suggestions() {
+    match build_sample_app().parse_with(MemoryInput::new("ferry").arg("--prot").arg("80")) {
+        Result::Err(CliError::UnknownFlag { flag, suggestion }) => {
+            assert!(flag == "--prot")
+            assert!(suggestion.is_some())
+            assert!(suggestion.unwrap() == "--port")
+        },
+        _ => assert!(false),
+    }
+
+    let app_sub = App::new("ctl")
+        .subcommand(App::new("serve").about("Start server"))
+        .subcommand(App::new("status").about("Check status"))
+    match app_sub.parse_with(MemoryInput::new("ctl").arg("serrve")) {
+        Result::Err(CliError::UnknownSubcommand { name, suggestion }) => {
+            assert!(name == "serrve")
+            assert!(suggestion.is_some())
+            assert!(suggestion.unwrap() == "serve")
+        },
+        _ => assert!(false),
+    }
+}
+
+#[test]
+fn test_help_version_and_run_io() {
+    var out_help = BufferOutput::new()
+    let code_help = build_sample_app()
+        .run_io(
+            MemoryInput::new("ferry").arg("--help"),
+            mut out_help,
+            |_ m: Matches| -> i32 {
+                99
+            },
+        )
+    assert!(code_help == 0)
+    assert!(out_help.stderr.is_empty())
+    assert!(
+        out_help.stdout.span().index_of("Usage: ferry [OPTIONS]").is_some(),
+    )
+    assert!(out_help.stdout.span().index_of("--port <PORT>").is_some())
+    assert!(
+        out_help.stdout.span().index_of("[env: FERRY_PORT]").is_some(),
+    )
+    assert!(
+        out_help.stdout.span().index_of("[default: 8080]").is_some(),
+    )
+
+    var out_ver = BufferOutput::new()
+    let code_ver = build_sample_app()
+        .run_io(
+            MemoryInput::new("ferry").arg("-V"),
+            mut out_ver,
+            |_ m: Matches| -> i32 {
+                99
+            },
+        )
+    assert!(code_ver == 0)
+    assert!(out_ver.stdout == "ferry 1.2.3\n")
+
+    var out_err = BufferOutput::new()
+    let code_err = build_sample_app()
+        .run_io(
+            MemoryInput::new("ferry").arg("--prot"),
+            mut out_err,
+            |_ m: Matches| -> i32 {
+                0
+            },
+        )
+    assert!(code_err == 2)
+    assert!(out_err.stdout.is_empty())
+    assert!(out_err.stderr.span().index_of("--port").is_some())
+}
+
+#[test]
+fn test_subcommands_recursive() {
+    let app = App::new("svc")
+        .version("0.1.0")
+        .subcommand_required()
+        .arg(Arg::flag("quiet").short(b'q').help("Quiet mode"))
+        .subcommand(
+            App::new("node")
+                .about("Manage node")
+                .subcommand_required()
+                .subcommand(
+                    App::new("start")
+                        .about("Start node")
+                        .arg(Arg::option("port").default_value("9000")),
+                ),
+        )
+
+    // Missing subcommand error
+    match app.parse_with(MemoryInput::new("svc")) {
+        Result::Err(CliError::MissingSubcommand { .. }) => {},
+        _ => assert!(false),
+    }
+
+    // `help node` prints subcommand help
+    let app_h = App::new("svc").subcommand(App::new("node").about("Manage node"))
+    match app_h.parse_with(MemoryInput::new("svc").arg("help").arg("node")) {
+        Result::Err(CliError::HelpRequested(text)) => {
+            assert!(text.span().index_of("Usage: svc node").is_some())
+        },
+        _ => assert!(false),
+    }
+
+    // Nested subcommand execution
+    let app_run = App::new("svc")
+        .subcommand_required()
+        .arg(Arg::flag("quiet").short(b'q'))
+        .subcommand(
+            App::new("node")
+                .subcommand_required()
+                .subcommand(
+                    App::new("start").arg(Arg::option("port").default_value("9000")),
+                ),
+        )
+    let m = app_run
+        .parse_with(
+            MemoryInput::new("svc").arg("-q").arg("node").arg("start").arg("--port").arg("9005"),
+        )
+        .unwrap()
+    assert!(m.flag("quiet"))
+    assert!(m.subcommand_is("node"))
+    let port_val = m
+        .with_subcommand(
+            |_ name: MemBuffer, sub: Matches| -> u16 {
+                sub.with_subcommand(
+                    |_ name2: MemBuffer, leaf: Matches| -> u16 {
+                        leaf.require<u16>("port").unwrap()
+                    },
+                )
+                    .unwrap()
+            },
+        )
+        .unwrap()
+    assert!(port_val == 9005)
+}
+
+fn read_via_capability() -> Result<CliError, (u16, bool, MemBuffer)>
+uses (cli: Cli)
+{
+    let port: u16 = require("port")?
+    let verbose = cli.cli_flag("verbose".span())
+    let mode: MemBuffer = get_or("mode", default: format!("default-mode"))?
+    let tags: MemVec<u64> = get_many("ids")?
+    assert!(tags.len() == 2 && tags[0] == 10 && tags[1] == 20)
+    Result::Ok((port, verbose, mode))
+}
+
+#[test]
+fn test_cli_capability_injection() {
+    let app = App::new("cap")
+        .arg(Arg::option("port").required())
+        .arg(Arg::flag("verbose"))
+        .arg(Arg::option("mode"))
+        .arg(Arg::multi("ids").delimiter(b','))
+    let matches = app
+        .parse_with(
+            MemoryInput::new("cap")
+                .arg("--port")
+                .arg("7777")
+                .arg("--verbose")
+                .arg("--ids")
+                .arg("10,20"),
+        )
+        .unwrap()
+
+    let (port, verbose, mode) = with (Cli = matches) { read_via_capability() }.unwrap()
+    assert!(port == 7777)
+    assert!(verbose)
+    assert!(mode == "default-mode")
+}
+
+#[test]
+fn test_arg_required_else_help() {
+    let app = App::new("feracle")
+        .arg_required_else_help()
+        .arg(Arg::option("node-id").env("ORACLE_NODE_ID").required())
+        .arg(Arg::option("port").env("ORACLE_P2P_PORT").required())
+
+    var out_bare = BufferOutput::new()
+    let code_bare = app
+        .run_io(
+            MemoryInput::new("feracle"),
+            mut out_bare,
+            |_ m: Matches| -> i32 {
+                99
+            },
+        )
+    assert!(code_bare == 0)
+    assert!(out_bare.stderr.is_empty())
+    assert!(
+        out_bare.stdout.span().index_of("Usage: feracle [OPTIONS]").is_some(),
+    )
+
+    var out_partial = BufferOutput::new()
+    let code_partial = app
+        .run_io(
+            MemoryInput::new("feracle").arg("--node-id").arg("0"),
+            mut out_partial,
+            |_ m: Matches| -> i32 {
+                99
+            },
+        )
+    assert!(code_partial == 2)
+    assert!(out_partial.stderr.span().index_of("--port").is_some())
+
+    var out_env = BufferOutput::new()
+    let code_env = app
+        .run_io(
+            MemoryInput::new("feracle").env("ORACLE_NODE_ID", "1").env("ORACLE_P2P_PORT", "7002"),
+            mut out_env,
+            |m: Matches| -> i32 {
+                assert!(m.require<u64>("node-id").unwrap() == 1)
+                assert!(m.require<u16>("port").unwrap() == 7002)
+                0
+            },
+        )
+    assert!(code_env == 0)
+    assert!(out_env.stdout.is_empty())
+    assert!(out_env.stderr.is_empty())
+}

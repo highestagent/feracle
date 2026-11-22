@@ -1,0 +1,265 @@
+use super::spec::{App, Arg, ArgKind}
+
+fn push_spaces(_ out: mut MemBuffer, _ count: usize) {
+    var i: usize = 0
+    while i < count {
+        out.push(b' ')
+        i += 1
+    }
+}
+
+fn push_upper_ascii(_ out: mut MemBuffer, _ span: MemSpan) {
+    var i: usize = 0
+    while i < span.len() {
+        let b = span.byte_at(i)
+        if b >= b'a' && b <= b'z' {
+            out.push(b - 32)
+        } else {
+            out.push(b)
+        }
+        i += 1
+    }
+}
+
+fn format_value_placeholder(_ arg: Arg) -> MemBuffer {
+    var out = MemBuffer::empty()
+    out.push(b'<')
+    match arg.value_name {
+        Option::Some(ref v) => out.extend_from(v.span()),
+        Option::None => push_upper_ascii(mut out, arg.id.span()),
+    }
+    out.push(b'>')
+    out
+}
+
+fn format_option_label(_ arg: Arg) -> MemBuffer {
+    var out = MemBuffer::empty()
+    match arg.short {
+        Option::Some(ch) => {
+            out.push(b'-')
+            out.push(ch)
+            if arg.long.is_some() {
+                out.extend_from(", ".span())
+            }
+        },
+        Option::None => {
+            out.extend_from("    ".span())
+        },
+    }
+    if let Option::Some(ref long_name) = arg.long {
+        out.extend_from("--".span())
+        out.extend_from(long_name.span())
+    }
+    match arg.kind {
+        ArgKind::Option | ArgKind::Multi => {
+            out.push(b' ')
+            let ph = format_value_placeholder(arg)
+            out.extend_from(ph.span())
+        },
+        _ => {},
+    }
+    out
+}
+
+fn format_positional_label(_ arg: Arg) -> MemBuffer {
+    var out = format_value_placeholder(arg)
+    if arg.multiple {
+        out.extend_from("...".span())
+    }
+    out
+}
+
+fn format_arg_meta(_ arg: Arg) -> MemBuffer {
+    var out = MemBuffer::empty()
+    if let Option::Some(ref h) = arg.help {
+        out.extend_from(h.span())
+    }
+    var tags = MemBuffer::empty()
+    if arg.required {
+        write!(mut tags, " (required)")
+    }
+    if let Option::Some(ref env_name) = arg.env_var {
+        write!(mut tags, " [env: ", env_name, "]")
+    }
+    if let Option::Some(ref def_val) = arg.default_val {
+        write!(mut tags, " [default: ", def_val, "]")
+    }
+    if !arg.possible_values.is_empty() {
+        write!(mut tags, " [possible values: ")
+        var i: usize = 0
+        while i < arg.possible_values.len() {
+            if i > 0 {
+                write!(mut tags, ", ")
+            }
+            tags.extend_from(arg.possible_values[i].span())
+            i += 1
+        }
+        tags.push(b']')
+    }
+    if !tags.is_empty() {
+        if out.is_empty() {
+            out.extend_from(tags.span().trim())
+        } else {
+            out.extend_from(tags.span())
+        }
+    }
+    out
+}
+
+pub fn render_version_for(_ app: App, breadcrumb: MemSpan) -> MemBuffer {
+    var out = MemBuffer::empty()
+    match app.version {
+        Option::Some(ref ver) => writeln!(mut out, breadcrumb, " ", ver),
+        Option::None => writeln!(mut out, breadcrumb),
+    }
+    out
+}
+
+pub fn render_help_for(_ app: App, breadcrumb: MemSpan) -> MemBuffer {
+    var out = MemBuffer::empty()
+    if let Option::Some(ref about) = app.about {
+        writeln!(mut out, about, "\n")
+    }
+
+    var has_positionals = false
+    var i: usize = 0
+    while i < app.args.len() {
+        if app.args[i].kind == ArgKind::Positional {
+            has_positionals = true
+        }
+        i += 1
+    }
+
+    write!(mut out, "Usage: ", breadcrumb, " [OPTIONS]")
+    if has_positionals {
+        var j: usize = 0
+        while j < app.args.len() {
+            let arg = ref app.args[j]
+            if arg.kind == ArgKind::Positional {
+                let ph = format_positional_label(arg)
+                if arg.required {
+                    write!(mut out, " ", ph)
+                } else {
+                    write!(mut out, " [", ph, "]")
+                }
+            }
+            j += 1
+        }
+    }
+    if !app.subcommands.is_empty() {
+        if app.subcommand_required {
+            write!(mut out, " <COMMAND>")
+        } else {
+            write!(mut out, " [COMMAND]")
+        }
+    }
+    out.push(b'\n')
+
+    // Compute alignment width across options, positionals, and commands
+    var opt_labels = MemVec<MemBuffer>::new()
+    var opt_metas = MemVec<MemBuffer>::new()
+    var pos_labels = MemVec<MemBuffer>::new()
+    var pos_metas = MemVec<MemBuffer>::new()
+    var max_col: usize = 12
+
+    var idx: usize = 0
+    while idx < app.args.len() {
+        let arg = ref app.args[idx]
+        if arg.kind == ArgKind::Positional {
+            let lbl = format_positional_label(arg)
+            if lbl.len() > max_col {
+                max_col = lbl.len()
+            }
+            pos_labels.push(lbl)
+            pos_metas.push(format_arg_meta(arg))
+        } else {
+            let lbl = format_option_label(arg)
+            if lbl.len() > max_col {
+                max_col = lbl.len()
+            }
+            opt_labels.push(lbl)
+            opt_metas.push(format_arg_meta(arg))
+        }
+        idx += 1
+    }
+
+    let help_lbl = format!("-h, --help")
+    if help_lbl.len() > max_col {
+        max_col = help_lbl.len()
+    }
+    opt_labels.push(help_lbl)
+    opt_metas.push(format!("Print help"))
+
+    if app.version.is_some() {
+        let ver_lbl = format!("-V, --version")
+        if ver_lbl.len() > max_col {
+            max_col = ver_lbl.len()
+        }
+        opt_labels.push(ver_lbl)
+        opt_metas.push(format!("Print version"))
+    }
+
+    var sub_idx: usize = 0
+    while sub_idx < app.subcommands.len() {
+        let slen = app.subcommands[sub_idx].name.len()
+        if slen > max_col {
+            max_col = slen
+        }
+        sub_idx += 1
+    }
+
+    let col_width = max_col + 2
+
+    if !app.subcommands.is_empty() {
+        writeln!(mut out, "\nCommands:")
+        var s: usize = 0
+        while s < app.subcommands.len() {
+            let sub = ref app.subcommands[s]
+            write!(mut out, "  ", sub.name)
+            if let Option::Some(ref about) = sub.about {
+                push_spaces(mut out, col_width - sub.name.len())
+                out.extend_from(about.span())
+            }
+            out.push(b'\n')
+            s += 1
+        }
+        write!(mut out, "  help")
+        push_spaces(mut out, col_width - 4)
+        writeln!(
+            mut out,
+            "Print this message or the help of the given subcommand(s)",
+        )
+    }
+
+    if !pos_labels.is_empty() {
+        writeln!(mut out, "\nArguments:")
+        var p: usize = 0
+        while p < pos_labels.len() {
+            let lbl = pos_labels[p].span()
+            let meta = pos_metas[p].span()
+            write!(mut out, "  ", lbl)
+            if !meta.is_empty() {
+                push_spaces(mut out, col_width - lbl.len())
+                out.extend_from(meta)
+            }
+            out.push(b'\n')
+            p += 1
+        }
+    }
+
+    writeln!(mut out, "\nOptions:")
+    var o: usize = 0
+    while o < opt_labels.len() {
+        let lbl = opt_labels[o].span()
+        let meta = opt_metas[o].span()
+        write!(mut out, "  ", lbl)
+        if !meta.is_empty() {
+            push_spaces(mut out, col_width - lbl.len())
+            out.extend_from(meta)
+        }
+        out.push(b'\n')
+        o += 1
+    }
+
+    out
+}

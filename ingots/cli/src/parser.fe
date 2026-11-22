@@ -1,0 +1,725 @@
+use super::error::{CliError, closest_match}
+use super::help::{render_help_for, render_version_for}
+use super::io::Input
+use super::matches::{MatchedArg, Matches}
+use super::spec::{App, Arg, ArgKind}
+use super::value::ValueSource
+
+fn arg_display_name(_ arg: Arg) -> MemBuffer {
+    match arg.long {
+        Option::Some(ref long_name) => format!("--", long_name),
+        Option::None => match arg.short {
+            Option::Some(ch) => {
+                var b = MemBuffer::with_capacity(2)
+                b.push(b'-')
+                b.push(ch)
+                b
+            },
+            Option::None => format!("<", arg.id, ">"),
+        },
+    }
+}
+
+fn find_arg_by_id(_ app: App, _ id: MemSpan) -> Option<usize> {
+    var i: usize = 0
+    while i < app.args.len() {
+        if app.args[i].id.span() == id {
+            return Option::Some(i)
+        }
+        i += 1
+    }
+    Option::None
+}
+
+fn find_arg_by_long(_ app: App, _ name: MemSpan) -> Option<usize> {
+    var i: usize = 0
+    while i < app.args.len() {
+        if let Option::Some(ref long_name) = app.args[i].long {
+            if long_name.span() == name {
+                return Option::Some(i)
+            }
+        }
+        i += 1
+    }
+    Option::None
+}
+
+fn find_arg_by_short(_ app: App, _ ch: u8) -> Option<usize> {
+    var i: usize = 0
+    while i < app.args.len() {
+        if let Option::Some(s) = app.args[i].short {
+            if s == ch {
+                return Option::Some(i)
+            }
+        }
+        i += 1
+    }
+    Option::None
+}
+
+fn find_subcommand(_ app: App, _ name: MemSpan) -> Option<usize> {
+    var i: usize = 0
+    while i < app.subcommands.len() {
+        if app.subcommands[i].name.span() == name {
+            return Option::Some(i)
+        }
+        i += 1
+    }
+    Option::None
+}
+
+fn app_has_positional(_ app: App) -> bool {
+    var i: usize = 0
+    while i < app.args.len() {
+        if app.args[i].kind == ArgKind::Positional {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn suggest_long_flag(_ app: App, _ flag_name: MemSpan) -> Option<MemBuffer> {
+    var candidates = MemVec<MemBuffer>::new()
+    candidates.push(format!("help"))
+    if app.version.is_some() {
+        candidates.push(format!("version"))
+    }
+    var i: usize = 0
+    while i < app.args.len() {
+        if let Option::Some(ref long_name) = app.args[i].long {
+            candidates.push(MemBuffer::from_span(long_name.span()))
+        }
+        i += 1
+    }
+    let max_d: usize = if flag_name.len() <= 3 { 1 } else { 3 }
+    let best = closest_match(flag_name, candidates.as_slice(), max_dist: max_d)?
+    Option::Some(format!("--", best))
+}
+
+fn suggest_subcommand(_ app: App, _ name: MemSpan) -> Option<MemBuffer> {
+    var candidates = MemVec<MemBuffer>::new()
+    candidates.push(format!("help"))
+    var i: usize = 0
+    while i < app.subcommands.len() {
+        candidates.push(MemBuffer::from_span(app.subcommands[i].name.span()))
+        i += 1
+    }
+    let max_d: usize = if name.len() <= 3 { 1 } else { 3 }
+    closest_match(name, candidates.as_slice(), max_dist: max_d)
+}
+
+fn append_split_value(_ values: mut MemVec<MemBuffer>, _ raw: MemSpan, _ delim: Option<u8>) {
+    match delim {
+        Option::Some(sep) => {
+            for part in raw.split(sep) {
+                values.push(MemBuffer::from_span(part))
+            }
+        },
+        Option::None => {
+            values.push(MemBuffer::from_span(raw))
+        },
+    }
+}
+
+fn record_value(
+    _ state: mut MemVec<Option<MatchedArg>>,
+    _ app: App,
+    arg_idx: usize,
+    _ raw: MemSpan,
+    source: ValueSource,
+    from_cli: bool,
+) -> Result<CliError, ()> {
+    let arg = ref app.args[arg_idx]
+    match state[arg_idx] {
+        Option::Some(mut existing) => {
+            if arg.kind == ArgKind::Multi {
+                append_split_value(mut existing.values, raw, arg.delimiter)
+                existing.occurrences += 1
+                existing.source = source
+                return Result::Ok(())
+            }
+            if from_cli && !arg.allow_override {
+                return Result::Err(CliError::DuplicateArg { arg: arg_display_name(arg) })
+            }
+            existing.values.clear()
+            existing.values.push(MemBuffer::from_span(raw))
+            existing.occurrences += 1
+            existing.source = source
+        },
+        Option::None => {
+            var vals = MemVec<MemBuffer>::new()
+            if arg.kind == ArgKind::Multi {
+                append_split_value(mut vals, raw, arg.delimiter)
+            } else {
+                vals.push(MemBuffer::from_span(raw))
+            }
+            state[arg_idx] = Option::Some(
+                MatchedArg {
+                    display_name: arg_display_name(arg),
+                    values: vals,
+                    occurrences: 1,
+                    source,
+                    sensitive: arg.sensitive,
+                },
+            )
+        },
+    }
+    Result::Ok(())
+}
+
+fn record_flag(
+    _ state: mut MemVec<Option<MatchedArg>>,
+    _ app: App,
+    arg_idx: usize,
+    source: ValueSource,
+) {
+    let arg = ref app.args[arg_idx]
+    match state[arg_idx] {
+        Option::Some(mut existing) => {
+            existing.occurrences += 1
+            existing.source = source
+        },
+        Option::None => {
+            state[arg_idx] = Option::Some(
+                MatchedArg {
+                    display_name: arg_display_name(arg),
+                    values: MemVec<MemBuffer>::new(),
+                    occurrences: 1,
+                    source,
+                    sensitive: arg.sensitive,
+                },
+            )
+        },
+    }
+}
+
+fn is_truthy_flag_str(_ s: MemSpan) -> bool {
+    s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES" || s == "on" || s == "ON"
+}
+
+fn is_falsy_flag_str(_ s: MemSpan) -> bool {
+    s == "0" || s == "false" || s == "FALSE" || s == "no" || s == "NO" || s == "off" || s == "OFF"
+}
+
+fn format_allowed_choices(_ choices: MemSlice<MemBuffer>) -> MemBuffer {
+    var out = MemBuffer::empty()
+    var i: usize = 0
+    while i < choices.len() {
+        if i > 0 {
+            out.extend_from(", ".span())
+        }
+        out.extend_from(choices.at(i).span())
+        i += 1
+    }
+    out
+}
+
+fn value_in_choices(_ val: MemSpan, _ choices: MemSlice<MemBuffer>) -> bool {
+    var i: usize = 0
+    while i < choices.len() {
+        if val == choices.at(i).span() {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn parse_tokens<I: Input>(
+    _ app: App,
+    _ input: I,
+    program: MemSpan,
+    breadcrumb: MemSpan,
+    _ tokens: MemSlice<MemBuffer>,
+    start_idx: usize,
+) -> Result<CliError, Matches>
+uses I::E
+{
+    var state = MemVec<Option<MatchedArg>>::with_capacity(app.args.len())
+    var init_i: usize = 0
+    while init_i < app.args.len() {
+        state.push(Option::None)
+        init_i += 1
+    }
+
+    var matches = Matches::empty(
+        program: MemBuffer::from_span(program),
+        command: MemBuffer::from_span(app.name.span()),
+    )
+
+    var positional_arg_indices = MemVec<usize>::new()
+    var pa_i: usize = 0
+    while pa_i < app.args.len() {
+        if app.args[pa_i].kind == ArgKind::Positional {
+            positional_arg_indices.push(pa_i)
+        }
+        pa_i += 1
+    }
+    var pos_cursor: usize = 0
+    var after_double_dash = false
+    var subcommand_invoked = false
+
+    var idx = start_idx
+    while idx < tokens.len() {
+        let tok = tokens.at(idx).span()
+
+        if !after_double_dash && tok == "--" {
+            after_double_dash = true
+            idx += 1
+            continue
+        }
+
+        // Long flags: --name or --name=value
+        if !after_double_dash && tok.len() > 2 && tok.byte_at(0) == b'-' && tok.byte_at(1) == b'-' {
+            let body = tok.tail(2)
+            let eq_pos_opt = body.index_of(b'=')
+            let name_len = match eq_pos_opt {
+                Option::Some(p) => p,
+                Option::None => body.len(),
+            }
+            let flag_name = body.head(name_len)
+
+            if flag_name == "help" {
+                return Result::Err(CliError::HelpRequested(render_help_for(app, breadcrumb)))
+            }
+            if flag_name == "version"
+                && app.version.is_some()
+                && find_arg_by_long(app, "version".span()).is_none() {
+                return Result::Err(
+                    CliError::VersionRequested(render_version_for(app, breadcrumb)),
+                )
+            }
+
+            let Option::Some(arg_idx) = find_arg_by_long(app, flag_name) else {
+                return Result::Err(
+                    CliError::UnknownFlag {
+                        flag: format!("--", flag_name),
+                        suggestion: suggest_long_flag(app, flag_name),
+                    },
+                )
+            }
+
+            let arg = ref app.args[arg_idx]
+            match arg.kind {
+                ArgKind::Flag => {
+                    if eq_pos_opt.is_some() {
+                        return Result::Err(
+                            CliError::UnexpectedValue { flag: arg_display_name(arg) },
+                        )
+                    }
+                    record_flag(mut state, app, arg_idx, source: ValueSource::CommandLine)
+                    idx += 1
+                },
+                ArgKind::Option | ArgKind::Multi => {
+                    match eq_pos_opt {
+                        Option::Some(eq_p) => {
+                            let val_span = body.tail(eq_p + 1)
+                            record_value(
+                                mut state,
+                                app,
+                                arg_idx,
+                                val_span,
+                                source: ValueSource::CommandLine,
+                                from_cli: true,
+                            )?
+                            idx += 1
+                        },
+                        Option::None => {
+                            if idx + 1 >= tokens.len() {
+                                return Result::Err(
+                                    CliError::MissingValue { arg: arg_display_name(arg) },
+                                )
+                            }
+                            let val_span = tokens.at(idx + 1).span()
+                            record_value(
+                                mut state,
+                                app,
+                                arg_idx,
+                                val_span,
+                                source: ValueSource::CommandLine,
+                                from_cli: true,
+                            )?
+                            idx += 2
+                        },
+                    }
+                },
+                ArgKind::Positional => {
+                    return Result::Err(
+                        CliError::UnknownFlag {
+                            flag: format!("--", flag_name),
+                            suggestion: suggest_long_flag(app, flag_name),
+                        },
+                    )
+                },
+            }
+            continue
+        }
+
+        // Short flags: -h, -V, -p 7001, -p=7001, -p7001, -vvf
+        if !after_double_dash && tok.len() >= 2 && tok.byte_at(0) == b'-' {
+            var j: usize = 1
+            var consumed_next = false
+            while j < tok.len() {
+                let ch = tok.byte_at(j)
+                if ch == b'h' && find_arg_by_short(app, ch).is_none() {
+                    return Result::Err(CliError::HelpRequested(render_help_for(app, breadcrumb)))
+                }
+                if ch == b'V' && app.version.is_some() && find_arg_by_short(app, ch).is_none() {
+                    return Result::Err(
+                        CliError::VersionRequested(render_version_for(app, breadcrumb)),
+                    )
+                }
+
+                let Option::Some(arg_idx) = find_arg_by_short(app, ch) else {
+                    var bad = MemBuffer::with_capacity(2)
+                    bad.push(b'-')
+                    bad.push(ch)
+                    return Result::Err(
+                        CliError::UnknownFlag { flag: bad, suggestion: Option::None },
+                    )
+                }
+
+                let arg = ref app.args[arg_idx]
+                match arg.kind {
+                    ArgKind::Flag => {
+                        record_flag(mut state, app, arg_idx, source: ValueSource::CommandLine)
+                        j += 1
+                    },
+                    ArgKind::Option | ArgKind::Multi => {
+                        if j + 1 < tok.len() {
+                            let val_off: usize = if tok.byte_at(j + 1) == b'=' {
+                                j + 2
+                            } else {
+                                j + 1
+                            }
+                            let val_span = tok.tail(val_off)
+                            record_value(
+                                mut state,
+                                app,
+                                arg_idx,
+                                val_span,
+                                source: ValueSource::CommandLine,
+                                from_cli: true,
+                            )?
+                        } else {
+                            if idx + 1 >= tokens.len() {
+                                return Result::Err(
+                                    CliError::MissingValue { arg: arg_display_name(arg) },
+                                )
+                            }
+                            let val_span = tokens.at(idx + 1).span()
+                            record_value(
+                                mut state,
+                                app,
+                                arg_idx,
+                                val_span,
+                                source: ValueSource::CommandLine,
+                                from_cli: true,
+                            )?
+                            consumed_next = true
+                        }
+                        break
+                    },
+                    ArgKind::Positional => {
+                        var bad = MemBuffer::with_capacity(2)
+                        bad.push(b'-')
+                        bad.push(ch)
+                        return Result::Err(
+                            CliError::UnknownFlag { flag: bad, suggestion: Option::None },
+                        )
+                    },
+                }
+            }
+            idx += if consumed_next { 2 } else { 1 }
+            continue
+        }
+
+        // Subcommand dispatch (before positionals when subcommands exist and no positional consumed yet)
+        if !after_double_dash && !app.subcommands.is_empty() && pos_cursor == 0 {
+            if tok == "help" {
+                if idx + 1 < tokens.len() {
+                    let target = tokens.at(idx + 1).span()
+                    let Option::Some(sub_idx) = find_subcommand(app, target) else {
+                        return Result::Err(
+                            CliError::UnknownSubcommand {
+                                name: MemBuffer::from_span(target),
+                                suggestion: suggest_subcommand(app, target),
+                            },
+                        )
+                    }
+                    let sub_app = ref app.subcommands[sub_idx]
+                    let sub_bc = format!(breadcrumb, " ", sub_app.name)
+                    return Result::Err(
+                        CliError::HelpRequested(
+                            render_help_for(sub_app, breadcrumb: sub_bc.span()),
+                        ),
+                    )
+                }
+                return Result::Err(CliError::HelpRequested(render_help_for(app, breadcrumb)))
+            }
+
+            if let Option::Some(sub_idx) = find_subcommand(app, tok) {
+                let sub_app = ref app.subcommands[sub_idx]
+                let sub_bc = format!(breadcrumb, " ", sub_app.name)
+                let sub_matches = parse_tokens(
+                    sub_app,
+                    input,
+                    program,
+                    breadcrumb: sub_bc.span(),
+                    tokens,
+                    start_idx: idx + 1,
+                )?
+                matches.set_subcommand(MemBuffer::from_span(sub_app.name.span()), sub_matches)
+                subcommand_invoked = true
+                break
+            }
+
+            if !app_has_positional(app) {
+                return Result::Err(
+                    CliError::UnknownSubcommand {
+                        name: MemBuffer::from_span(tok),
+                        suggestion: suggest_subcommand(app, tok),
+                    },
+                )
+            }
+        }
+
+        // Positional argument
+        if pos_cursor >= positional_arg_indices.len() {
+            return Result::Err(
+                CliError::UnexpectedPositional { value: MemBuffer::from_span(tok) },
+            )
+        }
+        let p_arg_idx = positional_arg_indices[pos_cursor]
+        let p_arg = ref app.args[p_arg_idx]
+        matches.push_positional(MemBuffer::from_span(tok))
+        if p_arg.multiple {
+            // Multiple trailing positional acts like Multi
+            match state[p_arg_idx] {
+                Option::Some(mut existing) => {
+                    existing.values.push(MemBuffer::from_span(tok))
+                    existing.occurrences += 1
+                    existing.source = ValueSource::CommandLine
+                },
+                Option::None => {
+                    var vals = MemVec<MemBuffer>::new()
+                    vals.push(MemBuffer::from_span(tok))
+                    state[p_arg_idx] = Option::Some(
+                        MatchedArg {
+                            display_name: arg_display_name(p_arg),
+                            values: vals,
+                            occurrences: 1,
+                            source: ValueSource::CommandLine,
+                            sensitive: p_arg.sensitive,
+                        },
+                    )
+                },
+            }
+        } else {
+            record_value(
+                mut state,
+                app,
+                arg_idx: p_arg_idx,
+                tok,
+                source: ValueSource::CommandLine,
+                from_cli: true,
+            )?
+            pos_cursor += 1
+        }
+        idx += 1
+    }
+
+    // Resolve env fallbacks and defaults for unmatched arguments (CLI > Env > Default)
+    var any_env_resolved = false
+    var a_i: usize = 0
+    while a_i < app.args.len() {
+        if state[a_i].is_none() {
+            let arg = ref app.args[a_i]
+            var resolved_env = false
+            if let Option::Some(ref env_name) = arg.env_var {
+                if let Option::Some(env_val) = input.env_lookup(env_name.span()) {
+                    if !env_val.is_empty() {
+                        resolved_env = true
+                        any_env_resolved = true
+                        if arg.kind == ArgKind::Flag {
+                            if is_truthy_flag_str(env_val.span()) {
+                                record_flag(mut state, app, arg_idx: a_i, source: ValueSource::Env)
+                            } else if !is_falsy_flag_str(env_val.span()) {
+                                return Result::Err(
+                                    CliError::InvalidValue {
+                                        arg: arg_display_name(arg),
+                                        value: if arg.sensitive {
+                                            format!("<redacted>")
+                                        } else {
+                                            env_val
+                                        },
+                                        detail: format!(
+                                            "expected boolean env value (true/false, 1/0, yes/no, on/off)",
+                                        ),
+                                    },
+                                )
+                            }
+                        } else {
+                            record_value(
+                                mut state,
+                                app,
+                                arg_idx: a_i,
+                                env_val.span(),
+                                source: ValueSource::Env,
+                                from_cli: false,
+                            )?
+                        }
+                    }
+                }
+            }
+
+            if !resolved_env {
+                if let Option::Some(ref def_val) = arg.default_val {
+                    if arg.kind == ArgKind::Flag {
+                        if is_truthy_flag_str(def_val.span()) {
+                            record_flag(mut state, app, arg_idx: a_i, source: ValueSource::Default)
+                        }
+                    } else {
+                        record_value(
+                            mut state,
+                            app,
+                            arg_idx: a_i,
+                            def_val.span(),
+                            source: ValueSource::Default,
+                            from_cli: false,
+                        )?
+                    }
+                }
+            }
+        }
+        a_i += 1
+    }
+
+    if app.arg_required_else_help && start_idx == tokens.len() && !any_env_resolved {
+        return Result::Err(CliError::HelpRequested(render_help_for(app, breadcrumb)))
+    }
+
+    // Validate possible_values, required, conflicts, requires, and subcommand_required
+    var v_i: usize = 0
+    while v_i < app.args.len() {
+        let arg = ref app.args[v_i]
+        match state[v_i] {
+            Option::Some(ref entry) => {
+                if !arg.possible_values.is_empty() {
+                    var pv_k: usize = 0
+                    while pv_k < entry.values.len() {
+                        let val_span = entry.values[pv_k].span()
+                        if !value_in_choices(val_span, arg.possible_values.as_slice()) {
+                            return Result::Err(
+                                CliError::InvalidChoice {
+                                    arg: arg_display_name(arg),
+                                    value: if arg.sensitive {
+                                        format!("<redacted>")
+                                    } else {
+                                        MemBuffer::from_span(val_span)
+                                    },
+                                    allowed: format_allowed_choices(arg.possible_values.as_slice()),
+                                },
+                            )
+                        }
+                        pv_k += 1
+                    }
+                }
+
+                var c_k: usize = 0
+                while c_k < arg.conflicts.len() {
+                    let other_id = arg.conflicts[c_k].span()
+                    if let Option::Some(other_idx) = find_arg_by_id(app, other_id) {
+                        if state[other_idx].is_some() {
+                            return Result::Err(
+                                CliError::Conflict {
+                                    arg: arg_display_name(arg),
+                                    other: arg_display_name(app.args[other_idx]),
+                                },
+                            )
+                        }
+                    }
+                    c_k += 1
+                }
+
+                var r_k: usize = 0
+                while r_k < arg.requires.len() {
+                    let req_id = arg.requires[r_k].span()
+                    match find_arg_by_id(app, req_id) {
+                        Option::Some(req_idx) => {
+                            if state[req_idx].is_none() {
+                                return Result::Err(
+                                    CliError::MissingDependency {
+                                        arg: arg_display_name(arg),
+                                        requires: arg_display_name(app.args[req_idx]),
+                                    },
+                                )
+                            }
+                        },
+                        Option::None => {
+                            return Result::Err(
+                                CliError::MissingDependency {
+                                    arg: arg_display_name(arg),
+                                    requires: MemBuffer::from_span(req_id),
+                                },
+                            )
+                        },
+                    }
+                    r_k += 1
+                }
+            },
+            Option::None => {
+                if arg.required {
+                    return Result::Err(CliError::MissingRequired { arg: arg_display_name(arg) })
+                }
+            },
+        }
+        v_i += 1
+    }
+
+    if app.subcommand_required && !subcommand_invoked {
+        return Result::Err(
+            CliError::MissingSubcommand { command: MemBuffer::from_span(breadcrumb) },
+        )
+    }
+
+    // Materialize MatchedArg entries into Matches HashMap
+    var m_i: usize = 0
+    while m_i < app.args.len() {
+        if let Option::Some(ref entry) = state[m_i] {
+            matches.insert_arg(
+                    MemBuffer::from_span(app.args[m_i].id.span()),
+                    entry.clone_entry(),
+                )
+        }
+        m_i += 1
+    }
+
+    Result::Ok(matches)
+}
+
+pub fn parse_app<I: Input>(_ app: App, _ input: I) -> Result<CliError, Matches>
+uses I::E
+{
+    let argc = input.arg_count()
+    let program = if argc > 0 {
+        input.arg_at(0)
+    } else {
+        MemBuffer::from_span(app.name.span())
+    }
+    var tokens = MemVec<MemBuffer>::with_capacity(if argc > 0 { argc - 1 } else { 0 })
+    var i: usize = 1
+    while i < argc {
+        tokens.push(input.arg_at(i))
+        i += 1
+    }
+    parse_tokens(
+        app,
+        input,
+        program: program.span(),
+        breadcrumb: app.name.span(),
+        tokens: tokens.as_slice(),
+        start_idx: 0,
+    )
+}

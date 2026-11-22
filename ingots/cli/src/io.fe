@@ -1,0 +1,122 @@
+use core::map::HashMap
+use std::env::{Args, Env}
+use std::io::{Display, Stderr, Stdout}
+
+/// Source of command-line arguments and environment variables.
+///
+/// The associated effect row `E` lets production code bind `(Args, Env)`
+/// while tests supply pure in-memory inputs (`uses E = ()`).
+pub trait Input {
+    uses E
+
+    fn arg_count(self) -> usize uses E
+    fn arg_at(self, _ index: usize) -> MemBuffer uses E
+    fn env_lookup(self, _ name: MemSpan) -> Option<MemBuffer> uses E
+}
+
+/// Host process `Args` + `Env` capability adapter.
+pub struct HostInput {}
+
+impl Copy for HostInput {}
+
+impl Input for HostInput {
+    uses E = (args: Args, env: Env)
+
+    fn arg_count(self) -> usize uses E {
+        args.count()
+    }
+
+    fn arg_at(self, _ index: usize) -> MemBuffer uses E {
+        MemBuffer::from_span(args.get(index).span())
+    }
+
+    fn env_lookup(self, _ name: MemSpan) -> Option<MemBuffer> uses E {
+        env.lookup(name)
+    }
+}
+
+/// Pure, deterministic in-memory `Input` for unit tests and embedding.
+pub struct MemoryInput { argv: MemVec<MemBuffer>, env: HashMap<MemBuffer, MemBuffer> }
+
+impl MemoryInput {
+    pub fn new<T: Display>(_ program: T) -> Self {
+        var argv = MemVec<MemBuffer>::new()
+        argv.push(format!(program))
+        Self { argv, env: HashMap<MemBuffer, MemBuffer>::new() }
+    }
+
+    pub fn arg<T: Display>(var own self, _ value: T) -> Self {
+        self.argv.push(format!(value))
+        self
+    }
+
+    pub fn env<K: Display, V: Display>(var own self, _ key: K, _ value: V) -> Self {
+        self.env.insert(format!(key), format!(value))
+        self
+    }
+}
+
+impl Input for MemoryInput {
+    uses E = ()
+
+    fn arg_count(self) -> usize uses E {
+        self.argv.len()
+    }
+
+    fn arg_at(self, _ index: usize) -> MemBuffer uses E {
+        MemBuffer::from_span(self.argv[index].span())
+    }
+
+    fn env_lookup(self, _ name: MemSpan) -> Option<MemBuffer> uses E {
+        let Option::Some(ref val) = self.env.get(name) else {
+            return Option::None
+        }
+        Option::Some(MemBuffer::from_span(val.span()))
+    }
+}
+
+/// Sink for CLI help/version/error output.
+pub trait Output {
+    uses E
+
+    fn write_stdout(mut self, _ text: MemSpan) uses E
+    fn write_stderr(mut self, _ text: MemSpan) uses E
+}
+
+/// Host `Stdout` + `Stderr` capability adapter.
+pub struct HostOutput {}
+
+impl Copy for HostOutput {}
+
+impl Output for HostOutput {
+    uses E = (out: mut Stdout, err: mut Stderr)
+
+    fn write_stdout(mut self, _ text: MemSpan) uses E {
+        let _ = out.write_stdout(text)
+    }
+
+    fn write_stderr(mut self, _ text: MemSpan) uses E {
+        let _ = err.write_stderr(text)
+    }
+}
+
+/// Pure in-memory `Output` capturing stdout and stderr into `MemBuffer`s.
+pub struct BufferOutput { pub stdout: MemBuffer, pub stderr: MemBuffer }
+
+impl BufferOutput {
+    pub fn new() -> Self {
+        Self { stdout: MemBuffer::empty(), stderr: MemBuffer::empty() }
+    }
+}
+
+impl Output for BufferOutput {
+    uses E = ()
+
+    fn write_stdout(mut self, _ text: MemSpan) uses E {
+        self.stdout.extend_from(text)
+    }
+
+    fn write_stderr(mut self, _ text: MemSpan) uses E {
+        self.stderr.extend_from(text)
+    }
+}

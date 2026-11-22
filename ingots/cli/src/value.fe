@@ -1,0 +1,279 @@
+use core::num::IntDowncast
+use core::text::{Text, parse_int, parse_uint}
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}
+
+/// Indicates where an argument's value originated.
+pub enum ValueSource {
+    CommandLine,
+    Env,
+    Default,
+}
+
+impl Copy for ValueSource {}
+
+impl core::ops::Eq for ValueSource {
+    fn eq(self, _ other: Self) -> bool {
+        match (self, other) {
+            (Self::CommandLine, Self::CommandLine) => true,
+            (Self::Env, Self::Env) => true,
+            (Self::Default, Self::Default) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Copies any `Text` value into an owned `MemBuffer`.
+pub fn text_to_buf<K: Text>(_ text: K) -> MemBuffer {
+    let len = text.text_len()
+    var buf = MemBuffer::with_capacity(len)
+    var i: usize = 0
+    while i < len {
+        buf.push(text.text_byte(i))
+        i += 1
+    }
+    buf
+}
+
+/// Trait for types that can be parsed from a CLI/env argument byte span.
+///
+/// Consumers implement `FromArg` for their own domain types to get seamless
+/// type-inferred parsing via `matches.get(...)` / `matches.require(...)`.
+pub trait FromArg {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self>
+}
+
+fn int_err(_ label: MemSpan) -> MemBuffer {
+    format!("expected a valid ", label)
+}
+
+fn parse_u256_checked(_ raw: MemSpan, _ label: MemSpan) -> Result<MemBuffer, u256> {
+    match parse_uint(raw) {
+        Option::Some(v) => Result::Ok(v),
+        Option::None => Result::Err(int_err(label)),
+    }
+}
+
+fn parse_i256_checked(_ raw: MemSpan, _ label: MemSpan) -> Result<MemBuffer, i256> {
+    match parse_int(raw) {
+        Option::Some(v) => Result::Ok(v),
+        Option::None => Result::Err(int_err(label)),
+    }
+}
+
+impl FromArg for u8 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_u256_checked(raw, "u8".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("u8".span())),
+        }
+    }
+}
+
+impl FromArg for u16 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_u256_checked(raw, "u16".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("u16".span())),
+        }
+    }
+}
+
+impl FromArg for u32 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_u256_checked(raw, "u32".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("u32".span())),
+        }
+    }
+}
+
+impl FromArg for u64 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_u256_checked(raw, "u64".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("u64".span())),
+        }
+    }
+}
+
+impl FromArg for u128 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_u256_checked(raw, "u128".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("u128".span())),
+        }
+    }
+}
+
+impl FromArg for u256 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        parse_u256_checked(raw, "u256".span())
+    }
+}
+
+impl FromArg for usize {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_u256_checked(raw, "usize".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("usize".span())),
+        }
+    }
+}
+
+impl FromArg for i8 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_i256_checked(raw, "i8".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("i8".span())),
+        }
+    }
+}
+
+impl FromArg for i16 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_i256_checked(raw, "i16".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("i16".span())),
+        }
+    }
+}
+
+impl FromArg for i32 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_i256_checked(raw, "i32".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("i32".span())),
+        }
+    }
+}
+
+impl FromArg for i64 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_i256_checked(raw, "i64".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("i64".span())),
+        }
+    }
+}
+
+impl FromArg for i128 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_i256_checked(raw, "i128".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("i128".span())),
+        }
+    }
+}
+
+impl FromArg for i256 {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        parse_i256_checked(raw, "i256".span())
+    }
+}
+
+impl FromArg for isize {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        let word = parse_i256_checked(raw, "isize".span())?
+        match word.downcast() {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(int_err("isize".span())),
+        }
+    }
+}
+
+fn eq_ascii_ignore_case(_ a: MemSpan, _ b: MemSpan) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i: usize = 0
+    while i < a.len() {
+        let ca = a.byte_at(i)
+        let cb = b.byte_at(i)
+        let la = if ca >= b'A' && ca <= b'Z' {
+            ca + 32
+        } else {
+            ca
+        }
+        let lb = if cb >= b'A' && cb <= b'Z' {
+            cb + 32
+        } else {
+            cb
+        }
+        if la != lb { return false }
+        i += 1
+    }
+    true
+}
+
+impl FromArg for bool {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        if eq_ascii_ignore_case(raw, "true".span())
+            || eq_ascii_ignore_case(raw, "1".span())
+            || eq_ascii_ignore_case(raw, "yes".span())
+            || eq_ascii_ignore_case(raw, "on".span()) {
+            return Result::Ok(true)
+        }
+        if eq_ascii_ignore_case(raw, "false".span())
+            || eq_ascii_ignore_case(raw, "0".span())
+            || eq_ascii_ignore_case(raw, "no".span())
+            || eq_ascii_ignore_case(raw, "off".span()) {
+            return Result::Ok(false)
+        }
+        Result::Err(
+            format!("expected boolean (true/false, 1/0, yes/no, on/off)"),
+        )
+    }
+}
+
+impl FromArg for MemBuffer {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        Result::Ok(MemBuffer::from_span(raw))
+    }
+}
+
+impl FromArg for Ipv4Addr {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        match Ipv4Addr::parse(raw) {
+            Option::Some(ip) => Result::Ok(ip),
+            Option::None => Result::Err(format!("expected IPv4 address (e.g. 127.0.0.1)")),
+        }
+    }
+}
+
+impl FromArg for Ipv6Addr {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        match Ipv6Addr::parse(raw) {
+            Option::Some(ip) => Result::Ok(ip),
+            Option::None => Result::Err(format!("expected IPv6 address")),
+        }
+    }
+}
+
+impl FromArg for IpAddr {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        match IpAddr::parse(raw) {
+            Option::Some(ip) => Result::Ok(ip),
+            Option::None => Result::Err(format!("expected IPv4 or IPv6 address")),
+        }
+    }
+}
+
+impl FromArg for SocketAddr {
+    fn from_arg(_ raw: MemSpan) -> Result<MemBuffer, Self> {
+        match SocketAddr::parse(raw) {
+            Option::Some(addr) => Result::Ok(addr),
+            Option::None => Result::Err(format!("expected socket address (e.g. 127.0.0.1:8080)")),
+        }
+    }
+}

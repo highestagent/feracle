@@ -1,0 +1,473 @@
+use core::map::HashMap
+use core::ptr::Box
+use core::text::Text
+use super::error::CliError
+use super::value::{FromArg, ValueSource, text_to_buf}
+
+/// A single matched argument entry inside `Matches`.
+pub struct MatchedArg {
+    pub display_name: MemBuffer,
+    pub values: MemVec<MemBuffer>,
+    pub occurrences: usize,
+    pub source: ValueSource,
+    pub sensitive: bool,
+}
+
+impl MatchedArg {
+    pub fn clone_entry(self) -> Self {
+        var cloned_vals = MemVec<MemBuffer>::with_capacity(self.values.len())
+        var i: usize = 0
+        while i < self.values.len() {
+            cloned_vals.push(MemBuffer::from_span(self.values[i].span()))
+            i += 1
+        }
+        Self {
+            display_name: MemBuffer::from_span(self.display_name.span()),
+            values: cloned_vals,
+            occurrences: self.occurrences,
+            source: self.source,
+            sensitive: self.sensitive,
+        }
+    }
+}
+
+/// Parsed, validated command-line arguments and subcommand tree.
+pub struct Matches {
+    program: MemBuffer,
+    command: MemBuffer,
+    args: HashMap<MemBuffer, MatchedArg>,
+    positionals: MemVec<MemBuffer>,
+    subcommand: Option<(MemBuffer, Box<Matches>)>,
+}
+
+impl Matches {
+    pub fn empty(program: own MemBuffer, command: own MemBuffer) -> Self {
+        Self {
+            program,
+            command,
+            args: HashMap<MemBuffer, MatchedArg>::new(),
+            positionals: MemVec<MemBuffer>::new(),
+            subcommand: Option::None,
+        }
+    }
+
+    pub fn insert_arg(mut self, _ id: own MemBuffer, _ entry: own MatchedArg) {
+        self.args.insert(id, entry)
+    }
+
+    pub fn push_positional(mut self, _ value: own MemBuffer) {
+        self.positionals.push(value)
+    }
+
+    pub fn set_subcommand(mut self, _ name: own MemBuffer, _ sub: own Matches) {
+        self.subcommand = Option::Some((name, Box::new(sub)))
+    }
+
+    pub fn program(self) -> ref MemSpan {
+        self.program.span()
+    }
+
+    pub fn command_name(self) -> ref MemSpan {
+        self.command.span()
+    }
+
+    /// Returns `true` if `id` was supplied via CLI, env, or default value.
+    pub fn is_present<K: Text>(self, _ id: K) -> bool {
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return false
+        }
+        entry.occurrences > 0 || !entry.values.is_empty()
+    }
+
+    /// Returns `true` when boolean flag `id` is set (`occurrences > 0`).
+    pub fn flag<K: Text>(self, _ id: K) -> bool {
+        self.count(id) > 0
+    }
+
+    /// Number of occurrences of flag/option `id` (e.g. `-vvv` -> `3`).
+    pub fn count<K: Text>(self, _ id: K) -> usize {
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return 0
+        }
+        entry.occurrences
+    }
+
+    /// Where `id`'s value came from (`CommandLine`, `Env`, or `Default`).
+    pub fn value_source<K: Text>(self, _ id: K) -> Option<ValueSource> {
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return Option::None
+        }
+        Option::Some(entry.source)
+    }
+
+    /// Copies the last raw string value of `id`, if present.
+    pub fn raw<K: Text>(self, _ id: K) -> Option<MemBuffer> {
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return Option::None
+        }
+        if entry.values.is_empty() {
+            return Option::None
+        }
+        let last = entry.values.len() - 1
+        Option::Some(MemBuffer::from_span(entry.values[last].span()))
+    }
+
+    /// Copies all raw string values of multi-value argument `id`.
+    pub fn raw_many<K: Text>(self, _ id: K) -> MemVec<MemBuffer> {
+        var out = MemVec<MemBuffer>::new()
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return out
+        }
+        var i: usize = 0
+        while i < entry.values.len() {
+            out.push(MemBuffer::from_span(entry.values[i].span()))
+            i += 1
+        }
+        out
+    }
+
+    /// Parses the value of `id` into `T` via `FromArg`, returning `Ok(None)` if absent.
+    pub fn get<T: FromArg, K: Text>(self, _ id: K) -> Result<CliError, Option<T>> {
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return Result::Ok(Option::None)
+        }
+        if entry.values.is_empty() {
+            return Result::Ok(Option::None)
+        }
+        let last = entry.values.len() - 1
+        let raw_span = entry.values[last].span()
+        match T::from_arg(raw_span) {
+            Result::Ok(parsed) => Result::Ok(Option::Some(parsed)),
+            Result::Err(detail) => {
+                let shown_val = if entry.sensitive {
+                    format!("<redacted>")
+                } else {
+                    MemBuffer::from_span(raw_span)
+                }
+                Result::Err(
+                    CliError::InvalidValue {
+                        arg: MemBuffer::from_span(entry.display_name.span()),
+                        value: shown_val,
+                        detail,
+                    },
+                )
+            },
+        }
+    }
+
+    /// Parses required argument `id` into `T`, returning `MissingRequired` if absent.
+    pub fn require<T: FromArg, K: Text>(self, _ id: K) -> Result<CliError, T> {
+        let id_buf = text_to_buf(id)
+        match self.get<T>(id_buf.span())? {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(CliError::MissingRequired { arg: id_buf }),
+        }
+    }
+
+    /// Parses `id` into `T` or returns `default` when absent.
+    pub fn get_or<T: FromArg, K: Text>(self, _ id: K, default: own T) -> Result<CliError, T> {
+        match self.get<T>(id)? {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Ok(default),
+        }
+    }
+
+    /// Parses `id` into `T` or invokes lazy fallback `f` when absent.
+    pub fn get_or_else<T: FromArg, K: Text, F: Fn() -> T>(self, _ id: K, _ f: F) -> Result<
+        CliError,
+        T,
+    >
+    uses F::E
+    {
+        match self.get<T>(id)? {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Ok(f()),
+        }
+    }
+
+    /// Parses all values of multi-value argument `id` into `MemVec<T>`.
+    pub fn get_many<T: FromArg, K: Text>(self, _ id: K) -> Result<CliError, MemVec<T>> {
+        var out = MemVec<T>::new()
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return Result::Ok(out)
+        }
+        var i: usize = 0
+        while i < entry.values.len() {
+            let raw_span = entry.values[i].span()
+            match T::from_arg(raw_span) {
+                Result::Ok(v) => out.push(v),
+                Result::Err(detail) => {
+                    let shown_val = if entry.sensitive {
+                        format!("<redacted>")
+                    } else {
+                        MemBuffer::from_span(raw_span)
+                    }
+                    return Result::Err(
+                        CliError::InvalidValue {
+                            arg: MemBuffer::from_span(entry.display_name.span()),
+                            value: shown_val,
+                            detail,
+                        },
+                    )
+                },
+            }
+            i += 1
+        }
+        Result::Ok(out)
+    }
+
+    /// Parses optional `id` with a caller-supplied effect-polymorphic parser closure.
+    pub fn parse_with<T, K: Text, F: Fn(MemBuffer) -> Result<MemBuffer, T>>(
+        self,
+        _ id: K,
+        _ parser: F,
+    ) -> Result<CliError, Option<T>>
+    uses F::E
+    {
+        let key = text_to_buf(id)
+        let Option::Some(ref entry) = self.args.get(key.span()) else {
+            return Result::Ok(Option::None)
+        }
+        if entry.values.is_empty() {
+            return Result::Ok(Option::None)
+        }
+        let last = entry.values.len() - 1
+        let raw_span = entry.values[last].span()
+        match parser(MemBuffer::from_span(raw_span)) {
+            Result::Ok(parsed) => Result::Ok(Option::Some(parsed)),
+            Result::Err(detail) => {
+                let shown_val = if entry.sensitive {
+                    format!("<redacted>")
+                } else {
+                    MemBuffer::from_span(raw_span)
+                }
+                Result::Err(
+                    CliError::InvalidValue {
+                        arg: MemBuffer::from_span(entry.display_name.span()),
+                        value: shown_val,
+                        detail,
+                    },
+                )
+            },
+        }
+    }
+
+    /// Parses required `id` with a caller-supplied effect-polymorphic parser closure.
+    pub fn require_with<T, K: Text, F: Fn(MemBuffer) -> Result<MemBuffer, T>>(
+        self,
+        _ id: K,
+        _ parser: F,
+    ) -> Result<CliError, T>
+    uses F::E
+    {
+        let id_buf = text_to_buf(id)
+        match self.parse_with(id_buf.span(), parser)? {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(CliError::MissingRequired { arg: id_buf }),
+        }
+    }
+
+    /// Number of raw positional tokens parsed on this command level.
+    pub fn positional_count(self) -> usize {
+        self.positionals.len()
+    }
+
+    /// Raw positional token at `index`.
+    pub fn positional_raw(self, _ index: usize) -> Option<MemBuffer> {
+        if index >= self.positionals.len() {
+            return Option::None
+        }
+        Option::Some(MemBuffer::from_span(self.positionals[index].span()))
+    }
+
+    /// Parses positional token at `index` into `T` via `FromArg`.
+    pub fn positional<T: FromArg>(self, _ index: usize) -> Result<CliError, Option<T>> {
+        if index >= self.positionals.len() {
+            return Result::Ok(Option::None)
+        }
+        let raw_span = self.positionals[index].span()
+        match T::from_arg(raw_span) {
+            Result::Ok(v) => Result::Ok(Option::Some(v)),
+            Result::Err(detail) => Result::Err(
+                CliError::InvalidValue {
+                    arg: format!("positional[", index, "]"),
+                    value: MemBuffer::from_span(raw_span),
+                    detail,
+                },
+            ),
+        }
+    }
+
+    /// Name of the matched subcommand, if any.
+    pub fn subcommand_name(self) -> Option<MemBuffer> {
+        let Option::Some((ref name, _)) = self.subcommand else {
+            return Option::None
+        }
+        Option::Some(MemBuffer::from_span(name.span()))
+    }
+
+    /// Returns `true` if the matched subcommand has `name`.
+    pub fn subcommand_is<K: Text>(self, _ name: K) -> bool {
+        let Option::Some((ref matched_name, _)) = self.subcommand else {
+            return false
+        }
+        matched_name.span() == text_to_buf(name).span()
+    }
+
+    /// Consumes `Matches` and returns `(subcommand_name, subcommand_matches)`.
+    pub fn into_subcommand(own self) -> Option<(MemBuffer, Matches)> {
+        match self.subcommand {
+            Option::Some((name, boxed)) => Option::Some((name, boxed.into_inner())),
+            Option::None => Option::None,
+        }
+    }
+
+    /// Invokes `f(subcommand_name, subcommand_matches)` by borrow if a subcommand matched.
+    pub fn with_subcommand<R, F: Fn(MemBuffer, Matches) -> R>(self, _ f: F) -> Option<R>
+    uses F::E
+    {
+        let Option::Some((ref name, ref boxed)) = self.subcommand else {
+            return Option::None
+        }
+        Option::Some(f(MemBuffer::from_span(name.span()), boxed.get()))
+    }
+}
+
+/// Custom CLI capability trait for dependency injection via `with (Cli = matches) { ... }`.
+///
+/// Consumer functions declare `uses (cli: Cli)` to read parsed configuration
+/// cleanly without threading `Matches` explicitly through every helper.
+pub trait Cli {
+    fn cli_is_present(self, _ id: MemSpan) -> bool
+    fn cli_flag(self, _ id: MemSpan) -> bool
+    fn cli_count(self, _ id: MemSpan) -> usize
+    fn cli_raw(self, _ id: MemSpan) -> Option<MemBuffer>
+    fn cli_raw_many(self, _ id: MemSpan) -> MemVec<MemBuffer>
+    fn cli_source(self, _ id: MemSpan) -> Option<ValueSource>
+    fn cli_is_sensitive(self, _ id: MemSpan) -> bool
+    fn cli_display_name(self, _ id: MemSpan) -> Option<MemBuffer>
+}
+
+impl Cli for Matches {
+    fn cli_is_present(self, _ id: MemSpan) -> bool {
+        self.is_present(id)
+    }
+
+    fn cli_flag(self, _ id: MemSpan) -> bool {
+        self.flag(id)
+    }
+
+    fn cli_count(self, _ id: MemSpan) -> usize {
+        self.count(id)
+    }
+
+    fn cli_raw(self, _ id: MemSpan) -> Option<MemBuffer> {
+        self.raw(id)
+    }
+
+    fn cli_raw_many(self, _ id: MemSpan) -> MemVec<MemBuffer> {
+        self.raw_many(id)
+    }
+
+    fn cli_source(self, _ id: MemSpan) -> Option<ValueSource> {
+        self.value_source(id)
+    }
+
+    fn cli_is_sensitive(self, _ id: MemSpan) -> bool {
+        let Option::Some(ref entry) = self.args.get(id) else {
+            return false
+        }
+        entry.sensitive
+    }
+
+    fn cli_display_name(self, _ id: MemSpan) -> Option<MemBuffer> {
+        let Option::Some(ref entry) = self.args.get(id) else {
+            return Option::None
+        }
+        Option::Some(MemBuffer::from_span(entry.display_name.span()))
+    }
+}
+
+/// Convenience typed getters over the `Cli` capability for `with (Cli = matches)` blocks.
+pub fn get<T: FromArg, K: Text>(_ id: K) -> Result<CliError, Option<T>>
+uses (cli: Cli)
+{
+    let key = text_to_buf(id)
+    let Option::Some(raw) = cli.cli_raw(key.span()) else {
+        return Result::Ok(Option::None)
+    }
+    match T::from_arg(raw.span()) {
+        Result::Ok(v) => Result::Ok(Option::Some(v)),
+        Result::Err(detail) => {
+            let shown_val = if cli.cli_is_sensitive(key.span()) {
+                format!("<redacted>")
+            } else {
+                raw
+            }
+            let arg_name = match cli.cli_display_name(key.span()) {
+                Option::Some(d) => d,
+                Option::None => key,
+            }
+            Result::Err(
+                CliError::InvalidValue { arg: arg_name, value: shown_val, detail },
+            )
+        },
+    }
+}
+
+pub fn require<T: FromArg, K: Text>(_ id: K) -> Result<CliError, T>
+uses (cli: Cli)
+{
+    let key = text_to_buf(id)
+    match get<T>(key.span())? {
+        Option::Some(v) => Result::Ok(v),
+        Option::None => Result::Err(CliError::MissingRequired { arg: key }),
+    }
+}
+
+pub fn get_or<T: FromArg, K: Text>(_ id: K, default: own T) -> Result<CliError, T>
+uses (cli: Cli)
+{
+    match get<T>(id)? {
+        Option::Some(v) => Result::Ok(v),
+        Option::None => Result::Ok(default),
+    }
+}
+
+pub fn get_many<T: FromArg, K: Text>(_ id: K) -> Result<CliError, MemVec<T>>
+uses (cli: Cli)
+{
+    let key = text_to_buf(id)
+    let raw_vals = cli.cli_raw_many(key.span())
+    var out = MemVec<T>::with_capacity(raw_vals.len())
+    var i: usize = 0
+    while i < raw_vals.len() {
+        let raw_span = raw_vals[i].span()
+        match T::from_arg(raw_span) {
+            Result::Ok(v) => out.push(v),
+            Result::Err(detail) => {
+                let shown_val = if cli.cli_is_sensitive(key.span()) {
+                    format!("<redacted>")
+                } else {
+                    MemBuffer::from_span(raw_span)
+                }
+                let arg_name = match cli.cli_display_name(key.span()) {
+                    Option::Some(d) => d,
+                    Option::None => key,
+                }
+                return Result::Err(
+                    CliError::InvalidValue { arg: arg_name, value: shown_val, detail },
+                )
+            },
+        }
+        i += 1
+    }
+    Result::Ok(out)
+}
