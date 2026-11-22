@@ -85,88 +85,66 @@ let config = with (Cli = matches) { load_config() }
     - `infra/Caddyfile`: Optional local TLS proxy for live exchange feeds (`:9001`–`:9003`)
     - `scripts/install.sh`, `scripts/build-feracle.sh`, `scripts/build-wasm.sh`, `scripts/e2e.sh`, `scripts/e2e-telemetry.sh`, `scripts/dev-telemetry.sh`
 
-## Install & Run
+## Quickstart (Prebuilt Binaries)
 
-### Run from prebuilt binaries
-
-Install `feracle`, `feracle-telemetry`, and the local devnet runner (`feracle-demo`) into `~/.local/bin` with one command (downloads the release archive for `linux-x86_64`, `linux-arm64`, or `darwin-arm64`, or falls back to building from source if no release tarball matches):
+Install `feracle`, `feracle-telemetry`, and the local devnet launcher (`feracle-demo`) into `~/.local/bin` (downloads the release archive for `linux-x86_64`, `linux-arm64`, or `darwin-arm64`, or falls back to building from source):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/highestagent/feracle/main/scripts/install.sh | bash
 ```
 
-Optional installer flags: `--prefix <DIR>`, `--version <TAG>`, `--archive <PATH>` (to install a downloaded CI artifact `.tar.gz`), and `--install-foundry` (installs `anvil` and `cast` if missing). Make sure `~/.local/bin` is on your `PATH`, then run:
+Optional installer flags: `--prefix <DIR>`, `--version <TAG>`, `--archive <PATH>` (install a CI artifact tarball), and `--install-foundry`. Ensure `~/.local/bin` is on your `PATH`, then run:
 
 ```bash
-feracle                      # print node CLI flags & env vars
-feracle-telemetry --help     # inspect WASM telemetry host options (requires Node.js >= 20)
-feracle-demo                 # launch local Anvil + 3 nodes + telemetry TUI (requires Foundry & Python 3)
+feracle                      # print node CLI options (or pass flags to run)
+feracle-telemetry --help     # WASM telemetry collector options (requires Node.js >= 20)
+feracle-demo                 # local Anvil + 3 nodes + telemetry TUI (requires Foundry & Python 3)
 feracle-demo --backend udp   # switch P2P transport (libp2p | tcp | udp)
 ```
 
+## Build & Test
+
+**Prerequisites:** `fe` (auto-installed via `feup` by `scripts/install.sh` if absent), Rust `cargo`, and `Node.js >= 20` (plus Foundry and `python3` for E2E and local devnet runs).
+
 ### Build from source
 
-Prerequisites: `fe` (auto-installed via `feup` by `scripts/install.sh` if absent), Rust `cargo`, and `Node.js >= 20` (plus Foundry and `python3` for local devnet/E2E runs).
-
-Clone and install to `~/.local/bin`:
+Clone and install to `~/.local/bin`, or build artifacts in-place under `out/` and `ingots/evm/out/`:
 
 ```bash
-git clone https://github.com/highestagent/feracle.git
-cd feracle
+git clone https://github.com/highestagent/feracle.git && cd feracle
+
+# Option A: build and install wrappers to ~/.local/bin
 ./scripts/install.sh --from-source
-```
 
-Or build artifacts in-place under `out/` and `ingots/evm/out/`:
-
-```bash
+# Option B: build artifacts in-place and run directly
 fe build --emit abi,bytecode --out-dir ingots/evm/out ingots/evm
 ./scripts/build-wasm.sh
 ./scripts/build-feracle.sh
 
-./out/feracle                              # run native node (prints CLI help with no args)
-node telemetry/host.mjs --help             # run WASM telemetry collector directly
-./scripts/dev-telemetry.sh                 # launch local Anvil + 3 nodes + telemetry TUI
+./out/feracle                   # native oracle node (prints CLI help with no args)
+node telemetry/host.mjs --help  # WASM telemetry collector
 ```
 
-## Native Linking (`libp2p_shim.a`)
+`scripts/build-feracle.sh` links `p2p-shim/target/release/libp2p_shim.a` into `out/feracle` via `fe build --backend native --link`—linking `CoreFoundation` / `SystemConfiguration` framework stubs and `-liconv` on macOS, or `-lpthread -ldl -lm` on Linux.
 
-`ingots/feracle` links `p2p-shim/target/release/libp2p_shim.a` directly into `out/feracle` via `fe build --backend native --link`:
-
-- **macOS (Apple Silicon):** Links `CoreFoundation` and `SystemConfiguration` SDK `.tbd` framework stubs for `libp2p-mdns` alongside `-liconv`.
-- **Linux:** Links `pthread`, `dl`, and `m`.
-
-Run `./scripts/build-feracle.sh` to build `p2p-shim` and link `out/feracle` automatically for your host OS.
-
-## Verification Commands
+### Unit tests
 
 ```bash
-# CLI parser tests
 fe test --backend native ingots/cli
-
-# Target-independent shared core (Native + EVM + WASM)
-fe test --backend native ingots/core
-fe test ingots/core
-fe test --backend wasm ingots/core
-
-# Telemetry WASM engine tests & build
-fe test --backend wasm ingots/wasm
-./scripts/build-wasm.sh
-
-# EVM contract tests & bytecode/ABI build
+fe test --backend native ingots/core && fe test ingots/core && fe test --backend wasm ingots/core
 fe test ingots/evm
-fe build --emit abi,bytecode --out-dir ingots/evm/out ingots/evm
-
-# Rust libp2p + ECDSA shim tests & release archive
-(cd p2p-shim && cargo test && cargo build --release)
-
-# P2P networking ingots
+fe test --backend wasm ingots/wasm
 fe test --backend native ingots/p2p
 fe test --backend native ingots/p2p_udp
 fe test --backend native ingots/p2p_tcp
 fe check --backend native ingots/p2p_libp2p
+cargo test --manifest-path p2p-shim/Cargo.toml
+```
 
-# Build oracle node binary and run 3-node E2E & telemetry suites across all backends
-./scripts/build-feracle.sh
+### End-to-end & local devnet
+
+```bash
+# Consensus & telemetry E2E suites across all 3 P2P backends
 ./scripts/e2e.sh
 P2P_BACKEND=tcp ./scripts/e2e.sh
 P2P_BACKEND=udp ./scripts/e2e.sh
@@ -174,19 +152,11 @@ P2P_BACKEND=udp ./scripts/e2e.sh
 P2P_BACKEND=tcp ./scripts/e2e-telemetry.sh
 P2P_BACKEND=udp ./scripts/e2e-telemetry.sh
 
-# Interactive live WASM telemetry TUI (Anvil + 3 nodes + telemetry host)
+# Interactive live devnet (Anvil + 3 nodes + WASM telemetry TUI)
 ./scripts/dev-telemetry.sh
 ```
 
-## Optional Live TLS Smoke Test (Caddy)
-
-With `caddy` installed locally, start the TLS termination proxy:
-
-```bash
-caddy run --config infra/Caddyfile
-```
-
-Point the three oracle nodes at `127.0.0.1:9001`, `127.0.0.1:9002`, and `127.0.0.1:9003` against a local `anvil` node to fetch live market prices from Hyperliquid, Binance, and Coinbase. (Automated E2E runs do not require `caddy` and use `infra/mock_feeds.py`.)
+> **Optional live feeds:** To test against live Hyperliquid, Binance, and Coinbase endpoints instead of `infra/mock_feeds.py`, run `caddy run --config infra/Caddyfile` and point the nodes at `127.0.0.1:9001..9003` against a local `anvil` deployment.
 
 ## License
 
