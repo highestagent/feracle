@@ -1,0 +1,493 @@
+use std::abi::sol
+use std::evm::{Address, Call, CallOutcome, Create, Evm, Wei, encode_error}
+use super::{
+    ASSET_COUNT,
+    DuplicateOrUnsortedSigner,
+    FutureTimestamp,
+    InvalidAsset,
+    InvalidRound,
+    InvalidSignature,
+    OffchainMedianOracle,
+    OracleMsg,
+    Sig,
+    StaleTimestamp,
+    Unauthorized,
+    ZeroPrice,
+}
+
+const ADDR_0: Address = Address::new(0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266)
+const ADDR_1: Address = Address::new(0x70997970C51812dc3A010C7d01b50e0d17dc79C8)
+const ADDR_2: Address = Address::new(0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC)
+const ADDR_3: Address = Address::new(0x90F79bf6EB2c4f870365E785982E1f101E93b906)
+
+const TEST_TS: u256 = 1
+
+fn test_prices() -> [u256; 20] {
+    [
+        9_245_025_000_000,
+        342_050_000_000,
+        21_840_000_000,
+        245_200_000,
+        68_520_000_000,
+        38_400_000,
+        104_500_000,
+        26_100_000,
+        4_480_000_000,
+        2_360_000_000,
+        415_200_000,
+        892_000_000,
+        29_500_000,
+        51_230_000_000,
+        11_460_000_000,
+        1_475_000_000,
+        648_000_000,
+        1_235_000_000,
+        94_500_000,
+        31_850_000_000,
+    ]
+}
+
+fn sig0() -> Sig {
+    Sig {
+        v: 27,
+        r: 0x54dc09f451b6fa2d33ff0a22febe479be7501b27b0277ba7d0674b12f237e753,
+        s: 0x26899c2db86ab0b0fbeb50e280e87858d775f9699772f60d174cbc9ff7c4aa7a,
+    }
+}
+
+fn sig1() -> Sig {
+    Sig {
+        v: 27,
+        r: 0x87ad2430da409d9d9941f3ab9089dbb14a2958ddfa9d55edf17c7473007fa8c2,
+        s: 0x0164ed312c2e2512de02d69980d14db26833e0d6c29cfef19d0e4085ed0b7e9e,
+    }
+}
+
+fn sig2() -> Sig {
+    Sig {
+        v: 28,
+        r: 0x611137a6aeb9b4af5ba649ee0a12ef9555cfdf0dd4f2c42a2915b866a4f38430,
+        s: 0x15dfc5fabfc4e8a01436d7de218fbdf649f3dd3b050372271405ca702221e316,
+    }
+}
+
+fn sig3() -> Sig {
+    Sig {
+        v: 28,
+        r: 0xd52c6169c45af2235cea77bea5fa007d93b76fa8c6dbc7514c5ab063cf01c4eb,
+        s: 0x6333f5e9cd6eab00b4037ee6ccd2b9994ea3962ce84ef64cb9b021ab4c201862,
+    }
+}
+
+msg HelperMsg {
+    #[selector = sol("forwardAdd(address,address)")]
+    ForwardAdd { target: Address, node: Address } -> bool,
+}
+
+contract NonOwnerCaller uses (call: mut Call) {
+    init() {}
+
+    recv HelperMsg {
+        ForwardAdd { target, node } -> bool uses (mut call) {
+            let outcome = call
+                .try_call(
+                    addr: target,
+                    gas: 200000,
+                    value: Wei::zero(),
+                    message: OracleMsg::AddOracle { node },
+                )
+            outcome.success()
+        }
+    }
+}
+
+fn deploy_and_register(evm: mut Evm) -> Address {
+    let addr = evm.create2<OffchainMedianOracle>(value: Wei::zero(), args: (), salt: 0)
+    assert!(addr.word() == 0x3244d0de654b2d7e00fedb548d3f5a6c6175dcf0)
+
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::AddOracle { node: ADDR_0 },
+    )
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::AddOracle { node: ADDR_1 },
+    )
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::AddOracle { node: ADDR_2 },
+    )
+
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_0 },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_1 },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_2 },
+        ),
+    )
+    assert!(
+        !evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_3 },
+        ),
+    )
+    addr
+}
+
+fn assert_reverted_with(_ outcome: CallOutcome, _ expected: MemSpan) {
+    assert!(!outcome.success())
+    assert!(outcome.returndata() == expected)
+}
+
+#[test]
+fn test_asset_count_and_invalid_asset_revert() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let count: u256 = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::AssetCount {},
+        )
+    assert!(count == (ASSET_COUNT as u256))
+
+    let outcome = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestPrice { asset_id: 20 },
+        )
+    assert_reverted_with(outcome, encode_error(InvalidAsset {}).span())
+}
+
+#[test]
+fn test_valid_submit_medians() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let expected = test_prices()
+
+    let round0: u256 = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::CurrentRound {},
+        )
+    assert!(round0 == 1)
+
+    // Sorted ascending by signer address: ADDR_2 < ADDR_1 < ADDR_0
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+    evm.call(
+        addr: addr,
+        gas: 1500000,
+        value: Wei::zero(),
+        message: OracleMsg::SubmitMedians {
+            round_id: 1,
+            prices: expected,
+            timestamp: TEST_TS,
+            sigs,
+        },
+    )
+
+    let (all_prices, last_updated): ([u256; 20], u256) = evm
+        .call(
+            addr: addr,
+            gas: 300000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestPrices {},
+        )
+    assert!(last_updated == TEST_TS)
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        assert!(all_prices[i] == expected[i])
+        i += 1
+    }
+
+    let (btc_price, btc_ts): (u256, u256) = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestPrice { asset_id: 0 },
+        )
+    assert!(btc_price == expected[0])
+    assert!(btc_ts == TEST_TS)
+
+    let (aave_price, aave_ts): (u256, u256) = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestPrice { asset_id: 19 },
+        )
+    assert!(aave_price == expected[19])
+    assert!(aave_ts == TEST_TS)
+
+    let round1: u256 = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::CurrentRound {},
+        )
+    assert!(round1 == 2)
+}
+
+#[test]
+fn test_replay_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let prices = test_prices()
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+    evm.call(
+        addr: addr,
+        gas: 1500000,
+        value: Wei::zero(),
+        message: OracleMsg::SubmitMedians { round_id: 1, prices, timestamp: TEST_TS, sigs },
+    )
+
+    let outcome = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians { round_id: 1, prices, timestamp: TEST_TS, sigs },
+        )
+    assert_reverted_with(outcome, encode_error(InvalidRound {}).span())
+}
+
+#[test]
+fn test_unsorted_signers_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    // Descending order: ADDR_0 > ADDR_1 > ADDR_2
+    let sigs: [Sig; 3] = [sig0(), sig1(), sig2()]
+    let outcome = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians {
+                round_id: 1,
+                prices: test_prices(),
+                timestamp: TEST_TS,
+                sigs,
+            },
+        )
+    assert_reverted_with(outcome, encode_error(DuplicateOrUnsortedSigner {}).span())
+}
+
+#[test]
+fn test_duplicate_signer_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let sigs: [Sig; 3] = [sig2(), sig2(), sig0()]
+    let outcome = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians {
+                round_id: 1,
+                prices: test_prices(),
+                timestamp: TEST_TS,
+                sigs,
+            },
+        )
+    assert_reverted_with(outcome, encode_error(DuplicateOrUnsortedSigner {}).span())
+}
+
+#[test]
+fn test_unauthorized_signer_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let prices = test_prices()
+
+    // Account 3 is not an oracle (ADDR_2 < ADDR_1 < ADDR_3 < ADDR_0)
+    let sigs_with_unauth: [Sig; 3] = [sig2(), sig1(), sig3()]
+    let outcome1 = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians {
+                round_id: 1,
+                prices,
+                timestamp: TEST_TS,
+                sigs: sigs_with_unauth,
+            },
+        )
+    assert_reverted_with(outcome1, encode_error(Unauthorized {}).span())
+
+    // Remove ADDR_0 and attempt with [sig2, sig1, sig0]
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::RemoveOracle { node: ADDR_0 },
+    )
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+    let outcome2 = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians { round_id: 1, prices, timestamp: TEST_TS, sigs },
+        )
+    assert_reverted_with(outcome2, encode_error(Unauthorized {}).span())
+}
+
+#[test]
+fn test_invalid_signature_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let bad_sig = Sig { v: 0, r: 0, s: 0 }
+    let sigs: [Sig; 3] = [bad_sig, sig1(), sig0()]
+    let outcome = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians {
+                round_id: 1,
+                prices: test_prices(),
+                timestamp: TEST_TS,
+                sigs,
+            },
+        )
+    assert_reverted_with(outcome, encode_error(InvalidSignature {}).span())
+}
+
+#[test]
+fn test_zero_price_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    var zero_btc = test_prices()
+    zero_btc[0] = 0
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+    let outcome0 = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians {
+                round_id: 1,
+                prices: zero_btc,
+                timestamp: TEST_TS,
+                sigs,
+            },
+        )
+    assert_reverted_with(outcome0, encode_error(ZeroPrice {}).span())
+
+    var zero_last = test_prices()
+    zero_last[19] = 0
+    let outcome19 = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians {
+                round_id: 1,
+                prices: zero_last,
+                timestamp: TEST_TS,
+                sigs,
+            },
+        )
+    assert_reverted_with(outcome19, encode_error(ZeroPrice {}).span())
+}
+
+#[test]
+fn test_future_timestamp_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+    // In `fe test`, block.timestamp == 1, so timestamp == 2 is in the future
+    let outcome = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians {
+                round_id: 1,
+                prices: test_prices(),
+                timestamp: 2,
+                sigs,
+            },
+        )
+    assert_reverted_with(outcome, encode_error(FutureTimestamp {}).span())
+}
+
+#[test]
+fn test_stale_timestamp_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let prices = test_prices()
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+
+    // Initially last_updated == 0, so timestamp == 0 is stale
+    let outcome0 = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians { round_id: 1, prices, timestamp: 0, sigs },
+        )
+    assert_reverted_with(outcome0, encode_error(StaleTimestamp {}).span())
+
+    // Succeed round 1 with timestamp == 1 (sets last_updated = 1)
+    evm.call(
+        addr: addr,
+        gas: 1500000,
+        value: Wei::zero(),
+        message: OracleMsg::SubmitMedians { round_id: 1, prices, timestamp: TEST_TS, sigs },
+    )
+
+    // Round 2 with timestamp == 1 must fail StaleTimestamp
+    let outcome2 = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians { round_id: 2, prices, timestamp: 1, sigs },
+        )
+    assert_reverted_with(outcome2, encode_error(StaleTimestamp {}).span())
+}
+
+#[test]
+fn test_non_owner_add_oracle_reverts() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let helper = evm.create2<NonOwnerCaller>(value: Wei::zero(), args: (), salt: 1)
+    let ok = evm
+        .call(
+            addr: helper,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardAdd { target: addr, node: ADDR_3 },
+        )
+    assert!(!ok)
+    assert!(
+        !evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_3 },
+        ),
+    )
+}

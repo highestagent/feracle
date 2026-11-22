@@ -1,0 +1,181 @@
+use std::abi::sol
+use std::evm::{Address, Ctx, StorageMap, crypto, revert_error}
+pub use feracle_core::{ASSET_COUNT, QUORUM}
+
+#[error]
+pub struct Unauthorized {}
+
+#[error]
+pub struct InvalidRound {}
+
+#[error]
+pub struct ZeroPrice {}
+
+#[error]
+pub struct FutureTimestamp {}
+
+#[error]
+pub struct StaleTimestamp {}
+
+#[error]
+pub struct InvalidSignature {}
+
+#[error]
+pub struct DuplicateOrUnsortedSigner {}
+
+#[error]
+pub struct InvalidAsset {}
+
+#[abi]
+pub struct Sig { pub v: u8, pub r: u256, pub s: u256 }
+
+impl Copy for Sig {}
+
+pub msg OracleMsg {
+    #[selector = sol("addOracle(address)")]
+    AddOracle { node: Address },
+    #[selector = sol("removeOracle(address)")]
+    RemoveOracle { node: Address },
+    #[selector = sol(
+        "submitMedians(uint256,uint256[20],uint256,(uint8,uint256,uint256)[3])",
+    )]
+    SubmitMedians { round_id: u256, prices: [u256; 20], timestamp: u256, sigs: [Sig; 3] },
+    #[selector = sol("latestPrice(uint256)")]
+    LatestPrice { asset_id: u256 } -> (u256, u256),
+    #[selector = sol("latestPrices()")]
+    LatestPrices -> ([u256; 20], u256),
+    #[selector = sol("assetCount()")]
+    AssetCount -> u256,
+    #[selector = sol("currentRound()")]
+    CurrentRound -> u256,
+    #[selector = sol("isOracle(address)")]
+    IsOracle { node: Address } -> bool,
+    #[selector = sol("owner()")]
+    Owner -> Address,
+}
+
+struct OracleStore {
+    owner: Address,
+    is_oracle: StorageMap<Address, bool>,
+    current_round: u256,
+    latest_prices: StorageMap<u256, u256>,
+    last_updated: u256,
+}
+
+pub contract OffchainMedianOracle uses (ctx: Ctx) {
+    mut store: OracleStore,
+
+    init()
+    uses (ctx, mut store)
+    {
+        store.owner = ctx.caller()
+        store.current_round = 1
+        store.last_updated = 0
+    }
+
+    recv OracleMsg {
+        AddOracle { node } uses (ctx, mut store) {
+            if ctx.caller() != store.owner {
+                revert_error(Unauthorized {})
+            }
+            store.is_oracle.set(key: node, value: true)
+        }
+
+        RemoveOracle { node } uses (ctx, mut store) {
+            if ctx.caller() != store.owner {
+                revert_error(Unauthorized {})
+            }
+            store.is_oracle.set(key: node, value: false)
+        }
+
+        SubmitMedians { round_id, prices, timestamp, sigs }
+        uses (ctx, mut store)
+        {
+            if round_id != store.current_round {
+                revert_error(InvalidRound {})
+            }
+            if timestamp > ctx.timestamp().as_seconds() {
+                revert_error(FutureTimestamp {})
+            }
+            if timestamp <= store.last_updated {
+                revert_error(StaleTimestamp {})
+            }
+
+            var p_idx: usize = 0
+            while p_idx < ASSET_COUNT {
+                if prices[p_idx] == 0 {
+                    revert_error(ZeroPrice {})
+                }
+                p_idx += 1
+            }
+
+            let prices_hash: u256 = crypto::keccak_words(prices)
+            let digest: u256 = crypto::keccak_words(
+                [ctx.chainid(), ctx.address().word(), round_id, prices_hash, timestamp],
+            )
+
+            var last_signer = Address::zero()
+            var i: usize = 0
+            while i < QUORUM {
+                let sig = sigs[i]
+                let rec = crypto::ecrecover(hash: digest, v: sig.v as u256, r: sig.r, s: sig.s)
+                let recovered = match rec {
+                    Result::Ok(Option::Some(word)) => Address::from_word_truncate(word),
+                    _ => revert_error(InvalidSignature {}),
+                }
+                if recovered == Address::zero() {
+                    revert_error(InvalidSignature {})
+                }
+                if !store.is_oracle.get(recovered) {
+                    revert_error(Unauthorized {})
+                }
+                if recovered <= last_signer {
+                    revert_error(DuplicateOrUnsortedSigner {})
+                }
+                last_signer = recovered
+                i += 1
+            }
+
+            var s_idx: usize = 0
+            while s_idx < ASSET_COUNT {
+                store.latest_prices.set(key: s_idx as u256, value: prices[s_idx])
+                s_idx += 1
+            }
+            store.last_updated = timestamp
+            store.current_round = round_id + 1
+        }
+
+        LatestPrice { asset_id } -> (u256, u256) uses (store) {
+            if asset_id >= (ASSET_COUNT as u256) {
+                revert_error(InvalidAsset {})
+            }
+            (store.latest_prices.get(asset_id), store.last_updated)
+        }
+
+        LatestPrices -> ([u256; 20], u256) uses (store) {
+            var out: [u256; 20] = [0; 20]
+            var i: usize = 0
+            while i < ASSET_COUNT {
+                out[i] = store.latest_prices.get(i as u256)
+                i += 1
+            }
+            (out, store.last_updated)
+        }
+
+        AssetCount -> u256 {
+            ASSET_COUNT as u256
+        }
+
+        CurrentRound -> u256 uses (store) {
+            store.current_round
+        }
+
+        IsOracle { node } -> bool uses (store) {
+            store.is_oracle.get(node)
+        }
+
+        Owner -> Address uses (store) {
+            store.owner
+        }
+    }
+}
