@@ -1,0 +1,218 @@
+use std::net::{Net, SocketAddr}
+use std::time::Clock
+use p2p::{GossipConfig, Transport}
+use super::{TcpConfig, TcpTransport}
+
+fn pump_all(a: mut TcpTransport, b: mut TcpTransport, c: mut TcpTransport, steps: usize)
+uses (net: mut Net, clock: Clock)
+{
+    var i: usize = 0
+    while i < steps {
+        let _ = a.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        let _ = c.poll(timeout_ms: 15)
+        i += 1
+    }
+}
+
+#[test]
+fn test_tcp_three_node_pex_mesh_and_gossip() uses (net: mut Net, clock: Clock) {
+    let lo = SocketAddr::parse("127.0.0.1:0").unwrap()
+    let cfg = GossipConfig::default()
+
+    var a = TcpTransport::bind(
+        TcpConfig { bind_addr: lo, self_tag: 1, seeds: MemVec::new(), gossip: cfg },
+    )
+        .unwrap()
+
+    var seeds_b = MemVec<SocketAddr>::new()
+    seeds_b.push(a.local_addr())
+    var b = TcpTransport::bind(
+        TcpConfig { bind_addr: lo, self_tag: 2, seeds: seeds_b, gossip: cfg },
+    )
+        .unwrap()
+
+    var seeds_c = MemVec<SocketAddr>::new()
+    seeds_c.push(a.local_addr())
+    var c = TcpTransport::bind(
+        TcpConfig { bind_addr: lo, self_tag: 3, seeds: seeds_c, gossip: cfg },
+    )
+        .unwrap()
+
+    var step: usize = 0
+    while step < 50 && (a.peer_count() < 2 || b.peer_count() < 2 || c.peer_count() < 2) {
+        pump_all(mut a, mut b, mut c, steps: 1)
+        step += 1
+    }
+    assert!(
+        a.peer_count() == 2 && b.peer_count() == 2 && c.peer_count() == 2,
+    )
+
+    assert!(a.publish("tcp-round-1".span()))
+    pump_all(mut a, mut b, mut c, steps: 6)
+
+    var got = MemBuffer::empty()
+    let db = b.recv(mut got).unwrap()
+    assert!(db.origin == 1 && got == "tcp-round-1")
+    assert!(b.recv(mut got).is_none())
+
+    let dc = c.recv(mut got).unwrap()
+    assert!(dc.origin == 1 && got == "tcp-round-1")
+    assert!(c.recv(mut got).is_none())
+}
+
+#[test]
+fn test_tcp_duplicate_dial_tiebreak() uses (net: mut Net, clock: Clock) {
+    let lo = SocketAddr::parse("127.0.0.1:0").unwrap()
+    let cfg = GossipConfig::default()
+
+    var a = TcpTransport::bind(
+        TcpConfig { bind_addr: lo, self_tag: 10, seeds: MemVec::new(), gossip: cfg },
+    )
+        .unwrap()
+
+    var seeds_b = MemVec<SocketAddr>::new()
+    seeds_b.push(a.local_addr())
+    var b = TcpTransport::bind(
+        TcpConfig { bind_addr: lo, self_tag: 20, seeds: seeds_b, gossip: cfg },
+    )
+        .unwrap()
+    // Simultaneous reverse seed: A also dials B before or during B's dial.
+    a.add_seed(b.local_addr())
+
+    var step: usize = 0
+    while step < 30 && (a.peer_count() < 1 || b.peer_count() < 1) {
+        let _ = a.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        step += 1
+    }
+    // Pump extra ticks to ensure duplicate connection closes cleanly.
+    var extra: usize = 0
+    while extra < 8 {
+        let _ = a.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        extra += 1
+    }
+    assert!(a.peer_count() == 1 && b.peer_count() == 1)
+
+    assert!(b.publish("tiebreak-ok".span()))
+    var p: usize = 0
+    while p < 10 {
+        let _ = a.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        p += 1
+    }
+    var got = MemBuffer::empty()
+    let da = a.recv(mut got).unwrap()
+    assert!(da.origin == 20 && got == "tiebreak-ok")
+}
+
+fn run_burst_then_drop(
+    listen_addr: SocketAddr,
+    _ b: mut TcpTransport,
+    cfg: GossipConfig,
+) -> SocketAddr
+uses (net: mut Net, clock: Clock)
+{
+    var a = TcpTransport::bind(
+        TcpConfig { bind_addr: listen_addr, self_tag: 1, seeds: MemVec::new(), gossip: cfg },
+    )
+        .unwrap()
+    let bound_addr = a.local_addr()
+    b.add_seed(bound_addr)
+
+    var step: usize = 0
+    while step < 30 && (a.peer_count() < 1 || b.peer_count() < 1) {
+        let _ = a.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        step += 1
+    }
+    assert!(
+        a.peer_count() == 1 && b.peer_count() == 1,
+        "initial peer handshake failed",
+    )
+
+    // Back-to-back burst to exercise coalesced stream frame extraction.
+    var msg_idx: u64 = 0
+    while msg_idx < 10 {
+        let line = format!("burst-", msg_idx)
+        assert!(a.publish(line.span()), "burst publish failed")
+        msg_idx += 1
+    }
+
+    var drain: usize = 0
+    while drain < 12 {
+        let _ = a.poll(timeout_ms: 10)
+        let _ = b.poll(timeout_ms: 10)
+        drain += 1
+    }
+
+    var got = MemBuffer::empty()
+    var exp: u64 = 0
+    while exp < 10 {
+        let d = b.recv(mut got).unwrap()
+        assert!(
+            d.origin == 1 && got == format!("burst-", exp),
+            "burst content mismatch",
+        )
+        exp += 1
+    }
+    assert!(b.recv(mut got).is_none(), "extra frame after burst")
+    bound_addr
+}
+
+#[test]
+fn test_tcp_framed_burst_and_reconnect() uses (net: mut Net, clock: Clock) {
+    let lo = SocketAddr::parse("127.0.0.1:0").unwrap()
+    var cfg = GossipConfig::default()
+    cfg.reconnect_base_ms = 50
+    cfg.reconnect_max_ms = 200
+
+    var b = TcpTransport::bind(
+        TcpConfig { bind_addr: lo, self_tag: 2, seeds: MemVec::new(), gossip: cfg },
+    )
+        .unwrap()
+
+    let listen_a_addr = run_burst_then_drop(listen_addr: lo, mut b, cfg)
+
+    // `a` was dropped: B detects disconnect on poll, then reconnects once `a2` binds the same port.
+    var eof_wait: usize = 0
+    while eof_wait < 20 && b.peer_count() > 0 {
+        let _ = b.poll(timeout_ms: 15)
+        eof_wait += 1
+    }
+    assert!(b.peer_count() == 0, "b did not detect disconnect")
+
+    var a2 = TcpTransport::bind(
+        TcpConfig { bind_addr: listen_a_addr, self_tag: 1, seeds: MemVec::new(), gossip: cfg },
+    )
+        .unwrap()
+
+    var recon: usize = 0
+    while recon < 40 && (a2.peer_count() < 1 || b.peer_count() < 1) {
+        let _ = a2.poll(timeout_ms: 20)
+        let _ = b.poll(timeout_ms: 20)
+        recon += 1
+    }
+    assert!(
+        a2.peer_count() == 1 && b.peer_count() == 1,
+        "reconnect failed",
+    )
+
+    assert!(
+        a2.publish("after-reconnect".span()),
+        "publish after reconnect failed",
+    )
+    var p: usize = 0
+    while p < 10 {
+        let _ = a2.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        p += 1
+    }
+    var after_buf = MemBuffer::empty()
+    let d_after = b.recv(mut after_buf).unwrap()
+    assert!(
+        d_after.origin == 1 && after_buf == "after-reconnect",
+        "after-reconnect payload mismatch",
+    )
+}

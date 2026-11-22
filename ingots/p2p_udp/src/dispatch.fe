@@ -1,0 +1,295 @@
+//! Inbound UDP frame dispatch and gossip forwarding.
+
+use std::net::{Poller, SocketAddr, Token}
+use p2p::{
+    GossipCore,
+    KIND_DATA,
+    PeerEntry,
+    Stats,
+    decode_header,
+    frame_len,
+    normalize_addr,
+    pick_fanout,
+}
+use super::swim::SwimState
+use super::wire::{
+    KIND_ACK,
+    KIND_INDIRECT_ACK,
+    KIND_JOIN,
+    KIND_JOIN_ACK,
+    KIND_PING,
+    KIND_PING_REQ,
+    UdpSlot,
+    decode_indirect_ack,
+    decode_join,
+    decode_join_ack,
+    decode_ping_or_ack,
+    decode_ping_req,
+    encode_indirect_ack,
+    encode_join,
+    encode_join_ack,
+    encode_ping_or_ack,
+}
+
+pub struct UdpState { pub base: GossipCore, pub swim: SwimState }
+
+pub fn send_datagram(
+    _ poller: mut Poller<UdpSlot>,
+    _ udp_token: Token,
+    _ stats: mut Stats,
+    _ bytes: MemSpan,
+    _ to: SocketAddr,
+) -> bool {
+    match poller.get(udp_token) {
+        Option::Some(mut slot) => {
+            if slot.sock.send_to(bytes, to).is_ok() {
+                stats.frames_tx += 1
+                true
+            } else {
+                false
+            }
+        },
+        Option::None => false,
+    }
+}
+
+fn learn_peers(
+    entries: MemVec<PeerEntry>,
+    observed_from: SocketAddr,
+    now_ms: u64,
+    state: mut UdpState,
+    _ poller: mut Poller<UdpSlot>,
+    _ udp_token: Token,
+) {
+    var join_buf = MemBuffer::empty()
+    var i: usize = 0
+    while i < entries.len() {
+        let entry = entries[i]
+        let addr = normalize_addr(advertised: entry.addr, observed: observed_from)
+        if state.base.book.learn(tag: entry.tag, addr, now_ms) {
+            let seq = state.base.next_seq()
+            encode_join(
+                origin: state.base.self_tag,
+                seq,
+                listen_port: state.base.listen_port,
+                mut join_buf,
+            )
+            let _ = send_datagram(
+                mut poller,
+                udp_token,
+                mut state.base.stats,
+                join_buf.span(),
+                addr,
+            )
+        }
+        i += 1
+    }
+}
+
+fn forward_data(
+    origin: u64,
+    fwd: MemSpan,
+    from: SocketAddr,
+    state: mut UdpState,
+    _ poller: mut Poller<UdpSlot>,
+    _ udp_token: Token,
+) {
+    var targets = MemVec<usize>::new()
+    pick_fanout(
+        book: state.base.book,
+        exclude_tag: origin,
+        fanout: state.base.gossip.fanout,
+        rng: mut state.base.rng,
+        mut targets,
+    )
+    var i: usize = 0
+    while i < targets.len() {
+        let addr = state.base.book.get(targets[i]).addr
+        if addr != from {
+            let _ = send_datagram(mut poller, udp_token, mut state.base.stats, fwd, addr)
+        }
+        i += 1
+    }
+}
+
+pub fn handle_packet(
+    bytes: MemSpan,
+    from: SocketAddr,
+    now_ms: u64,
+    state: mut UdpState,
+    _ poller: mut Poller<UdpSlot>,
+    _ udp_token: Token,
+) {
+    let Option::Some(hdr) = decode_header(bytes) else {
+        return
+    }
+    if bytes.len() < frame_len(hdr) || hdr.origin == state.base.self_tag {
+        return
+    }
+    state.base.stats.frames_rx += 1
+
+    if hdr.kind == KIND_DATA {
+        var fwd = MemBuffer::empty()
+        if state.base.accept_data(hdr, raw: bytes, from, mut fwd) {
+            forward_data(
+                origin: hdr.origin,
+                fwd: fwd.span(),
+                from,
+                mut state,
+                mut poller,
+                udp_token,
+            )
+        }
+        return
+    }
+
+    let payload = bytes.slice(offset: hdr.payload_offset(), len: hdr.payload_len())
+    var tx = MemBuffer::empty()
+    if hdr.kind == KIND_JOIN {
+        let Option::Some(port) = decode_join(payload) else {
+            return
+        }
+        let peer_addr = SocketAddr::new(from.ip(), port)
+        let _ = state.base.book.observe(tag: hdr.origin, addr: peer_addr, now_ms)
+        let seq = state.base.next_seq()
+        encode_join_ack(
+            origin: state.base.self_tag,
+            seq,
+            listen_port: state.base.listen_port,
+            peers: state.base.book.alive_entries(exclude_tag: hdr.origin),
+            mut tx,
+        )
+        let _ = send_datagram(
+            mut poller,
+            udp_token,
+            mut state.base.stats,
+            tx.span(),
+            peer_addr,
+        )
+    } else if hdr.kind == KIND_JOIN_ACK {
+        var entries = MemVec<PeerEntry>::new()
+        let Option::Some(port) = decode_join_ack(payload, mut entries) else {
+            return
+        }
+        let _ = state
+            .base
+            .book
+            .observe(
+                tag: hdr.origin,
+                addr: SocketAddr::new(from.ip(), port),
+                now_ms,
+            )
+        learn_peers(
+            entries,
+            observed_from: from,
+            now_ms,
+            mut state,
+            mut poller,
+            udp_token,
+        )
+    } else if hdr.kind == KIND_PING {
+        var entries = MemVec<PeerEntry>::new()
+        let Option::Some((probe_id, port)) = decode_ping_or_ack(payload, mut entries) else {
+            return
+        }
+        let peer_addr = SocketAddr::new(from.ip(), port)
+        let _ = state.base.book.observe(tag: hdr.origin, addr: peer_addr, now_ms)
+        learn_peers(
+            entries,
+            observed_from: from,
+            now_ms,
+            mut state,
+            mut poller,
+            udp_token,
+        )
+        let seq = state.base.next_seq()
+        encode_ping_or_ack(
+            kind: KIND_ACK,
+            origin: state.base.self_tag,
+            seq,
+            probe_id,
+            listen_port: state.base.listen_port,
+            peers: state.base.book.alive_entries(exclude_tag: hdr.origin),
+            mut tx,
+        )
+        let _ = send_datagram(
+            mut poller,
+            udp_token,
+            mut state.base.stats,
+            tx.span(),
+            peer_addr,
+        )
+    } else if hdr.kind == KIND_ACK {
+        var entries = MemVec<PeerEntry>::new()
+        let Option::Some((probe_id, port)) = decode_ping_or_ack(payload, mut entries) else {
+            return
+        }
+        let _ = state
+            .base
+            .book
+            .observe(
+                tag: hdr.origin,
+                addr: SocketAddr::new(from.ip(), port),
+                now_ms,
+            )
+        learn_peers(
+            entries,
+            observed_from: from,
+            now_ms,
+            mut state,
+            mut poller,
+            udp_token,
+        )
+        if let Option::Some(requester) = state.swim.on_ack(probe_id, from_tag: hdr.origin) {
+            let seq = state.base.next_seq()
+            encode_indirect_ack(
+                origin: state.base.self_tag,
+                seq,
+                probe_id,
+                target_tag: hdr.origin,
+                mut tx,
+            )
+            let _ = send_datagram(
+                mut poller,
+                udp_token,
+                mut state.base.stats,
+                tx.span(),
+                requester,
+            )
+        }
+    } else if hdr.kind == KIND_PING_REQ {
+        let Option::Some((probe_id, target_tag, target_addr)) = decode_ping_req(payload) else {
+            return
+        }
+        let _ = state.base.book.observe(tag: hdr.origin, addr: from, now_ms)
+        state.swim.add_relay(probe_id, requester: from, target_tag, now_ms)
+        let seq = state.base.next_seq()
+        encode_ping_or_ack(
+            kind: KIND_PING,
+            origin: state.base.self_tag,
+            seq,
+            probe_id,
+            listen_port: state.base.listen_port,
+            peers: state.base.book.alive_entries(exclude_tag: target_tag),
+            mut tx,
+        )
+        let target = normalize_addr(advertised: target_addr, observed: from)
+        let _ = send_datagram(
+            mut poller,
+            udp_token,
+            mut state.base.stats,
+            tx.span(),
+            target,
+        )
+    } else if hdr.kind == KIND_INDIRECT_ACK {
+        let Option::Some((probe_id, target_tag)) = decode_indirect_ack(payload) else {
+            return
+        }
+        if state.swim.on_indirect_ack(probe_id, target_tag) {
+            if let Option::Some(idx) = state.base.book.find_tag(target_tag) {
+                let target_addr = state.base.book.get(idx).addr
+                let _ = state.base.book.observe(tag: target_tag, addr: target_addr, now_ms)
+            }
+        }
+    }
+}

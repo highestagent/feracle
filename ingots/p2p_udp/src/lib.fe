@@ -1,0 +1,5 @@
+//! Pure-Fe UDP gossip + SWIM membership transport.
+//!
+//! Uses only `p2p` shared facilities and `std::net::UdpSocket` + `Poller`.
+
+pub use transport::{UdpConfig, UdpTransport}

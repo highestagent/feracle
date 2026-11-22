@@ -1,0 +1,51 @@
+//! TCP control wire codecs and `WouldBlock` detection.
+
+use p2p::{
+    Header,
+    PeerEntry,
+    decode_entries,
+    decode_u16_payload,
+    encode_entries,
+    encode_frame,
+    encode_u16_frame,
+}
+
+pub const KIND_HELLO: u8 = 0x20
+pub const KIND_PEX: u8 = 0x21
+pub const KIND_PING: u8 = 0x22
+pub const KIND_PONG: u8 = 0x23
+
+pub fn encode_hello(origin: u64, seq: u64, listen_port: u16, _ out: mut MemBuffer) {
+    encode_u16_frame(kind: KIND_HELLO, origin, seq, listen_port, mut out)
+}
+
+pub fn decode_hello(_ payload: MemSpan) -> Option<u16> {
+    decode_u16_payload(payload)
+}
+
+pub fn encode_pex(origin: u64, seq: u64, peers: MemVec<PeerEntry>, _ out: mut MemBuffer) {
+    out.clear()
+    var payload = MemBuffer::empty()
+    let _ = encode_entries(peers, mut payload)
+    let hdr = Header::new(kind: KIND_PEX, origin, seq, ttl: 1)
+    let _ = encode_frame(hdr, payload.span(), mut out)
+}
+
+pub fn decode_pex(_ payload: MemSpan, _ peers_out: mut MemVec<PeerEntry>) -> bool {
+    decode_entries(payload, offset: 0, mut peers_out).is_some()
+}
+
+pub fn encode_ping_or_pong(kind: u8, origin: u64, seq: u64, nonce: u64, _ out: mut MemBuffer) {
+    out.clear()
+    var payload = MemBuffer::new(8)
+    payload.write_be<u64>(offset: 0, value: nonce)
+    let hdr = Header::new(kind, origin, seq, ttl: 1)
+    let _ = encode_frame(hdr, payload.span(), mut out)
+}
+
+pub fn decode_ping_or_pong(_ payload: MemSpan) -> Option<u64> {
+    if payload.len() < 8 {
+        return Option::None
+    }
+    Option::Some(payload.read_be<u64>(0))
+}

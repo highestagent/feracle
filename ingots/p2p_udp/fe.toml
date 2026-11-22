@@ -1,0 +1,6 @@
+[ingot]
+name = "p2p_udp"
+version = "0.1.0"
+
+[dependencies]
+p2p = { path = "../p2p" }

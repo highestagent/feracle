@@ -1,0 +1,126 @@
+//! `Libp2pConfig` and `p2p::Transport` implementation backed by `p2p-shim`.
+
+use core::num::IntDowncast
+use core::ops::Drop
+use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr}
+use std::time::Clock
+use p2p::{Delivery, PeerEntry, Stats, Transport}
+use super::ffi
+
+pub struct Libp2pConfig {
+    pub listen_port: u16,
+    pub self_tag: u64,
+    pub bootstrap: MemBuffer,
+    pub telemetry_port: u16,
+    pub telemetry_node_id: u64,
+}
+
+pub struct Libp2pTransport {
+    local_addr: SocketAddr,
+    self_tag: u64,
+    active: bool,
+    stats: Stats,
+    rx_seq: u64,
+}
+
+impl Libp2pTransport {
+    pub fn bind(_ config: own Libp2pConfig) -> Result<i32, Self> {
+        let rc = ffi::start_with_telemetry(
+            listen_port: config.listen_port,
+            bootstrap: config.bootstrap.span(),
+            telemetry_port: config.telemetry_port,
+            node_id: config.telemetry_node_id,
+        )
+        if rc != 0 {
+            return Result::Err(rc)
+        }
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.listen_port)
+        Result::Ok(
+            Libp2pTransport {
+                local_addr,
+                self_tag: config.self_tag,
+                active: true,
+                stats: Stats::zero(),
+                rx_seq: 0,
+            },
+        )
+    }
+
+    pub fn stop(mut self) {
+        if self.active {
+            self.active = false
+            let _ = ffi::stop()
+        }
+    }
+}
+
+impl Drop for Libp2pTransport {
+    fn drop(own self) {
+        if self.active {
+            let _ = ffi::stop()
+        }
+    }
+}
+
+impl Transport for Libp2pTransport {
+    fn local_addr(self) -> SocketAddr {
+        self.local_addr
+    }
+
+    fn self_tag(self) -> u64 {
+        self.self_tag
+    }
+
+    fn publish(mut self, _ payload: MemSpan) -> bool
+    uses (net: mut Net, clock: Clock)
+    {
+        if ffi::publish(payload) == 0 {
+            self.stats.frames_tx += 1
+            self.stats.data_tx += 1
+            true
+        } else {
+            false
+        }
+    }
+
+    fn poll(mut self, timeout_ms: u64) -> usize uses (net: mut Net, clock: Clock) {
+        if timeout_ms > 0 {
+            ffi::sleep_ms(timeout_ms.downcast_saturate())
+        }
+        0
+    }
+
+    fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
+        if ffi::poll_into(mut out) > 0 {
+            self.rx_seq += 1
+            self.stats.frames_rx += 1
+            self.stats.data_rx += 1
+            Option::Some(
+                Delivery { origin: 0, seq: self.rx_seq, from: self.local_addr },
+            )
+        } else {
+            Option::None
+        }
+    }
+
+    fn peer_count(self) -> usize {
+        let count = ffi::peer_count()
+        if count > 0 {
+            count.downcast_unchecked()
+        } else {
+            0
+        }
+    }
+
+    fn peer_entries(self) -> MemVec<PeerEntry> {
+        MemVec::new()
+    }
+
+    fn stats(self) -> Stats {
+        self.stats
+    }
+
+    fn add_seed(mut self, _ addr: SocketAddr) {
+        let _ = addr
+    }
+}

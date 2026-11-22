@@ -1,0 +1,6 @@
+//! `libp2p` GossipSub transport binding implementing `p2p::Transport`.
+//!
+//! Wraps the static Rust `p2p-shim` C ABI without pulling any application logic
+//! into the transport layer.
+
+pub use transport::{Libp2pConfig, Libp2pTransport}

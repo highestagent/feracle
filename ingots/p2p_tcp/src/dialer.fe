@@ -1,0 +1,101 @@
+//! Outbound seed/PEX dial state and exponential backoff scheduler.
+
+use std::net::{SocketAddr, Token}
+use p2p::{Backoff, PeerBook}
+
+pub struct DialEntry { pub addr: SocketAddr, pub backoff: Backoff, pub active: Option<Token> }
+
+impl Copy for DialEntry {}
+
+pub struct DialBook { entries: MemVec<DialEntry>, base_ms: u64, max_ms: u64 }
+
+impl DialBook {
+    pub fn new(base_ms: u64, max_ms: u64) -> Self {
+        DialBook { entries: MemVec::new(), base_ms, max_ms }
+    }
+
+    pub fn add_addr(mut self, _ addr: SocketAddr) {
+        if self.find_addr(addr).is_some() {
+            return
+        }
+        self.entries
+            .push(
+                DialEntry {
+                    addr,
+                    backoff: Backoff::new(base_ms: self.base_ms, max_ms: self.max_ms),
+                    active: Option::None,
+                },
+            )
+    }
+
+    pub fn find_addr(self, _ addr: SocketAddr) -> Option<usize> {
+        var i: usize = 0
+        while i < self.entries.len() {
+            if self.entries[i].addr == addr {
+                return Option::Some(i)
+            }
+            i += 1
+        }
+        Option::None
+    }
+
+    pub fn mark_active(mut self, _ addr: SocketAddr, _ token: Token) {
+        if let Option::Some(idx) = self.find_addr(addr) {
+            let e = mut self.entries[idx]
+            e.active = Option::Some(token)
+        }
+    }
+
+    pub fn mark_established(mut self, _ addr: SocketAddr) {
+        if let Option::Some(idx) = self.find_addr(addr) {
+            let e = mut self.entries[idx]
+            e.backoff.reset()
+        }
+    }
+
+    pub fn mark_fail(mut self, _ addr: SocketAddr, now_ms: u64) {
+        if let Option::Some(idx) = self.find_addr(addr) {
+            let e = mut self.entries[idx]
+            e.active = Option::None
+            e.backoff.fail(now_ms)
+        }
+    }
+
+    pub fn mark_closed(mut self, _ token: Token, now_ms: u64, was_established: bool) {
+        var i: usize = 0
+        while i < self.entries.len() {
+            let e = mut self.entries[i]
+            if let Option::Some(t) = e.active {
+                if t == token {
+                    e.active = Option::None
+                    if was_established {
+                        e.backoff.reset()
+                        e.backoff.defer(now_ms)
+                    } else {
+                        e.backoff.fail(now_ms)
+                    }
+                    return
+                }
+            }
+            i += 1
+        }
+    }
+
+    pub fn next_due(self, now_ms: u64, book: PeerBook) -> Option<SocketAddr> {
+        var i: usize = 0
+        while i < self.entries.len() {
+            let e = self.entries[i]
+            if e.active.is_none() && e.backoff.ready(now_ms) {
+                let connected = match book.find_addr(e.addr) {
+                    Option::Some(p_idx) => book.get(p_idx).is_alive(),
+                    Option::None => false,
+                }
+                if !connected {
+                    return Option::Some(e.addr)
+                }
+            }
+            i += 1
+        }
+        Option::None
+    }
+}

@@ -1,0 +1,81 @@
+//! C-ABI FFI bindings to the Rust `libp2p` GossipSub shim (`p2p-shim`).
+
+use core::num::IntDowncast
+
+extern {
+    fn p2p_start(_ listen_port: u32, _ bootstrap_ptr: *u8, _ bootstrap_len: usize) -> i32
+    fn p2p_start_with_telemetry(
+        _ listen_port: u32,
+        _ bootstrap_ptr: *u8,
+        _ bootstrap_len: usize,
+        _ telemetry_port: u32,
+        _ node_id: u64,
+    ) -> i32
+    fn p2p_publish(_ data_ptr: *u8, _ data_len: usize) -> i32
+    fn p2p_poll(_ out_ptr: *u8, _ out_cap: usize) -> i32
+    fn p2p_peer_count() -> i32
+    fn p2p_stop() -> i32
+    fn p2p_sleep_ms(_ ms: u32)
+}
+
+pub(ingot) fn start(listen_port: u16, bootstrap: MemSpan) -> i32 {
+    unsafe {
+        p2p_start(listen_port as u32, bootstrap.ptr(), bootstrap.len())
+    }
+}
+
+pub(ingot) fn start_with_telemetry(
+    listen_port: u16,
+    bootstrap: MemSpan,
+    telemetry_port: u16,
+    node_id: u64,
+) -> i32 {
+    unsafe {
+        p2p_start_with_telemetry(
+            listen_port as u32,
+            bootstrap.ptr(),
+            bootstrap.len(),
+            telemetry_port as u32,
+            node_id,
+        )
+    }
+}
+
+pub(ingot) fn publish(_ data: MemSpan) -> i32 {
+    unsafe {
+        p2p_publish(data.ptr(), data.len())
+    }
+}
+
+pub(ingot) fn poll_into(_ out: mut MemBuffer) -> i32 {
+    out.clear()
+    out.reserve(1280)
+    let rc = unsafe {
+        p2p_poll(out.ptr(), out.capacity())
+    }
+    if rc > 0 {
+        let len: usize = rc.downcast_unchecked()
+        unsafe {
+            out.set_len(len)
+        }
+    }
+    rc
+}
+
+pub(ingot) fn peer_count() -> i32 {
+    unsafe {
+        p2p_peer_count()
+    }
+}
+
+pub(ingot) fn stop() -> i32 {
+    unsafe {
+        p2p_stop()
+    }
+}
+
+pub(ingot) fn sleep_ms(_ ms: u32) {
+    unsafe {
+        p2p_sleep_ms(ms)
+    }
+}

@@ -1,0 +1,214 @@
+//! `TcpSlot` poller wrapper and non-blocking buffered stream framing.
+
+use std::io::{Read, Write}
+use std::net::{Pollable, SocketAddr, TcpListener, TcpStream}
+use p2p::{decode_header, frame_len, is_would_block}
+
+const MAX_INBUF: usize = 16384
+const MAX_OUTBUF: usize = 32768
+const READ_CHUNK: usize = 4096
+
+pub enum ConnState {
+    Connecting,
+    Handshaking,
+    Established,
+}
+
+impl Copy for ConnState {}
+
+impl ConnState {
+    pub fn is_connecting(self) -> bool {
+        match self {
+            ConnState::Connecting => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_established(self) -> bool {
+        match self {
+            ConnState::Established => true,
+            _ => false,
+        }
+    }
+}
+
+pub enum IoOutcome {
+    Ok,
+    Closed,
+    Err,
+}
+
+impl Copy for IoOutcome {}
+
+impl IoOutcome {
+    pub fn is_ok(self) -> bool {
+        match self {
+            IoOutcome::Ok => true,
+            _ => false,
+        }
+    }
+}
+
+pub enum FrameStep {
+    Frame,
+    NeedMore,
+    Invalid,
+}
+
+impl Copy for FrameStep {}
+
+pub struct PeerConn {
+    pub stream: TcpStream,
+    pub state: ConnState,
+    pub outbound: bool,
+    pub remote_addr: SocketAddr,
+    pub listen_addr: SocketAddr,
+    pub remote_tag: Option<u64>,
+    inbuf: MemBuffer,
+    outbuf: MemBuffer,
+    out_offset: usize,
+    pub last_activity_ms: u64,
+    pub want_writable: bool,
+}
+
+pub enum TcpSlot {
+    Listener(TcpListener),
+    Peer(PeerConn),
+}
+
+impl Pollable for TcpSlot {
+    fn raw_fd(self) -> i32 {
+        match self {
+            TcpSlot::Listener(ref l) => l.as_raw_fd(),
+            TcpSlot::Peer(ref p) => p.stream.as_raw_fd(),
+        }
+    }
+}
+
+impl PeerConn {
+    pub fn new(
+        stream: own TcpStream,
+        state: ConnState,
+        outbound: bool,
+        remote_addr: SocketAddr,
+        now_ms: u64,
+        want_writable: bool,
+    ) -> Self {
+        PeerConn {
+            stream,
+            state,
+            outbound,
+            remote_addr,
+            listen_addr: remote_addr,
+            remote_tag: Option::None,
+            inbuf: MemBuffer::with_capacity(4096),
+            outbuf: MemBuffer::with_capacity(4096),
+            out_offset: 0,
+            last_activity_ms: now_ms,
+            want_writable,
+        }
+    }
+
+    pub fn has_pending_write(self) -> bool {
+        self.out_offset < self.outbuf.len()
+    }
+
+    pub fn compact_outbox(mut self) {
+        if self.out_offset == 0 {
+            return
+        }
+        let rem = self.outbuf.len() - self.out_offset
+        if rem > 0 {
+            self.outbuf.span().copy_within(source: self.out_offset, dest: 0, len: rem)
+        }
+        self.outbuf.truncate(rem)
+        self.out_offset = 0
+    }
+
+    pub fn queue_bytes(mut self, _ bytes: MemSpan) -> bool {
+        let pending = self.outbuf.len() - self.out_offset
+        if pending + bytes.len() > MAX_OUTBUF {
+            return false
+        }
+        if self.outbuf.len() + bytes.len() > MAX_OUTBUF {
+            self.compact_outbox()
+        }
+        self.outbuf.extend_from(bytes)
+        true
+    }
+
+    pub fn flush(mut self) -> IoOutcome {
+        while self.out_offset < self.outbuf.len() {
+            let rem = self.outbuf.len() - self.out_offset
+            let send_len = if rem > READ_CHUNK { READ_CHUNK } else { rem }
+            let chunk = MemBuffer::from_span(
+                self.outbuf.slice(offset: self.out_offset, len: send_len),
+            )
+            match self.stream.write(chunk.span()) {
+                Result::Ok(n) => {
+                    if n == 0 {
+                        return IoOutcome::Closed
+                    }
+                    self.out_offset += n
+                },
+                Result::Err(err) => {
+                    if is_would_block(err) {
+                        return IoOutcome::Ok
+                    }
+                    return IoOutcome::Err
+                },
+            }
+        }
+        self.outbuf.clear()
+        self.out_offset = 0
+        IoOutcome::Ok
+    }
+
+    pub fn read_into(mut self, now_ms: u64) -> IoOutcome {
+        var tmp = MemBuffer::new(READ_CHUNK)
+        while self.inbuf.len() < MAX_INBUF {
+            let room = MAX_INBUF - self.inbuf.len()
+            let max_read = if room < READ_CHUNK { room } else { READ_CHUNK }
+            match self.stream.read(tmp.span().head(max_read)) {
+                Result::Ok(n) => {
+                    if n == 0 {
+                        return IoOutcome::Closed
+                    }
+                    self.inbuf.extend_from(tmp.span().head(n))
+                    self.last_activity_ms = now_ms
+                },
+                Result::Err(err) => {
+                    if is_would_block(err) {
+                        return IoOutcome::Ok
+                    }
+                    return IoOutcome::Err
+                },
+            }
+        }
+        IoOutcome::Ok
+    }
+
+    pub fn next_frame(mut self, _ out: mut MemBuffer) -> FrameStep {
+        let hdr = match decode_header(self.inbuf.span()) {
+            Option::Some(h) => h,
+            Option::None => {
+                if self.inbuf.len() < p2p::HEADER_LEN {
+                    return FrameStep::NeedMore
+                }
+                return FrameStep::Invalid
+            },
+        }
+        let total = frame_len(hdr)
+        if self.inbuf.len() < total {
+            return FrameStep::NeedMore
+        }
+        out.clear()
+        out.extend_from(self.inbuf.slice(offset: 0, len: total))
+        let rem = self.inbuf.len() - total
+        if rem > 0 {
+            self.inbuf.span().copy_within(source: total, dest: 0, len: rem)
+        }
+        self.inbuf.truncate(rem)
+        FrameStep::Frame
+    }
+}

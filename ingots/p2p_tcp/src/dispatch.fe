@@ -1,0 +1,212 @@
+//! Inbound TCP frame dispatch, tie-breaking, and gossip forwarding.
+
+use std::net::{Poller, SocketAddr, Token}
+use p2p::{GossipCore, KIND_DATA, PeerEntry, decode_header, frame_len, normalize_addr}
+use super::conn::{ConnState, TcpSlot}
+use super::mesh::{TcpMeshState, close_peer, find_duplicate_established, peer_meta, queue_to_peer}
+use super::wire::{
+    KIND_HELLO,
+    KIND_PEX,
+    KIND_PING,
+    KIND_PONG,
+    decode_hello,
+    decode_pex,
+    decode_ping_or_pong,
+    encode_pex,
+    encode_ping_or_pong,
+}
+
+fn forward_tcp_data(
+    sender_tok: Token,
+    origin: u64,
+    fwd: MemSpan,
+    now_ms: u64,
+    _ poller: mut Poller<TcpSlot>,
+    _ peer_tokens: mut MemVec<Token>,
+    _ state: mut TcpMeshState,
+) {
+    if peer_tokens.is_empty() {
+        return
+    }
+    var targets = MemVec<Token>::new()
+    var i: usize = 0
+    while i < peer_tokens.len() {
+        let tok = peer_tokens[i]
+        if tok != sender_tok {
+            if let Option::Some((_, _, _, tag_opt, est)) = peer_meta(poller, tok) {
+                if est && tag_opt != Option::Some(origin) {
+                    targets.push(tok)
+                }
+            }
+        }
+        i += 1
+    }
+    let limit = if state.base.gossip.fanout < targets.len() {
+        state.base.gossip.fanout
+    } else {
+        targets.len()
+    }
+    var chosen: usize = 0
+    while chosen < limit {
+        let pick = chosen + state.base.rng.below(targets.len() - chosen)
+        if pick != chosen {
+            targets.swap(chosen, pick)
+        }
+        let _ = queue_to_peer(
+            mut poller,
+            mut peer_tokens,
+            targets[chosen],
+            fwd,
+            now_ms,
+            mut state,
+        )
+        chosen += 1
+    }
+}
+
+pub fn handle_frame(
+    token: Token,
+    raw: MemSpan,
+    now_ms: u64,
+    _ poller: mut Poller<TcpSlot>,
+    _ peer_tokens: mut MemVec<Token>,
+    _ state: mut TcpMeshState,
+) {
+    let Option::Some(hdr) = decode_header(raw) else {
+        close_peer(mut poller, mut peer_tokens, token, now_ms, mut state)
+        return
+    }
+    if raw.len() < frame_len(hdr) {
+        return
+    }
+    let Option::Some((remote_addr, listen_addr_cur, new_out, remote_tag_opt, is_est)) = peer_meta(
+        poller,
+        token,
+    ) else {
+        return
+    }
+    state.base.stats.frames_rx += 1
+    let payload = raw.slice(offset: hdr.payload_offset(), len: hdr.payload_len())
+
+    if hdr.kind == KIND_HELLO {
+        let Option::Some(port) = decode_hello(payload) else {
+            close_peer(mut poller, mut peer_tokens, token, now_ms, mut state)
+            return
+        }
+        if hdr.origin == state.base.self_tag {
+            close_peer(mut poller, mut peer_tokens, token, now_ms, mut state)
+            return
+        }
+        let listen_addr = SocketAddr::new(remote_addr.ip(), port)
+        var close_existing: Option<Token> = Option::None
+        if let Option::Some((existing_tok, existing_out)) = find_duplicate_established(
+            poller,
+            peer_tokens,
+            tag: hdr.origin,
+            skip: token,
+        ) {
+            let new_wins = if new_out != existing_out {
+                new_out == (state.base.self_tag < hdr.origin)
+            } else {
+                true
+            }
+            if !new_wins {
+                close_peer(mut poller, mut peer_tokens, token, now_ms, mut state)
+                return
+            }
+            close_existing = Option::Some(existing_tok)
+        }
+        if let Option::Some(mut slot) = poller.get(token) {
+            if let TcpSlot::Peer(mut conn) = slot {
+                conn.state = ConnState::Established
+                conn.remote_tag = Option::Some(hdr.origin)
+                conn.listen_addr = listen_addr
+                conn.last_activity_ms = now_ms
+            }
+        }
+        let _ = state.base.book.observe(tag: hdr.origin, addr: listen_addr, now_ms)
+        state.dialer.mark_established(listen_addr)
+        if let Option::Some(old_tok) = close_existing {
+            close_peer(mut poller, mut peer_tokens, old_tok, now_ms, mut state)
+        }
+        var pex_buf = MemBuffer::empty()
+        let seq = state.base.next_seq()
+        encode_pex(
+            origin: state.base.self_tag,
+            seq,
+            peers: state.base.book.alive_entries(exclude_tag: hdr.origin),
+            mut pex_buf,
+        )
+        let _ = queue_to_peer(
+            mut poller,
+            mut peer_tokens,
+            token,
+            pex_buf.span(),
+            now_ms,
+            mut state,
+        )
+        return
+    }
+
+    if !is_est {
+        close_peer(mut poller, mut peer_tokens, token, now_ms, mut state)
+        return
+    }
+    if hdr.kind == KIND_DATA {
+        var fwd = MemBuffer::empty()
+        if state.base.accept_data(hdr, raw, from: listen_addr_cur, mut fwd) {
+            forward_tcp_data(
+                sender_tok: token,
+                origin: hdr.origin,
+                fwd: fwd.span(),
+                now_ms,
+                mut poller,
+                mut peer_tokens,
+                mut state,
+            )
+        }
+    } else if hdr.kind == KIND_PEX {
+        var entries = MemVec<PeerEntry>::new()
+        if !decode_pex(payload, mut entries) {
+            return
+        }
+        var i: usize = 0
+        while i < entries.len() {
+            let entry = entries[i]
+            if entry.tag != state.base.self_tag && state.base.book.find_tag(entry.tag).is_none() {
+                state.dialer.add_addr(
+                        normalize_addr(advertised: entry.addr, observed: remote_addr),
+                    )
+            }
+            i += 1
+        }
+    } else if hdr.kind == KIND_PING {
+        if let Option::Some(nonce) = decode_ping_or_pong(payload) {
+            if let Option::Some(tag) = remote_tag_opt {
+                let _ = state.base.book.observe(tag, addr: listen_addr_cur, now_ms)
+            }
+            var pong = MemBuffer::empty()
+            let seq = state.base.next_seq()
+            encode_ping_or_pong(
+                kind: KIND_PONG,
+                origin: state.base.self_tag,
+                seq,
+                nonce,
+                mut pong,
+            )
+            let _ = queue_to_peer(
+                mut poller,
+                mut peer_tokens,
+                token,
+                pong.span(),
+                now_ms,
+                mut state,
+            )
+        }
+    } else if hdr.kind == KIND_PONG {
+        let _ = decode_ping_or_pong(payload)
+        if let Option::Some(tag) = remote_tag_opt {
+            let _ = state.base.book.observe(tag, addr: listen_addr_cur, now_ms)
+        }
+    }
+}

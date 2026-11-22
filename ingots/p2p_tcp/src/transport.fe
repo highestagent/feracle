@@ -1,0 +1,304 @@
+//! Pure-Fe non-blocking TCP mesh + PEX implementation of `p2p::Transport`.
+
+use std::io::Error
+use std::net::{Event, Events, Interest, Net, Poller, SocketAddr, Token}
+use std::time::Clock
+use p2p::{GossipConfig, GossipCore, MonoClock, Ticker, is_would_block}
+use super::conn::{ConnState, FrameStep, PeerConn, TcpSlot}
+use super::dialer::DialBook
+use super::dispatch::handle_frame
+use super::mesh::{TcpMeshState, close_peer, queue_to_peer, sync_interest}
+use super::wire::encode_hello
+
+pub struct TcpConfig {
+    pub bind_addr: SocketAddr,
+    pub self_tag: u64,
+    pub seeds: MemVec<SocketAddr>,
+    pub gossip: GossipConfig,
+}
+
+pub struct TcpTransport {
+    pub(ingot) poller: Poller<TcpSlot>,
+    pub(ingot) events: Events,
+    pub(ingot) listener_token: Token,
+    pub(ingot) peer_tokens: MemVec<Token>,
+    pub(ingot) local_addr: SocketAddr,
+    pub(ingot) clock: MonoClock,
+    pub(ingot) pex_ticker: Ticker,
+    pub(ingot) ping_ticker: Ticker,
+    pub(ingot) nonce: u64,
+    pub(ingot) state: TcpMeshState,
+}
+
+impl TcpTransport {
+    pub fn bind(_ config: own TcpConfig) -> Result<Error, Self>
+    uses (net: mut Net, clock: Clock)
+    {
+        var listener = net.listen(config.bind_addr)?
+        listener.set_nonblocking(true)?
+        let local_addr = listener.local_addr()?
+        var poller = Poller<TcpSlot>::new()?
+        let listener_token = poller.add(TcpSlot::Listener(listener), Interest::READABLE)?
+        let mono = MonoClock::start()
+        let now_ms = mono.now_ms()
+
+        var dialer = DialBook::new(
+            base_ms: config.gossip.reconnect_base_ms,
+            max_ms: config.gossip.reconnect_max_ms,
+        )
+        var i: usize = 0
+        while i < config.seeds.len() {
+            if config.seeds[i] != local_addr {
+                dialer.add_addr(config.seeds[i])
+            }
+            i += 1
+        }
+
+        let state = TcpMeshState {
+            base: GossipCore::new(
+                self_tag: config.self_tag,
+                listen_port: local_addr.port(),
+                rng_salt: 0x9e3779b97f4a7c15,
+                gossip: config.gossip,
+            ),
+            dialer,
+        }
+
+        var transport = TcpTransport {
+            poller,
+            events: Events::with_capacity(64),
+            listener_token,
+            peer_tokens: MemVec::new(),
+            local_addr,
+            clock: mono,
+            pex_ticker: Ticker::new(period_ms: config.gossip.heartbeat_ms, now_ms),
+            ping_ticker: Ticker::new(period_ms: config.gossip.heartbeat_ms, now_ms),
+            nonce: 0,
+            state,
+        }
+        transport.dial_due(now_ms)
+        Result::Ok(transport)
+    }
+
+    pub(ingot) fn dial_due(mut self, _ now_ms: u64) uses (net: mut Net) {
+        var attempts: usize = 0
+        while attempts < 8 {
+            let Option::Some(addr) = self
+                .state
+                .dialer
+                .next_due(now_ms, book: self.state.base.book) else {
+                break
+            }
+            attempts += 1
+            if addr == self.local_addr {
+                self.state.dialer.mark_fail(addr, now_ms)
+                continue
+            }
+            match net.connect_nonblocking(addr) {
+                Result::Ok(var stream) => {
+                    let _ = stream.set_nodelay(true)
+                    let conn = PeerConn::new(
+                        stream,
+                        state: ConnState::Connecting,
+                        outbound: true,
+                        remote_addr: addr,
+                        now_ms,
+                        want_writable: true,
+                    )
+                    match self.poller.add(TcpSlot::Peer(conn), Interest::BOTH) {
+                        Result::Ok(tok) => {
+                            self.peer_tokens.push(tok)
+                            self.state.dialer.mark_active(addr, tok)
+                        },
+                        Result::Err(_) => self.state.dialer.mark_fail(addr, now_ms),
+                    }
+                },
+                Result::Err(_) => self.state.dialer.mark_fail(addr, now_ms),
+            }
+        }
+    }
+
+    pub(ingot) fn accept_all(mut self, _ now_ms: u64) {
+        while true {
+            let accepted = match self.poller.get(self.listener_token) {
+                Option::Some(mut slot) => match slot {
+                    TcpSlot::Listener(mut listener) => listener.accept(),
+                    TcpSlot::Peer(_) => {
+                        return
+                    },
+                },
+                Option::None => {
+                    return
+                },
+            }
+            let pair = match accepted {
+                Result::Ok(p) => p,
+                Result::Err(err) => {
+                    if is_would_block(err) {
+                        return
+                    }
+                    return
+                },
+            }
+            var stream = pair.0
+            let peer_addr = pair.1
+            if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
+                continue
+            }
+            var conn = PeerConn::new(
+                stream,
+                state: ConnState::Handshaking,
+                outbound: false,
+                remote_addr: peer_addr,
+                now_ms,
+                want_writable: false,
+            )
+            var hello = MemBuffer::empty()
+            let seq = self.state.base.next_seq()
+            encode_hello(
+                origin: self.state.base.self_tag,
+                seq,
+                listen_port: self.state.base.listen_port,
+                mut hello,
+            )
+            if conn.queue_bytes(hello.span()) && conn.flush().is_ok() {
+                self.state.base.stats.frames_tx += 1
+                let writable = conn.has_pending_write()
+                conn.want_writable = writable
+                let interest = if writable {
+                    Interest::BOTH
+                } else {
+                    Interest::READABLE
+                }
+                if let Result::Ok(tok) = self.poller.add(TcpSlot::Peer(conn), interest) {
+                    self.peer_tokens.push(tok)
+                }
+            }
+        }
+    }
+
+    fn handle_writable(mut self, _ token: Token, _ now_ms: u64) -> bool {
+        var connecting = false
+        var failed = false
+        match self.poller.get(token) {
+            Option::Some(mut slot) => {
+                if let TcpSlot::Peer(mut conn) = slot {
+                    if conn.state.is_connecting() {
+                        connecting = true
+                        match conn.stream.take_error() {
+                            Result::Ok(Option::None) => {
+                                conn.state = ConnState::Handshaking
+                                conn.last_activity_ms = now_ms
+                            },
+                            _ => failed = true,
+                        }
+                    } else if conn.has_pending_write() {
+                        if !conn.flush().is_ok() {
+                            failed = true
+                        }
+                    }
+                }
+            },
+            Option::None => {
+                return false
+            },
+        }
+        if failed {
+            close_peer(
+                mut self.poller,
+                mut self.peer_tokens,
+                token,
+                now_ms,
+                mut self.state,
+            )
+            return false
+        }
+        if connecting {
+            var hello = MemBuffer::empty()
+            let seq = self.state.base.next_seq()
+            encode_hello(
+                origin: self.state.base.self_tag,
+                seq,
+                listen_port: self.state.base.listen_port,
+                mut hello,
+            )
+            return queue_to_peer(
+                mut self.poller,
+                mut self.peer_tokens,
+                token,
+                hello.span(),
+                now_ms,
+                mut self.state,
+            )
+        }
+        sync_interest(mut self.poller, token)
+        true
+    }
+
+    pub(ingot) fn handle_peer_event(mut self, _ ev: Event, _ now_ms: u64) {
+        let tok = ev.token()
+        if ev.is_writable() && !self.handle_writable(tok, now_ms) {
+            return
+        }
+        if ev.is_readable() {
+            var frames = MemVec<MemBuffer>::new()
+            var dead = false
+            match self.poller.get(tok) {
+                Option::Some(mut slot) => {
+                    if let TcpSlot::Peer(mut conn) = slot {
+                        if !conn.read_into(now_ms).is_ok() {
+                            dead = true
+                        }
+                        var one = MemBuffer::empty()
+                        while true {
+                            match conn.next_frame(mut one) {
+                                FrameStep::Frame => frames.push(MemBuffer::from_span(one.span())),
+                                FrameStep::NeedMore => {
+                                    break
+                                },
+                                FrameStep::Invalid => {
+                                    dead = true
+                                    break
+                                },
+                            }
+                        }
+                    }
+                },
+                Option::None => {
+                    return
+                },
+            }
+            var fi: usize = 0
+            while fi < frames.len() {
+                handle_frame(
+                    token: tok,
+                    raw: frames[fi].span(),
+                    now_ms,
+                    mut self.poller,
+                    mut self.peer_tokens,
+                    mut self.state,
+                )
+                fi += 1
+            }
+            if dead {
+                close_peer(
+                    mut self.poller,
+                    mut self.peer_tokens,
+                    tok,
+                    now_ms,
+                    mut self.state,
+                )
+                return
+            }
+        }
+        if ev.is_error() || ev.is_hangup() {
+            close_peer(
+                mut self.poller,
+                mut self.peer_tokens,
+                tok,
+                now_ms,
+                mut self.state,
+            )
+        }
+    }
+}

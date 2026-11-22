@@ -1,0 +1,192 @@
+use std::net::{Net, SocketAddr}
+use std::time::Clock
+use p2p::{GossipConfig, Transport}
+use super::{UdpConfig, UdpTransport}
+
+fn pump_all(a: mut UdpTransport, b: mut UdpTransport, c: mut UdpTransport, steps: usize)
+uses (net: mut Net, clock: Clock)
+{
+    var i: usize = 0
+    while i < steps {
+        let _ = a.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        let _ = c.poll(timeout_ms: 15)
+        i += 1
+    }
+}
+
+#[test]
+fn test_udp_three_node_discovery_and_gossip()
+uses (net: mut Net, clock: Clock)
+{
+    let lo = SocketAddr::parse("127.0.0.1:0").unwrap()
+    let cfg = GossipConfig::default()
+
+    var a = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 1,
+            seeds: MemVec::new(),
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    var seeds_b = MemVec<SocketAddr>::new()
+    seeds_b.push(a.local_addr())
+    var b = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 2,
+            seeds: seeds_b,
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    var seeds_c = MemVec<SocketAddr>::new()
+    seeds_c.push(a.local_addr())
+    var c = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 3,
+            seeds: seeds_c,
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    var step: usize = 0
+    while step < 30 && (a.peer_count() < 2 || b.peer_count() < 2 || c.peer_count() < 2) {
+        pump_all(mut a, mut b, mut c, steps: 1)
+        step += 1
+    }
+    assert!(
+        a.peer_count() == 2 && b.peer_count() == 2 && c.peer_count() == 2,
+    )
+
+    assert!(a.publish("round-1-payload".span()))
+    pump_all(mut a, mut b, mut c, steps: 5)
+
+    var buf = MemBuffer::empty()
+    let db = b.recv(mut buf).unwrap()
+    assert!(db.origin == 1 && buf == "round-1-payload")
+    assert!(b.recv(mut buf).is_none())
+
+    let dc = c.recv(mut buf).unwrap()
+    assert!(dc.origin == 1 && buf == "round-1-payload")
+    assert!(c.recv(mut buf).is_none())
+}
+
+#[test]
+fn test_udp_multi_hop_forwarding() uses (net: mut Net, clock: Clock) {
+    let lo = SocketAddr::parse("127.0.0.1:0").unwrap()
+    var cfg = GossipConfig::default()
+    cfg.ttl = 3
+
+    var c = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 30,
+            seeds: MemVec::new(),
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    var seeds_b = MemVec<SocketAddr>::new()
+    seeds_b.push(c.local_addr())
+    var b = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 20,
+            seeds: seeds_b,
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    // Wait for B <-> C handshake first, then bind A with seed B and publish.
+    var w: usize = 0
+    while w < 10 && b.peer_count() < 1 {
+        let _ = b.poll(timeout_ms: 15)
+        let _ = c.poll(timeout_ms: 15)
+        w += 1
+    }
+    assert!(b.peer_count() == 1 && c.peer_count() == 1)
+
+    var seeds_a = MemVec<SocketAddr>::new()
+    seeds_a.push(b.local_addr())
+    var a = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 10,
+            seeds: seeds_a,
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    // Publish directly from A before A learns C; B forwards to C via TTL decrement.
+    assert!(a.publish("hop-secret".span()))
+    pump_all(mut a, mut b, mut c, steps: 6)
+
+    var got = MemBuffer::empty()
+    let dc = c.recv(mut got).unwrap()
+    assert!(dc.origin == 10 && got == "hop-secret")
+}
+
+#[test]
+fn test_udp_swim_suspect_and_expire() uses (net: mut Net, clock: Clock) {
+    let lo = SocketAddr::parse("127.0.0.1:0").unwrap()
+    var cfg = GossipConfig::default()
+    cfg.heartbeat_ms = 60
+    cfg.suspect_ms = 120
+    cfg.dead_ms = 200
+
+    var a = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 1,
+            seeds: MemVec::new(),
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    var seeds_b = MemVec<SocketAddr>::new()
+    seeds_b.push(a.local_addr())
+    var b = UdpTransport::bind(
+        UdpConfig {
+            bind_addr: lo,
+            self_tag: 2,
+            seeds: seeds_b,
+            gossip: cfg,
+            lan_broadcast_port: 0,
+        },
+    )
+        .unwrap()
+
+    var step: usize = 0
+    while step < 20 && a.peer_count() < 1 {
+        let _ = a.poll(timeout_ms: 15)
+        let _ = b.poll(timeout_ms: 15)
+        step += 1
+    }
+    assert!(a.peer_count() == 1)
+
+    // Stop polling B; A should probe, suspect, and eventually expire B.
+    var wait_steps: usize = 0
+    while wait_steps < 40 && a.peer_count() > 0 {
+        let _ = a.poll(timeout_ms: 25)
+        wait_steps += 1
+    }
+    assert!(a.peer_count() == 0)
+}

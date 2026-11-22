@@ -1,0 +1,148 @@
+//! UDP SWIM wire codecs and `Pollable` socket wrapper.
+
+use std::net::{IpAddr, Ipv4Addr, Pollable, SocketAddr, UdpSocket}
+use p2p::{
+    Header,
+    PeerEntry,
+    decode_entries,
+    decode_u16_payload,
+    encode_entries,
+    encode_frame,
+    encode_u16_frame,
+}
+
+pub const KIND_JOIN: u8 = 0x10
+pub const KIND_JOIN_ACK: u8 = 0x11
+pub const KIND_PING: u8 = 0x12
+pub const KIND_ACK: u8 = 0x13
+pub const KIND_PING_REQ: u8 = 0x14
+pub const KIND_INDIRECT_ACK: u8 = 0x15
+
+pub struct UdpSlot { pub sock: UdpSocket }
+
+impl Pollable for UdpSlot {
+    fn raw_fd(self) -> i32 {
+        self.sock.as_raw_fd()
+    }
+}
+
+pub fn encode_join(origin: u64, seq: u64, listen_port: u16, _ out: mut MemBuffer) {
+    encode_u16_frame(kind: KIND_JOIN, origin, seq, listen_port, mut out)
+}
+
+pub fn encode_join_ack(
+    origin: u64,
+    seq: u64,
+    listen_port: u16,
+    peers: MemVec<PeerEntry>,
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    var payload = MemBuffer::new(2)
+    payload.write_be<u16>(offset: 0, value: listen_port)
+    let _ = encode_entries(peers, mut payload)
+    let hdr = Header::new(kind: KIND_JOIN_ACK, origin, seq, ttl: 1)
+    let _ = encode_frame(hdr, payload.span(), mut out)
+}
+
+pub fn encode_ping_or_ack(
+    kind: u8,
+    origin: u64,
+    seq: u64,
+    probe_id: u32,
+    listen_port: u16,
+    peers: MemVec<PeerEntry>,
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    var payload = MemBuffer::new(6)
+    payload.write_be<u32>(offset: 0, value: probe_id)
+    payload.write_be<u16>(offset: 4, value: listen_port)
+    let _ = encode_entries(peers, mut payload)
+    let hdr = Header::new(kind, origin, seq, ttl: 1)
+    let _ = encode_frame(hdr, payload.span(), mut out)
+}
+
+pub fn encode_ping_req(
+    origin: u64,
+    seq: u64,
+    probe_id: u32,
+    target_tag: u64,
+    target_addr: SocketAddr,
+    _ out: mut MemBuffer,
+) -> bool {
+    let ipv4_bits: u32 = match target_addr.ip() {
+        IpAddr::V4(v4) => v4.to_bits(),
+        IpAddr::V6(_) => {
+            return false
+        },
+    }
+    out.clear()
+    var payload = MemBuffer::new(18)
+    payload.write_be<u32>(offset: 0, value: probe_id)
+    payload.write_be<u64>(offset: 4, value: target_tag)
+    payload.write_be<u32>(offset: 12, value: ipv4_bits)
+    payload.write_be<u16>(offset: 16, value: target_addr.port())
+    let hdr = Header::new(kind: KIND_PING_REQ, origin, seq, ttl: 1)
+    encode_frame(hdr, payload.span(), mut out)
+}
+
+pub fn encode_indirect_ack(
+    origin: u64,
+    seq: u64,
+    probe_id: u32,
+    target_tag: u64,
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    var payload = MemBuffer::new(12)
+    payload.write_be<u32>(offset: 0, value: probe_id)
+    payload.write_be<u64>(offset: 4, value: target_tag)
+    let hdr = Header::new(kind: KIND_INDIRECT_ACK, origin, seq, ttl: 1)
+    let _ = encode_frame(hdr, payload.span(), mut out)
+}
+
+pub fn decode_join(_ payload: MemSpan) -> Option<u16> {
+    decode_u16_payload(payload)
+}
+
+pub fn decode_join_ack(_ payload: MemSpan, _ peers_out: mut MemVec<PeerEntry>) -> Option<u16> {
+    if payload.len() < 3 {
+        return Option::None
+    }
+    let listen_port = payload.read_be<u16>(0)
+    let _ = decode_entries(payload, offset: 2, mut peers_out)?
+    Option::Some(listen_port)
+}
+
+pub fn decode_ping_or_ack(_ payload: MemSpan, _ peers_out: mut MemVec<PeerEntry>) -> Option<
+    (u32, u16),
+> {
+    if payload.len() < 7 {
+        return Option::None
+    }
+    let probe_id = payload.read_be<u32>(0)
+    let listen_port = payload.read_be<u16>(4)
+    let _ = decode_entries(payload, offset: 6, mut peers_out)?
+    Option::Some((probe_id, listen_port))
+}
+
+pub fn decode_ping_req(_ payload: MemSpan) -> Option<(u32, u64, SocketAddr)> {
+    if payload.len() < 18 {
+        return Option::None
+    }
+    let probe_id = payload.read_be<u32>(0)
+    let target_tag = payload.read_be<u64>(4)
+    let ip = Ipv4Addr::from_bits(payload.read_be<u32>(12))
+    let port = payload.read_be<u16>(16)
+    Option::Some(
+        (probe_id, target_tag, SocketAddr::new(IpAddr::V4(ip), port)),
+    )
+}
+
+pub fn decode_indirect_ack(_ payload: MemSpan) -> Option<(u32, u64)> {
+    if payload.len() < 12 {
+        return Option::None
+    }
+    Option::Some((payload.read_be<u32>(0), payload.read_be<u64>(4)))
+}

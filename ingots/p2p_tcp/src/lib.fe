@@ -1,0 +1,5 @@
+//! Pure-Fe non-blocking TCP mesh + peer-exchange (`PEX`) transport.
+//!
+//! Uses only `p2p` shared facilities and `std::net::TcpListener`/`TcpStream` + `Poller`.
+
+pub use transport::{TcpConfig, TcpTransport}

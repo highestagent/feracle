@@ -1,0 +1,170 @@
+//! SWIM probe scheduler, indirect ping-req relays, and suspicion timers.
+
+use std::net::SocketAddr
+use p2p::{GossipConfig, PeerBook, Ticker}
+
+const MAX_RELAYS: usize = 16
+
+pub struct PendingProbe {
+    pub probe_id: u32,
+    pub target_tag: u64,
+    pub target_addr: SocketAddr,
+    pub sent_ms: u64,
+    pub indirect_sent: bool,
+}
+
+impl Copy for PendingProbe {}
+
+pub struct IndirectRelay {
+    pub probe_id: u32,
+    pub requester: SocketAddr,
+    pub target_tag: u64,
+    pub created_ms: u64,
+}
+
+impl Copy for IndirectRelay {}
+
+pub struct SwimTick {
+    pub send_join_seeds: bool,
+    pub send_lan_join: bool,
+    pub send_ping: Option<(u32, SocketAddr)>,
+    pub send_indirect: Option<(u32, u64, SocketAddr)>,
+}
+
+impl Copy for SwimTick {}
+
+pub struct SwimState {
+    next_probe_id: u32,
+    probe_cursor: usize,
+    pending: Option<PendingProbe>,
+    relays: MemVec<IndirectRelay>,
+    join_ticker: Ticker,
+    swim_ticker: Ticker,
+    lan_ticker: Ticker,
+}
+
+impl SwimState {
+    pub fn new(now_ms: u64, cfg: GossipConfig) -> Self {
+        let lan_period = cfg.heartbeat_ms * 2
+        SwimState {
+            next_probe_id: 1,
+            probe_cursor: 0,
+            pending: Option::None,
+            relays: MemVec::new(),
+            join_ticker: Ticker::new(period_ms: cfg.heartbeat_ms, now_ms),
+            swim_ticker: Ticker::new(period_ms: cfg.heartbeat_ms, now_ms),
+            lan_ticker: Ticker::new(period_ms: lan_period, now_ms),
+        }
+    }
+
+    pub fn add_relay(mut self, probe_id: u32, requester: SocketAddr, target_tag: u64, now_ms: u64) {
+        if self.relays.len() >= MAX_RELAYS {
+            let _ = self.relays.swap_remove(0)
+        }
+        self.relays.push(
+                IndirectRelay { probe_id, requester, target_tag, created_ms: now_ms },
+            )
+    }
+
+    pub fn on_ack(mut self, probe_id: u32, from_tag: u64) -> Option<SocketAddr> {
+        if let Option::Some(p) = self.pending {
+            if p.probe_id == probe_id && p.target_tag == from_tag {
+                self.pending = Option::None
+            }
+        }
+        var i: usize = 0
+        while i < self.relays.len() {
+            let r = self.relays[i]
+            if r.probe_id == probe_id && r.target_tag == from_tag {
+                let _ = self.relays.swap_remove(i)
+                return Option::Some(r.requester)
+            }
+            i += 1
+        }
+        Option::None
+    }
+
+    pub fn on_indirect_ack(mut self, probe_id: u32, target_tag: u64) -> bool {
+        if let Option::Some(p) = self.pending {
+            if p.probe_id == probe_id && p.target_tag == target_tag {
+                self.pending = Option::None
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn on_tick(mut self, now_ms: u64, book: mut PeerBook, cfg: GossipConfig) -> SwimTick {
+        var out = SwimTick {
+            send_join_seeds: false,
+            send_lan_join: false,
+            send_ping: Option::None,
+            send_indirect: Option::None,
+        }
+
+        // Prune stale indirect relays.
+        var ri: usize = 0
+        while ri < self.relays.len() {
+            if now_ms >= self.relays[ri].created_ms + cfg.dead_ms {
+                let _ = self.relays.swap_remove(ri)
+            } else {
+                ri += 1
+            }
+        }
+
+        // Advance active probe timeouts.
+        var clear_pending = false
+        var set_indirect = false
+        if let Option::Some(p) = self.pending {
+            let elapsed = now_ms - p.sent_ms
+            if elapsed >= cfg.suspect_ms {
+                if let Option::Some(idx) = book.find_tag(p.target_tag) {
+                    book.suspect(idx, now_ms)
+                }
+                clear_pending = true
+            } else if !p.indirect_sent && elapsed >= cfg.suspect_ms / 2 {
+                set_indirect = true
+                out.send_indirect = Option::Some((p.probe_id, p.target_tag, p.target_addr))
+            }
+        }
+        if clear_pending {
+            self.pending = Option::None
+        } else if set_indirect {
+            if let Option::Some(mut p) = self.pending {
+                p.indirect_sent = true
+            }
+        }
+
+        let _ = book.expire(now_ms, grace_ms: cfg.dead_ms)
+
+        if self.join_ticker.due(now_ms) && book.is_empty() {
+            out.send_join_seeds = true
+        }
+        if self.lan_ticker.due(now_ms) {
+            out.send_lan_join = true
+        }
+
+        if self.pending.is_none() && self.swim_ticker.due(now_ms) && !book.is_empty() {
+            let idx = self.probe_cursor % book.len()
+            self.probe_cursor = (idx + 1) % book.len()
+            let target = book.get(idx)
+            let pid = self.next_probe_id
+            self.next_probe_id += 1
+            if self.next_probe_id == 0 {
+                self.next_probe_id = 1
+            }
+            self.pending = Option::Some(
+                PendingProbe {
+                    probe_id: pid,
+                    target_tag: target.tag,
+                    target_addr: target.addr,
+                    sent_ms: now_ms,
+                    indirect_sent: false,
+                },
+            )
+            out.send_ping = Option::Some((pid, target.addr))
+        }
+
+        out
+    }
+}
