@@ -1,8 +1,18 @@
 use std::collections::{HashSet, VecDeque};
+#[cfg(unix)]
+use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::raw::c_int;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -41,23 +51,122 @@ fn update_peers_snapshot(snapshot: &Mutex<(u64, String)>, peers: &HashSet<PeerId
     }
 }
 
+#[cfg(unix)]
+struct WakeSender(UnixStream);
+
+#[cfg(unix)]
+impl WakeSender {
+    fn notify(&self) {
+        let mut s = &self.0;
+        let _ = s.write(&[1u8]);
+    }
+}
+
+#[cfg(unix)]
+struct WakeReceiver(UnixStream);
+
+#[cfg(unix)]
+impl WakeReceiver {
+    fn fd(&self) -> i32 {
+        self.0.as_raw_fd()
+    }
+
+    fn drain(&self) -> usize {
+        let mut s = &self.0;
+        let mut buf = [0u8; 64];
+        let mut total = 0usize;
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => total = total.saturating_add(n),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        total
+    }
+}
+
+#[cfg(unix)]
+fn make_wake_pair() -> Result<(WakeReceiver, WakeSender), String> {
+    let (rx, tx) = UnixStream::pair().map_err(|e| format!("wake pair failed: {e}"))?;
+    rx.set_nonblocking(true)
+        .map_err(|e| format!("wake rx nonblocking failed: {e}"))?;
+    tx.set_nonblocking(true)
+        .map_err(|e| format!("wake tx nonblocking failed: {e}"))?;
+    Ok((WakeReceiver(rx), WakeSender(tx)))
+}
+
+#[cfg(not(unix))]
+struct WakeSender;
+
+#[cfg(not(unix))]
+impl WakeSender {
+    fn notify(&self) {}
+}
+
+#[cfg(not(unix))]
+struct WakeReceiver;
+
+#[cfg(not(unix))]
+impl WakeReceiver {
+    fn fd(&self) -> i32 {
+        -1
+    }
+
+    fn drain(&self) -> usize {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn make_wake_pair() -> Result<(WakeReceiver, WakeSender), String> {
+    Ok((WakeReceiver, WakeSender))
+}
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static SIGNAL_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(unix)]
+static SIGNAL_PIPE: OnceLock<Mutex<(WakeReceiver, WakeSender)>> = OnceLock::new();
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "signal"]
+    fn c_signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+    #[link_name = "write"]
+    fn c_write(fd: c_int, buf: *const u8, count: usize) -> isize;
+}
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(_sig: c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    let fd = SIGNAL_WAKE_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        let byte: u8 = 1;
+        unsafe {
+            let _ = c_write(fd, &byte as *const u8, 1);
+        }
+    }
+}
+
 pub struct P2pNode {
     local_peer_id: PeerId,
     inbox: Arc<Mutex<VecDeque<(u64, String, Vec<u8>)>>>,
     peer_count: Arc<AtomicUsize>,
     peers_snapshot: Arc<Mutex<(u64, String)>>,
+    wake_rx: WakeReceiver,
     tx: mpsc::Sender<ControlMsg>,
     shutdown_rx: Option<oneshot::Receiver<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
-
-static GLOBAL_NODE: Mutex<Option<P2pNode>> = Mutex::new(None);
 
 impl P2pNode {
     pub fn start(listen_port: u16, bootstrap_addrs: Vec<Multiaddr>) -> Result<Self, String> {
         let inbox = Arc::new(Mutex::new(VecDeque::with_capacity(64)));
         let peer_count = Arc::new(AtomicUsize::new(0));
         let peers_snapshot = Arc::new(Mutex::new((0u64, String::new())));
+        let (wake_rx, wake_tx) = make_wake_pair()?;
         let (tx, mut rx) = mpsc::channel::<ControlMsg>(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<PeerId, String>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -153,6 +262,7 @@ impl P2pNode {
                                             if subscribed_peers.insert(peer_id) {
                                                 peer_count_bg.store(subscribed_peers.len(), Ordering::Release);
                                                 update_peers_snapshot(&peers_snapshot_bg, &subscribed_peers);
+                                                wake_tx.notify();
                                             }
                                         }
                                     }
@@ -160,12 +270,14 @@ impl P2pNode {
                                         if sub_topic == topic.hash() && subscribed_peers.remove(&peer_id) {
                                             peer_count_bg.store(subscribed_peers.len(), Ordering::Release);
                                             update_peers_snapshot(&peers_snapshot_bg, &subscribed_peers);
+                                            wake_tx.notify();
                                         }
                                     }
                                     SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                                         if num_established == 0 && subscribed_peers.remove(&peer_id) {
                                             peer_count_bg.store(subscribed_peers.len(), Ordering::Release);
                                             update_peers_snapshot(&peers_snapshot_bg, &subscribed_peers);
+                                            wake_tx.notify();
                                         }
                                     }
                                     SwarmEvent::Behaviour(OracleBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -189,11 +301,16 @@ impl P2pNode {
                                         }
                                         let origin_tag = peer_id_tag(&source_peer);
                                         let peer_str = source_peer.to_string();
+                                        let mut pushed = false;
                                         if let Ok(mut guard) = inbox_bg.lock() {
                                             if guard.len() >= MAX_INBOX_LEN {
                                                 guard.pop_front();
                                             }
                                             guard.push_back((origin_tag, peer_str, data));
+                                            pushed = true;
+                                        }
+                                        if pushed {
+                                            wake_tx.notify();
                                         }
                                     }
                                     _ => {}
@@ -202,6 +319,7 @@ impl P2pNode {
                         }
                     }
 
+                    wake_tx.notify();
                     let _ = shutdown_tx.send(());
                 });
             })
@@ -216,6 +334,7 @@ impl P2pNode {
             inbox,
             peer_count,
             peers_snapshot,
+            wake_rx,
             tx,
             shutdown_rx: Some(shutdown_rx),
             thread: Some(thread),
@@ -224,6 +343,14 @@ impl P2pNode {
 
     pub fn local_peer_id(&self) -> PeerId {
         self.local_peer_id
+    }
+
+    pub fn wake_fd(&self) -> i32 {
+        self.wake_rx.fd()
+    }
+
+    pub fn drain_wake(&self) -> usize {
+        self.wake_rx.drain()
     }
 
     pub fn peer_count(&self) -> usize {
@@ -563,32 +690,15 @@ fn read_utf8_arg<'a>(ptr: *const u8, len: usize) -> Result<&'a str, i32> {
     std::str::from_utf8(bytes).map_err(|_| -3)
 }
 
-fn start_global_node(listen_port: u16, bootstrap_ptr: *const u8, bootstrap_len: usize) -> i32 {
-    let bootstrap_str = match read_utf8_arg(bootstrap_ptr, bootstrap_len) {
-        Ok(s) => s,
-        Err(code) => return code,
+unsafe fn with_node<F: FnOnce(&P2pNode) -> i32>(handle: u64, f: F) -> i32 {
+    let Ok(addr) = usize::try_from(handle) else {
+        return -2;
     };
-
-    let bootstrap_addrs = match parse_bootstrap_list(bootstrap_str) {
-        Ok(list) => list,
-        Err(_) => return -4,
-    };
-
-    let mut guard = match GLOBAL_NODE.lock() {
-        Ok(g) => g,
-        Err(_) => return -5,
-    };
-    if guard.is_some() {
-        *guard = None;
+    if addr == 0 {
+        return -7;
     }
-
-    match P2pNode::start(listen_port, bootstrap_addrs) {
-        Ok(node) => {
-            *guard = Some(node);
-            0
-        }
-        Err(_) => -6,
-    }
+    let node = &*(addr as *const P2pNode);
+    f(node)
 }
 
 #[no_mangle]
@@ -596,73 +706,107 @@ pub extern "C" fn p2p_start(
     listen_port: u32,
     bootstrap_ptr: *const u8,
     bootstrap_len: usize,
+    out_handle8_ptr: *mut u8,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
+        if out_handle8_ptr.is_null() {
+            return -2;
+        }
         let Ok(listen_port_u16) = u16::try_from(listen_port) else {
             return -2;
         };
-        start_global_node(listen_port_u16, bootstrap_ptr, bootstrap_len)
+        let bootstrap_str = match read_utf8_arg(bootstrap_ptr, bootstrap_len) {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let bootstrap_addrs = match parse_bootstrap_list(bootstrap_str) {
+            Ok(list) => list,
+            Err(_) => return -4,
+        };
+
+        match P2pNode::start(listen_port_u16, bootstrap_addrs) {
+            Ok(node) => {
+                let raw = Box::into_raw(Box::new(node)) as usize as u64;
+                let handle_be = raw.to_be_bytes();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(handle_be.as_ptr(), out_handle8_ptr, 8);
+                }
+                0
+            }
+            Err(_) => -6,
+        }
     }))
     .unwrap_or(-99)
 }
 
 #[no_mangle]
-pub extern "C" fn p2p_local_peer_id(out_buf: *mut u8, max_len: usize) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let guard = match GLOBAL_NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        let Some(node) = guard.as_ref() else {
-            return -7;
-        };
-        let peer_str = node.local_peer_id().to_string();
-        let bytes = peer_str.as_bytes();
-        if bytes.len() > max_len || (!bytes.is_empty() && out_buf.is_null()) {
-            return -2;
-        }
-        if !bytes.is_empty() {
-            unsafe {
+pub extern "C" fn p2p_wake_fd(handle: u64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        with_node(handle, |node| node.wake_fd())
+    }))
+    .unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn p2p_drain_wake(handle: u64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        with_node(handle, |node| {
+            i32::try_from(node.drain_wake()).unwrap_or(i32::MAX)
+        })
+    }))
+    .unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn p2p_local_peer_id(handle: u64, out_buf: *mut u8, max_len: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        with_node(handle, |node| {
+            let peer_str = node.local_peer_id().to_string();
+            let bytes = peer_str.as_bytes();
+            if bytes.len() > max_len || (!bytes.is_empty() && out_buf.is_null()) {
+                return -2;
+            }
+            if !bytes.is_empty() {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
             }
-        }
-        i32::try_from(bytes.len()).unwrap_or(-2)
+            i32::try_from(bytes.len()).unwrap_or(-2)
+        })
     }))
     .unwrap_or(-99)
 }
 
 #[no_mangle]
-pub extern "C" fn p2p_peers_csv(out_ver8_ptr: *mut u8, out_buf: *mut u8, max_len: usize) -> i32 {
+pub extern "C" fn p2p_peers_csv(
+    handle: u64,
+    out_ver8_ptr: *mut u8,
+    out_buf: *mut u8,
+    max_len: usize,
+) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         if out_ver8_ptr.is_null() {
             return -2;
         }
-        let guard = match GLOBAL_NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        let Some(node) = guard.as_ref() else {
-            return -7;
-        };
-        let (ver, csv) = node.peers_snapshot();
-        let bytes = csv.as_bytes();
-        if bytes.len() > max_len || (!bytes.is_empty() && out_buf.is_null()) {
-            return -2;
-        }
-        let ver_be = ver.to_be_bytes();
         unsafe {
-            std::ptr::copy_nonoverlapping(ver_be.as_ptr(), out_ver8_ptr, 8);
-            if !bytes.is_empty() {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
-            }
+            with_node(handle, |node| {
+                let (ver, csv) = node.peers_snapshot();
+                let bytes = csv.as_bytes();
+                if bytes.len() > max_len || (!bytes.is_empty() && out_buf.is_null()) {
+                    return -2;
+                }
+                let ver_be = ver.to_be_bytes();
+                std::ptr::copy_nonoverlapping(ver_be.as_ptr(), out_ver8_ptr, 8);
+                if !bytes.is_empty() {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+                }
+                i32::try_from(bytes.len()).unwrap_or(-2)
+            })
         }
-        i32::try_from(bytes.len()).unwrap_or(-2)
     }))
     .unwrap_or(-99)
 }
 
 #[no_mangle]
-pub extern "C" fn p2p_publish(data_ptr: *const u8, data_len: usize) -> i32 {
+pub extern "C" fn p2p_publish(handle: u64, data_ptr: *const u8, data_len: usize) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         if data_len > 0 && data_ptr.is_null() {
             return -2;
@@ -672,16 +816,11 @@ pub extern "C" fn p2p_publish(data_ptr: *const u8, data_len: usize) -> i32 {
         } else {
             unsafe { slice::from_raw_parts(data_ptr, data_len) }.to_vec()
         };
-        let guard = match GLOBAL_NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        let Some(node) = guard.as_ref() else {
-            return -7;
-        };
-        match node.publish(payload) {
-            Ok(()) => 0,
-            Err(_) => -8,
+        unsafe {
+            with_node(handle, |node| match node.publish(payload) {
+                Ok(()) => 0,
+                Err(_) => -8,
+            })
         }
     }))
     .unwrap_or(-99)
@@ -689,6 +828,7 @@ pub extern "C" fn p2p_publish(data_ptr: *const u8, data_len: usize) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn p2p_poll_with_peer(
+    handle: u64,
     out_ptr: *mut u8,
     out_cap: usize,
     out_meta16_ptr: *mut u8,
@@ -699,108 +839,148 @@ pub extern "C" fn p2p_poll_with_peer(
         if out_meta16_ptr.is_null() {
             return -2;
         }
-        let guard = match GLOBAL_NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        let Some(node) = guard.as_ref() else {
-            return -7;
-        };
-
-        let Some(front_len) = node.peek_front_len() else {
-            return 0;
-        };
-        if front_len > out_cap || (front_len > 0 && out_ptr.is_null()) {
-            return -1;
-        }
-        let Some((origin_tag, peer_str, msg)) = node.poll_with_peer() else {
-            return 0;
-        };
-        if msg.len() > out_cap {
-            return -1;
-        }
-        if !msg.is_empty() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(msg.as_ptr(), out_ptr, msg.len());
-            }
-        }
-        let peer_bytes = peer_str.as_bytes();
-        let peer_copy = peer_bytes.len().min(out_peer_cap);
-        let mut meta = [0u8; 16];
-        meta[0..8].copy_from_slice(&origin_tag.to_be_bytes());
-        meta[8..16].copy_from_slice(&(peer_copy as u64).to_be_bytes());
         unsafe {
-            std::ptr::copy_nonoverlapping(meta.as_ptr(), out_meta16_ptr, 16);
-            if peer_copy > 0 && !out_peer_ptr.is_null() {
-                std::ptr::copy_nonoverlapping(peer_bytes.as_ptr(), out_peer_ptr, peer_copy);
-            }
+            with_node(handle, |node| {
+                let Some(front_len) = node.peek_front_len() else {
+                    return 0;
+                };
+                if front_len > out_cap || (front_len > 0 && out_ptr.is_null()) {
+                    return -1;
+                }
+                let Some((origin_tag, peer_str, msg)) = node.poll_with_peer() else {
+                    return 0;
+                };
+                if msg.len() > out_cap {
+                    return -1;
+                }
+                if !msg.is_empty() {
+                    std::ptr::copy_nonoverlapping(msg.as_ptr(), out_ptr, msg.len());
+                }
+                let peer_bytes = peer_str.as_bytes();
+                let peer_copy = peer_bytes.len().min(out_peer_cap);
+                let mut meta = [0u8; 16];
+                meta[0..8].copy_from_slice(&origin_tag.to_be_bytes());
+                meta[8..16].copy_from_slice(&(peer_copy as u64).to_be_bytes());
+                std::ptr::copy_nonoverlapping(meta.as_ptr(), out_meta16_ptr, 16);
+                if peer_copy > 0 && !out_peer_ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(peer_bytes.as_ptr(), out_peer_ptr, peer_copy);
+                }
+                i32::try_from(msg.len()).unwrap_or(-1)
+            })
         }
-        i32::try_from(msg.len()).unwrap_or(-1)
     }))
     .unwrap_or(-99)
 }
 
 #[no_mangle]
-pub extern "C" fn p2p_poll(out_ptr: *mut u8, out_cap: usize) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let guard = match GLOBAL_NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        let Some(node) = guard.as_ref() else {
-            return -7;
-        };
-
-        let Some(front_len) = node.peek_front_len() else {
-            return 0;
-        };
-        if front_len > out_cap || (front_len > 0 && out_ptr.is_null()) {
-            return -1;
-        }
-        let Some(msg) = node.poll() else {
-            return 0;
-        };
-        if msg.len() > out_cap {
-            return -1;
-        }
-        if !msg.is_empty() {
-            unsafe {
+pub extern "C" fn p2p_poll(handle: u64, out_ptr: *mut u8, out_cap: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        with_node(handle, |node| {
+            let Some(front_len) = node.peek_front_len() else {
+                return 0;
+            };
+            if front_len > out_cap || (front_len > 0 && out_ptr.is_null()) {
+                return -1;
+            }
+            let Some(msg) = node.poll() else {
+                return 0;
+            };
+            if msg.len() > out_cap {
+                return -1;
+            }
+            if !msg.is_empty() {
                 std::ptr::copy_nonoverlapping(msg.as_ptr(), out_ptr, msg.len());
             }
-        }
-        i32::try_from(msg.len()).unwrap_or(-1)
+            i32::try_from(msg.len()).unwrap_or(-1)
+        })
     }))
     .unwrap_or(-99)
 }
 
 #[no_mangle]
-pub extern "C" fn p2p_peer_count() -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let guard = match GLOBAL_NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        let Some(node) = guard.as_ref() else {
-            return -7;
-        };
-        i32::try_from(node.peer_count()).unwrap_or(i32::MAX)
+pub extern "C" fn p2p_peer_count(handle: u64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        with_node(handle, |node| {
+            i32::try_from(node.peer_count()).unwrap_or(i32::MAX)
+        })
     }))
     .unwrap_or(-99)
 }
 
 #[no_mangle]
-pub extern "C" fn p2p_stop() -> i32 {
+pub extern "C" fn p2p_stop(handle: u64) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let mut guard = match GLOBAL_NODE.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        if let Some(node) = guard.take() {
-            node.stop();
+        if handle == 0 {
+            return 0;
         }
+        let Ok(addr) = usize::try_from(handle) else {
+            return -2;
+        };
+        let boxed = unsafe { Box::from_raw(addr as *mut P2pNode) };
+        boxed.stop();
         0
     }))
     .unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn sys_install_signal_handlers() -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            if SIGNAL_PIPE.get().is_none() {
+                if let Ok(pair) = make_wake_pair() {
+                    let _ = SIGNAL_PIPE.set(Mutex::new(pair));
+                }
+            }
+            let Some(pipe_lock) = SIGNAL_PIPE.get() else {
+                return -1;
+            };
+            let Ok(guard) = pipe_lock.lock() else {
+                return -1;
+            };
+            guard.0.drain();
+            let tx_fd = guard.1 .0.as_raw_fd();
+            let rx_fd = guard.0.fd();
+            SIGNAL_WAKE_FD.store(tx_fd, Ordering::Release);
+            unsafe {
+                c_signal(2, handle_shutdown_signal);
+                c_signal(15, handle_shutdown_signal);
+            }
+            rx_fd
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn sys_shutdown_requested() -> i32 {
+    if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sys_drain_signal_wake() -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(unix)]
+        {
+            if let Some(pipe_lock) = SIGNAL_PIPE.get() {
+                if let Ok(guard) = pipe_lock.lock() {
+                    return i32::try_from(guard.0.drain()).unwrap_or(i32::MAX);
+                }
+            }
+        }
+        0
+    }))
+    .unwrap_or(-1)
 }
 
 #[no_mangle]
@@ -1522,5 +1702,91 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn test_opaque_handle_concurrent_nodes_and_wakeup_fd() {
+        let mut h_a_be = [0u8; 8];
+        let mut h_b_be = [0u8; 8];
+        assert_eq!(
+            p2p_start(17201, std::ptr::null(), 0, h_a_be.as_mut_ptr()),
+            0
+        );
+        let h_a = u64::from_be_bytes(h_a_be);
+        assert_ne!(h_a, 0);
+
+        let mut peer_a_buf = [0u8; 128];
+        let peer_a_len = p2p_local_peer_id(h_a, peer_a_buf.as_mut_ptr(), peer_a_buf.len());
+        assert!(peer_a_len > 0);
+        let peer_a = std::str::from_utf8(&peer_a_buf[..peer_a_len as usize]).unwrap();
+
+        let boot_b = format!("/ip4/127.0.0.1/tcp/17201/p2p/{peer_a}");
+        assert_eq!(
+            p2p_start(17202, boot_b.as_ptr(), boot_b.len(), h_b_be.as_mut_ptr()),
+            0
+        );
+        let h_b = u64::from_be_bytes(h_b_be);
+        assert_ne!(h_b, 0);
+        assert_ne!(h_a, h_b);
+
+        #[cfg(unix)]
+        {
+            assert!(p2p_wake_fd(h_a) >= 0);
+            assert!(p2p_wake_fd(h_b) >= 0);
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if p2p_peer_count(h_a) >= 1 && p2p_peer_count(h_b) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(p2p_peer_count(h_a) >= 1);
+        assert!(p2p_peer_count(h_b) >= 1);
+        assert!(p2p_drain_wake(h_b) >= 1);
+        assert_eq!(p2p_drain_wake(h_b), 0);
+
+        let payload = b"wake-check-payload";
+        assert_eq!(p2p_publish(h_a, payload.as_ptr(), payload.len()), 0);
+
+        let mut rx_buf = [0u8; 256];
+        let mut got = 0i32;
+        let rx_deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < rx_deadline {
+            let n = p2p_poll(h_b, rx_buf.as_mut_ptr(), rx_buf.len());
+            if n > 0 {
+                got = n;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(got, payload.len() as i32);
+        assert_eq!(&rx_buf[..got as usize], payload);
+        #[cfg(unix)]
+        assert!(p2p_drain_wake(h_b) >= 1);
+        assert_eq!(p2p_drain_wake(h_b), 0);
+
+        assert_eq!(p2p_stop(h_b), 0);
+        assert_eq!(p2p_stop(h_a), 0);
+        assert_eq!(p2p_stop(0), 0);
+        assert_eq!(p2p_peer_count(0), -7);
+    }
+
+    #[test]
+    fn test_signal_flag_and_wake_fd() {
+        let fd = sys_install_signal_handlers();
+        assert_eq!(sys_shutdown_requested(), 0);
+        #[cfg(unix)]
+        {
+            assert!(fd >= 0);
+            handle_shutdown_signal(15);
+            assert_eq!(sys_shutdown_requested(), 1);
+            assert!(sys_drain_signal_wake() >= 1);
+            assert_eq!(sys_drain_signal_wake(), 0);
+        }
+        #[cfg(not(unix))]
+        let _ = fd;
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     }
 }

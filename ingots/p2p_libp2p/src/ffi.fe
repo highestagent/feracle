@@ -3,33 +3,64 @@
 use core::num::IntDowncast
 
 extern {
-    fn p2p_start(_ listen_port: u32, _ bootstrap_ptr: *u8, _ bootstrap_len: usize) -> i32
-    fn p2p_publish(_ data_ptr: *u8, _ data_len: usize) -> i32
-    fn p2p_poll(_ out_ptr: *u8, _ out_cap: usize) -> i32
+    fn p2p_start(
+        _ listen_port: u32,
+        _ bootstrap_ptr: *u8,
+        _ bootstrap_len: usize,
+        _ out_handle8_ptr: *u8,
+    ) -> i32
+    fn p2p_wake_fd(_ handle: u64) -> i32
+    fn p2p_drain_wake(_ handle: u64) -> i32
+    fn p2p_publish(_ handle: u64, _ data_ptr: *u8, _ data_len: usize) -> i32
+    fn p2p_poll(_ handle: u64, _ out_ptr: *u8, _ out_cap: usize) -> i32
     fn p2p_poll_with_peer(
+        _ handle: u64,
         _ out_ptr: *u8,
         _ out_cap: usize,
         _ out_meta16_ptr: *u8,
         _ out_peer_ptr: *u8,
         _ out_peer_cap: usize,
     ) -> i32
-    fn p2p_local_peer_id(_ out_ptr: *u8, _ out_cap: usize) -> i32
-    fn p2p_peers_csv(_ out_ver8_ptr: *u8, _ out_ptr: *u8, _ out_cap: usize) -> i32
-    fn p2p_peer_count() -> i32
-    fn p2p_stop() -> i32
+    fn p2p_local_peer_id(_ handle: u64, _ out_ptr: *u8, _ out_cap: usize) -> i32
+    fn p2p_peers_csv(_ handle: u64, _ out_ver8_ptr: *u8, _ out_ptr: *u8, _ out_cap: usize) -> i32
+    fn p2p_peer_count(_ handle: u64) -> i32
+    fn p2p_stop(_ handle: u64) -> i32
     fn p2p_sleep_ms(_ ms: u32)
 }
 
-pub(ingot) fn start(listen_port: u16, bootstrap: MemSpan) -> i32 {
+pub(ingot) fn start(listen_port: u16, bootstrap: MemSpan) -> (i32, u64) {
+    var handle_buf = MemBuffer::new(8)
+    let rc = unsafe {
+        p2p_start(
+            listen_port as u32,
+            bootstrap.ptr(),
+            bootstrap.len(),
+            handle_buf.ptr(),
+        )
+    }
+    if rc == 0 {
+        let handle = handle_buf.span().read_be<u64>(0)
+        return (0, handle)
+    }
+    (rc, 0)
+}
+
+pub(ingot) fn wake_fd(_ handle: u64) -> i32 {
     unsafe {
-        p2p_start(listen_port as u32, bootstrap.ptr(), bootstrap.len())
+        p2p_wake_fd(handle)
     }
 }
 
-pub(ingot) fn local_peer_id() -> MemBuffer {
+pub(ingot) fn drain_wake(_ handle: u64) -> i32 {
+    unsafe {
+        p2p_drain_wake(handle)
+    }
+}
+
+pub(ingot) fn local_peer_id(_ handle: u64) -> MemBuffer {
     var out = MemBuffer::new(128)
     let rc = unsafe {
-        p2p_local_peer_id(out.ptr(), out.capacity())
+        p2p_local_peer_id(handle, out.ptr(), out.capacity())
     }
     if rc > 0 {
         let len: usize = rc.downcast_unchecked()
@@ -47,11 +78,11 @@ pub(ingot) fn local_peer_id() -> MemBuffer {
     out
 }
 
-pub(ingot) fn peers_csv() -> (u64, MemBuffer) {
+pub(ingot) fn peers_csv(_ handle: u64) -> (u64, MemBuffer) {
     var ver_buf = MemBuffer::new(8)
     var out = MemBuffer::new(8192)
     let rc = unsafe {
-        p2p_peers_csv(ver_buf.ptr(), out.ptr(), out.capacity())
+        p2p_peers_csv(handle, ver_buf.ptr(), out.ptr(), out.capacity())
     }
     if rc >= 0 {
         let ver = ver_buf.span().read_be<u64>(0)
@@ -70,13 +101,16 @@ pub(ingot) fn peers_csv() -> (u64, MemBuffer) {
     (0, out)
 }
 
-pub(ingot) fn publish(_ data: MemSpan) -> i32 {
+pub(ingot) fn publish(_ handle: u64, _ data: MemSpan) -> i32 {
     unsafe {
-        p2p_publish(data.ptr(), data.len())
+        p2p_publish(handle, data.ptr(), data.len())
     }
 }
 
-pub(ingot) fn poll_with_peer(_ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> (i32, u64) {
+pub(ingot) fn poll_with_peer(_ handle: u64, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> (
+    i32,
+    u64,
+) {
     out.clear()
     out.reserve(1280)
     peer_out.clear()
@@ -84,6 +118,7 @@ pub(ingot) fn poll_with_peer(_ out: mut MemBuffer, _ peer_out: mut MemBuffer) ->
     var meta = MemBuffer::new(16)
     let rc = unsafe {
         p2p_poll_with_peer(
+            handle,
             out.ptr(),
             out.capacity(),
             meta.ptr(),
@@ -110,11 +145,11 @@ pub(ingot) fn poll_with_peer(_ out: mut MemBuffer, _ peer_out: mut MemBuffer) ->
     (rc, 0)
 }
 
-pub(ingot) fn poll_into(_ out: mut MemBuffer) -> i32 {
+pub(ingot) fn poll_into(_ handle: u64, _ out: mut MemBuffer) -> i32 {
     out.clear()
     out.reserve(1280)
     let rc = unsafe {
-        p2p_poll(out.ptr(), out.capacity())
+        p2p_poll(handle, out.ptr(), out.capacity())
     }
     if rc > 0 {
         let len: usize = rc.downcast_unchecked()
@@ -125,15 +160,15 @@ pub(ingot) fn poll_into(_ out: mut MemBuffer) -> i32 {
     rc
 }
 
-pub(ingot) fn peer_count() -> i32 {
+pub(ingot) fn peer_count(_ handle: u64) -> i32 {
     unsafe {
-        p2p_peer_count()
+        p2p_peer_count(handle)
     }
 }
 
-pub(ingot) fn stop() -> i32 {
+pub(ingot) fn stop(_ handle: u64) -> i32 {
     unsafe {
-        p2p_stop()
+        p2p_stop(handle)
     }
 }
 

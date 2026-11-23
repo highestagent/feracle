@@ -98,12 +98,14 @@ impl PeerSession {
 
         let inner = match config.p2p_backend {
             PeerBackend::Libp2p => {
-                match Libp2pTransport::bind(
+                let owner = sched.alloc_task()
+                match Libp2pTransport::bind_reactor(
                     Libp2pConfig {
                         listen_port: config.p2p_port,
                         self_tag,
                         bootstrap: MemBuffer::from_span(config.bootstrap.span()),
                     },
+                    owner,
                 ) {
                     Result::Ok(l) => {
                         engine_local_peer_id(l, prefix: prefix.span(), mut peer_id)

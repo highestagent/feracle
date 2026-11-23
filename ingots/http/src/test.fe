@@ -498,6 +498,13 @@ impl SocketIo for HalfCloseInjectorIo {
         self.inner.register_udp_socket(owner, tag, sock)
     }
 
+    fn register_raw_fd(mut self, owner: TaskId, tag: u32, fd: i32, _ interest: Interest) -> Result<
+        Error,
+        Token,
+    > {
+        self.inner.register_raw_fd(owner, tag, fd, interest)
+    }
+
     fn set_interest(mut self, _ token: Token, _ interest: Interest) -> Result<Error, ()> {
         self.inner.set_interest(token, interest)
     }

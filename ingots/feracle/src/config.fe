@@ -90,7 +90,9 @@ pub fn build_cli() -> App {
                 .env("FERACLE_PRIVKEY_HEX")
                 .required()
                 .sensitive()
-                .help("32-byte hex ECDSA signing key"),
+                .help(
+                    "32-byte hex ECDSA signing key (prefer FERACLE_PRIVKEY_HEX env var to avoid process-list exposure)",
+                ),
         )
         .arg(
             Arg::option("rpc-url")

@@ -136,6 +136,8 @@ fe build --emit abi,bytecode --out-dir ingots/evm/out ingots/evm
 node telemetry/host.mjs --help  # WASM telemetry collector
 ```
 
+> **Private keys:** Set `FERACLE_PRIVKEY_HEX` via the environment instead of passing `--privkey-hex` on the command line so signing keys are not exposed in process listings or shell history.
+
 `scripts/build-feracle.sh` links `p2p-shim/target/release/libp2p_shim.a` into `out/feracle` via `fe build --backend native --link`—linking `CoreFoundation` / `SystemConfiguration` framework stubs and `-liconv` on macOS, or `-lpthread -ldl -lm` on Linux.
 
 ### Unit tests

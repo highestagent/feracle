@@ -3,4 +3,6 @@ name = "p2p_libp2p"
 version = "0.1.0"
 
 [dependencies]
+coro = { path = "../coro" }
+net_reactor = { path = "../net_reactor" }
 p2p = { path = "../p2p" }

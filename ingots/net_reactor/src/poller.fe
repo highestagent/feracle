@@ -1,4 +1,4 @@
-use std::io::Error
+use std::io::{Error, ErrorKind}
 use std::net::{Events, Interest, Poller, SocketAddr, TcpListener, TcpStream, Token, UdpSocket}
 use std::time::Duration
 use coro::TaskId
@@ -86,6 +86,19 @@ impl SocketIo for NetPoller {
     > {
         let interest = Interest::READABLE
         let entry = IoEntry { owner, tag, interest, slot: IoSlot::UdpSocket(sock) }
+        let tok = self.poller.add(entry, interest)?
+        self.tokens.push(tok)
+        Result::Ok(tok)
+    }
+
+    fn register_raw_fd(mut self, owner: TaskId, tag: u32, fd: i32, _ interest: Interest) -> Result<
+        Error,
+        Token,
+    > {
+        if fd < 0 {
+            return Result::Err(Error::new(ErrorKind::InvalidInput))
+        }
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::RawFd(fd) }
         let tok = self.poller.add(entry, interest)?
         self.tokens.push(tok)
         Result::Ok(tok)

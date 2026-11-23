@@ -40,6 +40,9 @@ extern {
         _ r32_ptr: *u8,
         _ s32_ptr: *u8,
     ) -> i32
+    fn sys_install_signal_handlers() -> i32
+    fn sys_shutdown_requested() -> i32
+    fn sys_drain_signal_wake() -> i32
 }
 
 fn read_addr20(_ buf: ref MemBuffer) -> [u8; 20] {
@@ -259,4 +262,22 @@ pub fn verify_quote(chain_id: u64, contract20: MemSpan, quote: feracle_core::Quo
         )
     }
     rc == 1
+}
+
+pub fn install_signal_handlers() -> i32 {
+    unsafe {
+        sys_install_signal_handlers()
+    }
+}
+
+pub fn shutdown_requested() -> bool {
+    unsafe {
+        sys_shutdown_requested() != 0
+    }
+}
+
+pub fn drain_signal_wake() {
+    unsafe {
+        let _ = sys_drain_signal_wake()
+    }
 }

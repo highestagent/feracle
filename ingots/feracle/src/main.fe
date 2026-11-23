@@ -1,22 +1,38 @@
 use std::env::{Args, Env}
 use std::io::{Stderr, Stdout}
-use std::net::Net
+use std::net::{Interest, Net, Token}
 use std::time::Clock
-use cli::{Cli, Matches}
+use cli::{Cli, Matches, ValueSource}
 use coro::{Coroutine, LocalScheduler, Poll, Scheduler, Sleep, TaskId, block_on}
 use net_reactor::{NetDriver, NetPoller, SocketIo}
 use super::config::{build_cli, load_config}
 use super::consensus::ConsensusCoro
+use super::ffi
 use super::network::PeerSession
 use super::telemetry::{TelemetryServer, TelemetrySink}
 
 struct NodeCoro {
+    node_id: u64,
     peer: PeerSession,
     telemetry: TelemetrySink,
     consensus: ConsensusCoro,
     flush_owner: TaskId,
     flush_sleep: Option<Sleep>,
+    sig_token: Option<Token>,
     exit_code: Option<i32>,
+}
+
+impl NodeCoro {
+    fn release_io(mut self)
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        if let Option::Some(tok) = self.sig_token {
+            self.sig_token = Option::None
+            io.deregister(tok)
+        }
+        self.telemetry.stop()
+        self.peer.stop()
+    }
 }
 
 impl Coroutine for NodeCoro {
@@ -31,6 +47,27 @@ impl Coroutine for NodeCoro {
     )
 
     fn poll(mut self) -> Poll<i32> uses E {
+        if let Option::Some(tok) = self.sig_token {
+            if io.take_token_event(tok).is_some() {
+                ffi::drain_signal_wake()
+            }
+        }
+        if self.exit_code.is_none() && ffi::shutdown_requested() {
+            eprintln!(
+                "node ",
+                self.node_id,
+                " received shutdown signal; stopping cleanly",
+            )
+            self.consensus.cancel()
+            if !self.telemetry.has_pending_writes() {
+                self.release_io()
+                return Poll::Ready(0)
+            }
+            self.flush_sleep = Option::Some(Sleep::after(owner: self.flush_owner, delay_ms: 50))
+            self.exit_code = Option::Some(0)
+            return Poll::Pending
+        }
+
         if let Option::Some(code) = self.exit_code {
             self.telemetry.poll()
             var flush_done = !self.telemetry.has_pending_writes()
@@ -45,8 +82,7 @@ impl Coroutine for NodeCoro {
             }
             if flush_done {
                 self.flush_sleep = Option::None
-                self.telemetry.stop()
-                self.peer.stop()
+                self.release_io()
                 return Poll::Ready(code)
             }
             return Poll::Pending
@@ -57,8 +93,7 @@ impl Coroutine for NodeCoro {
         self.telemetry.poll()
         if let Poll::Ready(code) = cons_poll {
             if !self.telemetry.has_pending_writes() {
-                self.telemetry.stop()
-                self.peer.stop()
+                self.release_io()
                 return Poll::Ready(code)
             }
             self.flush_sleep = Option::Some(Sleep::after(owner: self.flush_owner, delay_ms: 50))
@@ -74,8 +109,7 @@ impl Coroutine for NodeCoro {
             s.cancel()
             self.flush_sleep = Option::None
         }
-        self.telemetry.stop()
-        self.peer.stop()
+        self.release_io()
     }
 }
 
@@ -93,6 +127,13 @@ uses (args: Args, env: Env, out: mut Stdout, err: mut Stderr, net: mut Net, cloc
                         eprintln!(cli_err)
                         return cli_err.exit_code()
                     },
+                }
+
+                if let Option::Some(ValueSource::CommandLine) = matches
+                    .value_source("privkey-hex") {
+                    eprintln!(
+                        "warning: passing --privkey-hex on the command line may expose your key; prefer FERACLE_PRIVKEY_HEX env var",
+                    )
                 }
 
                 var sched = LocalScheduler::new(0)
@@ -149,15 +190,30 @@ uses (args: Args, env: Env, out: mut Stdout, err: mut Stderr, net: mut Net, cloc
                     }
 
                     let flush_owner = sched.alloc_task()
+                    var sig_token: Option<Token> = Option::None
+                    let sig_fd = ffi::install_signal_handlers()
+                    if sig_fd >= 0 {
+                        if let Result::Ok(tok) = io.register_raw_fd(
+                            owner: flush_owner,
+                            tag: 99,
+                            fd: sig_fd,
+                            Interest::READABLE,
+                        ) {
+                            sig_token = Option::Some(tok)
+                        }
+                    }
+                    let node_id = config.node_id
                     let consensus = ConsensusCoro::new(config)
                     let max_wait: u64 = if peer.needs_periodic_poll() { 25 } else { 500 }
                     var driver = NetDriver::new(max_wait_ms: max_wait)
                     var node = NodeCoro {
+                        node_id,
                         peer,
                         telemetry,
                         consensus,
                         flush_owner,
                         flush_sleep: Option::None,
+                        sig_token,
                         exit_code: Option::None,
                     }
                     block_on(mut node, mut driver)

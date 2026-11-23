@@ -6,6 +6,7 @@ pub enum IoSlot {
     TcpListener(TcpListener),
     TcpStream(TcpStream),
     UdpSocket(UdpSocket),
+    RawFd(i32),
 }
 
 pub struct IoEntry { pub owner: TaskId, pub tag: u32, pub interest: Interest, pub slot: IoSlot }
@@ -16,6 +17,7 @@ impl Pollable for IoEntry {
             IoSlot::TcpListener(ref l) => l.as_raw_fd(),
             IoSlot::TcpStream(ref s) => s.as_raw_fd(),
             IoSlot::UdpSocket(ref u) => u.as_raw_fd(),
+            IoSlot::RawFd(fd) => fd,
         }
     }
 }
@@ -47,6 +49,10 @@ pub trait SocketIo {
         _ interest: Interest,
     ) -> Result<Error, Token>
     fn register_udp_socket(mut self, owner: TaskId, tag: u32, _ sock: own UdpSocket) -> Result<
+        Error,
+        Token,
+    >
+    fn register_raw_fd(mut self, owner: TaskId, tag: u32, fd: i32, _ interest: Interest) -> Result<
         Error,
         Token,
     >

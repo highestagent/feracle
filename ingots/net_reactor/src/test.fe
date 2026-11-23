@@ -231,6 +231,44 @@ uses (net: mut Net, clock: Clock)
         }
         assert!(td_count == 1)
         io.deregister_owner(coalesce_task)
+
+        // Raw non-owned fd registration + wake notification + explicit deregister before close.
+        let raw_task = sched.alloc_task()
+        var raw_rx = net.bind_udp(lo).unwrap()
+        var raw_tx = net.bind_udp(lo).unwrap()
+        raw_rx.set_nonblocking(true).unwrap()
+        raw_tx.set_nonblocking(true).unwrap()
+        let raw_addr = raw_rx.local_addr().unwrap()
+        let raw_tok = io
+            .register_raw_fd(
+                owner: raw_task,
+                tag: 9,
+                fd: raw_rx.as_raw_fd(),
+                Interest::READABLE,
+            )
+            .unwrap()
+        let _ = raw_tx.send_to("wake".span(), raw_addr).unwrap()
+        var woke_raw = false
+        var rw_step: usize = 0
+        while !woke_raw && rw_step < 10 {
+            let _ = io.poll_os(timeout_ms: 5, mut woken)
+            var wi: usize = 0
+            while wi < woken.len() {
+                if woken[wi] == raw_task {
+                    woke_raw = true
+                    break
+                }
+                wi += 1
+            }
+            rw_step += 1
+        }
+        assert!(woke_raw)
+        let raw_ev = io.take_token_event(raw_tok).unwrap()
+        assert!(raw_ev.readable && raw_ev.tag == 9)
+        let raw_slice = mut rx.span()
+        let (rn, _) = raw_rx.recv_from(mut raw_slice).unwrap()
+        assert!(rx.span().head(rn) == "wake")
+        io.deregister(raw_tok)
     }
 
     var wrap = WrapperTransport {
