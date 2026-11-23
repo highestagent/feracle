@@ -16,10 +16,182 @@ const DEFAULT_ORACLES = [
   "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
 ].join(",");
 const DEFAULT_WASM_PATH = path.join(REPO_ROOT, "out", "telemetry_wasm.wasm");
-const MEDIANS_SUBMITTED_TOPIC =
+export const MEDIANS_SUBMITTED_TOPIC =
   "0xf2da0e6afc773e2239fc39b0cab487f90ff53838719584aab05eeed38611e097";
-const INITIAL_LOG_LOOKBACK = 256;
-const MAX_LOG_BLOCK_SPAN = 1000;
+export const INITIAL_LOG_LOOKBACK = 256;
+export const MAX_LOG_BLOCK_SPAN = 1000;
+export const MAX_SEEN_RECEIPTS = 512;
+export const MAX_ROUND_TX_COUNTS = 256;
+export const MAX_FRAME_SEQS = 512;
+
+export function addBoundedSet(set, key, maxSize) {
+  if (set.has(key)) {
+    return false;
+  }
+  while (set.size >= maxSize) {
+    const oldest = set.values().next().value;
+    if (oldest === undefined) break;
+    set.delete(oldest);
+  }
+  set.add(key);
+  return true;
+}
+
+export function setBoundedMap(map, key, value, maxSize) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else {
+    while (map.size >= maxSize) {
+      const oldest = map.keys().next().value;
+      if (oldest === undefined) break;
+      map.delete(oldest);
+    }
+  }
+  map.set(key, value);
+}
+
+export function shouldSkipStatusPoll(connected, lastEventAt, now = Date.now(), staleMs = 15000) {
+  return Boolean(connected && lastEventAt > 0 && now - lastEventAt < staleMs);
+}
+
+export function createFrameDeduper({
+  nodeCount,
+  maxSeqs = MAX_FRAME_SEQS,
+  ingestWireFrame,
+}) {
+  const nodePeerIds = new Array(nodeCount).fill(null);
+  const seenSeqs = Array.from({ length: nodeCount }, () => new Set());
+
+  function updatePeerId(nodeIdx, peerId) {
+    if (!peerId) return;
+    if (nodePeerIds[nodeIdx] && nodePeerIds[nodeIdx] !== peerId) {
+      seenSeqs[nodeIdx].clear();
+    }
+    nodePeerIds[nodeIdx] = peerId;
+  }
+
+  function recordFrameOnce(nodeIdx, frame) {
+    if (!frame || !frame.hex || typeof frame.seq !== "number") {
+      return false;
+    }
+    const set = seenSeqs[nodeIdx];
+    if (!addBoundedSet(set, frame.seq, maxSeqs)) {
+      return false;
+    }
+    const canonicalPeer =
+      frame.dir === "tx" ? nodePeerIds[nodeIdx] || `node-${nodeIdx}` : frame.peer || "";
+    ingestWireFrame(frame.hex, canonicalPeer, frame.dir === "tx");
+    return true;
+  }
+
+  return {
+    updatePeerId,
+    recordFrameOnce,
+    getPeerId(nodeIdx) {
+      return nodePeerIds[nodeIdx];
+    },
+    seenCount(nodeIdx) {
+      return seenSeqs[nodeIdx].size;
+    },
+  };
+}
+
+export function createSettlementIndexer({
+  rpcCall,
+  contract,
+  ingestTx,
+  maxReceipts = MAX_SEEN_RECEIPTS,
+  maxRounds = MAX_ROUND_TX_COUNTS,
+  initialLookback = INITIAL_LOG_LOOKBACK,
+  maxBlockSpan = MAX_LOG_BLOCK_SPAN,
+}) {
+  const seenReceipts = new Set();
+  const roundTxCounts = new Map();
+  let lastScannedBlock = null;
+
+  function reset() {
+    lastScannedBlock = null;
+    seenReceipts.clear();
+    roundTxCounts.clear();
+  }
+
+  async function processLatestBlock(latestBlock) {
+    if (!Number.isFinite(latestBlock)) {
+      return;
+    }
+    if (lastScannedBlock !== null && latestBlock < lastScannedBlock) {
+      reset();
+    }
+    if (lastScannedBlock !== null && latestBlock <= lastScannedBlock) {
+      return;
+    }
+
+    const startBlock =
+      lastScannedBlock === null
+        ? Math.max(0, latestBlock - initialLookback)
+        : lastScannedBlock + 1;
+    for (let fromBlock = startBlock; fromBlock <= latestBlock; fromBlock += maxBlockSpan) {
+      const toBlock = Math.min(latestBlock, fromBlock + maxBlockSpan - 1);
+      const logsResp = await rpcCall({
+        jsonrpc: "2.0",
+        id: 100 + fromBlock,
+        method: "eth_getLogs",
+        params: [
+          {
+            address: contract,
+            fromBlock: `0x${fromBlock.toString(16)}`,
+            toBlock: `0x${toBlock.toString(16)}`,
+            topics: [MEDIANS_SUBMITTED_TOPIC],
+          },
+        ],
+      });
+      if (logsResp?.error || !Array.isArray(logsResp?.result)) {
+        return;
+      }
+      for (const log of logsResp.result) {
+        if (!log || log.removed || !log.transactionHash || seenReceipts.has(log.transactionHash)) {
+          continue;
+        }
+        if (!Array.isArray(log.topics) || log.topics.length < 2) {
+          continue;
+        }
+        const roundId = Number(BigInt(log.topics[1]));
+        const blockNum = Number(BigInt(log.blockNumber || "0x0"));
+        const rcptResp = await rpcCall({
+          jsonrpc: "2.0",
+          id: 2000 + blockNum,
+          method: "eth_getTransactionReceipt",
+          params: [log.transactionHash],
+        });
+        const rcpt = rcptResp?.result;
+        if (!rcpt) {
+          return;
+        }
+        if (rcpt.status !== "0x1") {
+          continue;
+        }
+        addBoundedSet(seenReceipts, log.transactionHash, maxReceipts);
+        const gasUsed = Number(BigInt(rcpt.gasUsed || "0x0"));
+        const nextCount = (roundTxCounts.get(roundId) || 0) + 1;
+        setBoundedMap(roundTxCounts, roundId, nextCount, maxRounds);
+        ingestTx(roundId, blockNum, gasUsed, nextCount, rcpt.from || "");
+      }
+      lastScannedBlock = toBlock;
+    }
+  }
+
+  return {
+    reset,
+    processLatestBlock,
+    getState() {
+      return {
+        lastScannedBlock,
+        seenReceiptsSize: seenReceipts.size,
+        roundTxCounts: new Map(roundTxCounts),
+      };
+    },
+  };
+}
 
 function printHelp() {
   console.log(`Feracle WASM Telemetry Host (Node.js)
@@ -41,7 +213,7 @@ Options:
 `);
 }
 
-function parseCliArgs(argv) {
+export function parseCliArgs(argv) {
   const opts = {
     rpcUrl: process.env.FERACLE_RPC_URL || DEFAULT_RPC_URL,
     contract: process.env.FERACLE_CONTRACT || "",
@@ -333,34 +505,20 @@ async function main() {
   const wasmHost = WasmTelemetryHost.load(opts.wasm);
   wasmHost.configure(opts.contract, opts.oracles);
 
-  const nodePeerIds = new Array(opts.nodeUrls.length).fill(null);
-  const seenSeqs = opts.nodeUrls.map(() => new Set());
-  const MAX_SEEN_RECEIPTS = 512;
-  const MAX_ROUND_TX_COUNTS = 256;
-  const seenReceipts = new Set();
-  const roundTxCounts = new Map();
+  const frameDeduper = createFrameDeduper({
+    nodeCount: opts.nodeUrls.length,
+    ingestWireFrame: (hex, canonicalPeer, isTx) =>
+      wasmHost.ingestWireFrame(hex, canonicalPeer, isTx),
+  });
+  const settlementIndexer = createSettlementIndexer({
+    rpcCall: (bodyObj) => rpcJsonCall(opts.rpcUrl, bodyObj),
+    contract: opts.contract,
+    ingestTx: (roundId, blockNum, gasUsed, nextCount, from) =>
+      wasmHost.ingestTx(roundId, blockNum, gasUsed, nextCount, from),
+  });
   const sseConnected = opts.nodeUrls.map(() => false);
   const sseLastEventAt = opts.nodeUrls.map(() => 0);
-  let lastScannedBlock = null;
   let stopping = false;
-
-  function recordFrameOnce(nodeIdx, frame) {
-    if (!frame || !frame.hex || typeof frame.seq !== "number") {
-      return;
-    }
-    const set = seenSeqs[nodeIdx];
-    if (set.has(frame.seq)) {
-      return;
-    }
-    if (set.size > 512) {
-      const oldest = set.values().next().value;
-      set.delete(oldest);
-    }
-    set.add(frame.seq);
-    const canonicalPeer =
-      frame.dir === "tx" ? nodePeerIds[nodeIdx] || `node-${nodeIdx}` : frame.peer || "";
-    wasmHost.ingestWireFrame(frame.hex, canonicalPeer, frame.dir === "tx");
-  }
 
   async function pollRpcAndBlocks() {
     const batchBody = wasmHost.buildRpcBatch();
@@ -391,88 +549,7 @@ async function main() {
         return;
       }
       const latestBlock = Number(BigInt(blockItem.result));
-      if (!Number.isFinite(latestBlock)) {
-        return;
-      }
-
-      if (lastScannedBlock !== null && latestBlock < lastScannedBlock) {
-        lastScannedBlock = null;
-        seenReceipts.clear();
-        roundTxCounts.clear();
-      }
-      if (lastScannedBlock !== null && latestBlock <= lastScannedBlock) {
-        return;
-      }
-
-      const startBlock =
-        lastScannedBlock === null
-          ? Math.max(0, latestBlock - INITIAL_LOG_LOOKBACK)
-          : lastScannedBlock + 1;
-      for (
-        let fromBlock = startBlock;
-        fromBlock <= latestBlock;
-        fromBlock += MAX_LOG_BLOCK_SPAN
-      ) {
-        const toBlock = Math.min(latestBlock, fromBlock + MAX_LOG_BLOCK_SPAN - 1);
-        const logsResp = await rpcJsonCall(opts.rpcUrl, {
-          jsonrpc: "2.0",
-          id: 100 + fromBlock,
-          method: "eth_getLogs",
-          params: [
-            {
-              address: opts.contract,
-              fromBlock: `0x${fromBlock.toString(16)}`,
-              toBlock: `0x${toBlock.toString(16)}`,
-              topics: [MEDIANS_SUBMITTED_TOPIC],
-            },
-          ],
-        });
-        if (logsResp?.error || !Array.isArray(logsResp?.result)) {
-          return;
-        }
-        for (const log of logsResp.result) {
-          if (
-            !log ||
-            log.removed ||
-            !log.transactionHash ||
-            seenReceipts.has(log.transactionHash)
-          ) {
-            continue;
-          }
-          if (!Array.isArray(log.topics) || log.topics.length < 2) {
-            continue;
-          }
-          const roundId = Number(BigInt(log.topics[1]));
-          const blockNum = Number(BigInt(log.blockNumber || "0x0"));
-          const rcptResp = await rpcJsonCall(opts.rpcUrl, {
-            jsonrpc: "2.0",
-            id: 2000 + blockNum,
-            method: "eth_getTransactionReceipt",
-            params: [log.transactionHash],
-          });
-          const rcpt = rcptResp?.result;
-          if (!rcpt) {
-            return;
-          }
-          if (rcpt.status !== "0x1") {
-            continue;
-          }
-          if (seenReceipts.size >= MAX_SEEN_RECEIPTS) {
-            const oldest = seenReceipts.values().next().value;
-            if (oldest !== undefined) seenReceipts.delete(oldest);
-          }
-          seenReceipts.add(log.transactionHash);
-          const gasUsed = Number(BigInt(rcpt.gasUsed || "0x0"));
-          const nextCount = (roundTxCounts.get(roundId) || 0) + 1;
-          if (!roundTxCounts.has(roundId) && roundTxCounts.size >= MAX_ROUND_TX_COUNTS) {
-            const oldestRound = roundTxCounts.keys().next().value;
-            if (oldestRound !== undefined) roundTxCounts.delete(oldestRound);
-          }
-          roundTxCounts.set(roundId, nextCount);
-          wasmHost.ingestTx(roundId, blockNum, gasUsed, nextCount, rcpt.from || "");
-        }
-        lastScannedBlock = toBlock;
-      }
+      await settlementIndexer.processLatestBlock(latestBlock);
     } catch {
       // Transient RPC disconnect; next interval will retry cleanly
     }
@@ -482,7 +559,7 @@ async function main() {
     const now = Date.now();
     await Promise.all(
       opts.nodeUrls.map(async (baseUrl, idx) => {
-        if (sseConnected[idx] && sseLastEventAt[idx] > 0 && now - sseLastEventAt[idx] < 15000) {
+        if (shouldSkipStatusPoll(sseConnected[idx], sseLastEventAt[idx], now)) {
           return;
         }
         try {
@@ -497,14 +574,11 @@ async function main() {
           try {
             const parsed = JSON.parse(body);
             if (parsed && parsed.peer_id) {
-              if (nodePeerIds[idx] && nodePeerIds[idx] !== parsed.peer_id) {
-                seenSeqs[idx].clear();
-              }
-              nodePeerIds[idx] = parsed.peer_id;
+              frameDeduper.updatePeerId(idx, parsed.peer_id);
             }
             if (Array.isArray(parsed?.recent_frames)) {
               for (const frame of parsed.recent_frames) {
-                recordFrameOnce(idx, frame);
+                frameDeduper.recordFrameOnce(idx, frame);
               }
             }
           } catch {
@@ -563,19 +637,16 @@ async function main() {
                 sseLastEventAt[nodeIdx] = Date.now();
                 if (ev.event === "status") {
                   if (ev.peer_id) {
-                    if (nodePeerIds[nodeIdx] && nodePeerIds[nodeIdx] !== ev.peer_id) {
-                      seenSeqs[nodeIdx].clear();
-                    }
-                    nodePeerIds[nodeIdx] = ev.peer_id;
+                    frameDeduper.updatePeerId(nodeIdx, ev.peer_id);
                   }
                   if (Array.isArray(ev.recent_frames)) {
                     for (const frame of ev.recent_frames) {
-                      recordFrameOnce(nodeIdx, frame);
+                      frameDeduper.recordFrameOnce(nodeIdx, frame);
                     }
                   }
                   wasmHost.ingestNodeStatus(nodeIdx, payload);
                 } else if (ev.event === "frame") {
-                  recordFrameOnce(nodeIdx, ev);
+                  frameDeduper.recordFrameOnce(nodeIdx, ev);
                 }
               } catch {
                 // Ignore non-JSON comments/partial lines
@@ -695,7 +766,13 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const isEntrypoint =
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isEntrypoint) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
