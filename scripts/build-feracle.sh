@@ -16,14 +16,14 @@ if [[ "$OS" == "Darwin" ]]; then
     --link "$SDK/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd" \
     --link "$SDK/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration.tbd" \
     --link-lib iconv \
-    --out-dir "$ROOT_DIR/out" \
-    "$ROOT_DIR/ingots/feracle"
+    --out-dir out \
+    ingots/feracle
 else
   fe build --backend native \
     --link "$ROOT_DIR/p2p-shim/target/release/libp2p_shim.a" \
     --link-lib pthread \
     --link-lib dl \
     --link-lib m \
-    --out-dir "$ROOT_DIR/out" \
-    "$ROOT_DIR/ingots/feracle"
+    --out-dir out \
+    ingots/feracle
 fi

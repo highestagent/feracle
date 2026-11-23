@@ -61,7 +61,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[1/11] Building evm and feracle..."
-fe build --emit abi,bytecode --out-dir "$ROOT_DIR/ingots/evm/out" "$ROOT_DIR/ingots/evm"
+fe build --emit abi,bytecode --out-dir ingots/evm/out ingots/evm
 "$ROOT_DIR/scripts/build-feracle.sh"
 
 echo "[2/11] Starting Anvil on port 8545 (chainId=$CHAIN_ID)..."

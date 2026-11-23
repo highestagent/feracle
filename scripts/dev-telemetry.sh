@@ -112,7 +112,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Building evm, feracle, and telemetry wasm..."
-fe build --emit abi,bytecode --out-dir "$ROOT_DIR/ingots/evm/out" "$ROOT_DIR/ingots/evm"
+fe build --emit abi,bytecode --out-dir ingots/evm/out ingots/evm
 "$ROOT_DIR/scripts/build-feracle.sh"
 "$ROOT_DIR/scripts/build-wasm.sh"
 
