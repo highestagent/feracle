@@ -16,7 +16,10 @@ const DEFAULT_ORACLES = [
   "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
 ].join(",");
 const DEFAULT_WASM_PATH = path.join(REPO_ROOT, "out", "telemetry_wasm.wasm");
-const SUBMIT_MEDIANS_SELECTOR = "0x6d2b8b3f";
+const MEDIANS_SUBMITTED_TOPIC =
+  "0xf2da0e6afc773e2239fc39b0cab487f90ff53838719584aab05eeed38611e097";
+const INITIAL_LOG_LOOKBACK = 256;
+const MAX_LOG_BLOCK_SPAN = 1000;
 
 function printHelp() {
   console.log(`Feracle WASM Telemetry Host (Node.js)
@@ -330,7 +333,6 @@ async function main() {
   const wasmHost = WasmTelemetryHost.load(opts.wasm);
   wasmHost.configure(opts.contract, opts.oracles);
 
-  const contractLower = opts.contract.toLowerCase();
   const nodePeerIds = new Array(opts.nodeUrls.length).fill(null);
   const seenSeqs = opts.nodeUrls.map(() => new Set());
   const MAX_SEEN_RECEIPTS = 512;
@@ -393,43 +395,73 @@ async function main() {
         return;
       }
 
+      if (lastScannedBlock !== null && latestBlock < lastScannedBlock) {
+        lastScannedBlock = null;
+        seenReceipts.clear();
+        roundTxCounts.clear();
+      }
+      if (lastScannedBlock !== null && latestBlock <= lastScannedBlock) {
+        return;
+      }
+
       const startBlock =
-        lastScannedBlock === null ? Math.max(0, latestBlock - 32) : lastScannedBlock + 1;
-      for (let b = startBlock; b <= latestBlock; b++) {
-        const blkResp = await rpcJsonCall(opts.rpcUrl, {
+        lastScannedBlock === null
+          ? Math.max(0, latestBlock - INITIAL_LOG_LOOKBACK)
+          : lastScannedBlock + 1;
+      for (
+        let fromBlock = startBlock;
+        fromBlock <= latestBlock;
+        fromBlock += MAX_LOG_BLOCK_SPAN
+      ) {
+        const toBlock = Math.min(latestBlock, fromBlock + MAX_LOG_BLOCK_SPAN - 1);
+        const logsResp = await rpcJsonCall(opts.rpcUrl, {
           jsonrpc: "2.0",
-          id: 100 + b,
-          method: "eth_getBlockByNumber",
-          params: [`0x${b.toString(16)}`, true],
+          id: 100 + fromBlock,
+          method: "eth_getLogs",
+          params: [
+            {
+              address: opts.contract,
+              fromBlock: `0x${fromBlock.toString(16)}`,
+              toBlock: `0x${toBlock.toString(16)}`,
+              topics: [MEDIANS_SUBMITTED_TOPIC],
+            },
+          ],
         });
-        const txs = blkResp?.result?.transactions || [];
-        for (const tx of txs) {
-          if (!tx || !tx.to || tx.to.toLowerCase() !== contractLower) {
+        if (logsResp?.error || !Array.isArray(logsResp?.result)) {
+          return;
+        }
+        for (const log of logsResp.result) {
+          if (
+            !log ||
+            log.removed ||
+            !log.transactionHash ||
+            seenReceipts.has(log.transactionHash)
+          ) {
             continue;
           }
-          const input = (tx.input || "").toLowerCase();
-          if (!input.startsWith(SUBMIT_MEDIANS_SELECTOR) || input.length < 74) {
+          if (!Array.isArray(log.topics) || log.topics.length < 2) {
             continue;
           }
-          if (seenReceipts.has(tx.hash)) {
-            continue;
-          }
+          const roundId = Number(BigInt(log.topics[1]));
+          const blockNum = Number(BigInt(log.blockNumber || "0x0"));
           const rcptResp = await rpcJsonCall(opts.rpcUrl, {
             jsonrpc: "2.0",
-            id: 2000 + b,
+            id: 2000 + blockNum,
             method: "eth_getTransactionReceipt",
-            params: [tx.hash],
+            params: [log.transactionHash],
           });
           const rcpt = rcptResp?.result;
-          if (!rcpt || rcpt.status !== "0x1") {
+          if (!rcpt) {
+            return;
+          }
+          if (rcpt.status !== "0x1") {
             continue;
           }
           if (seenReceipts.size >= MAX_SEEN_RECEIPTS) {
             const oldest = seenReceipts.values().next().value;
             if (oldest !== undefined) seenReceipts.delete(oldest);
           }
-          seenReceipts.add(tx.hash);
-          const roundId = Number(BigInt("0x" + input.slice(10, 74)));
+          seenReceipts.add(log.transactionHash);
           const gasUsed = Number(BigInt(rcpt.gasUsed || "0x0"));
           const nextCount = (roundTxCounts.get(roundId) || 0) + 1;
           if (!roundTxCounts.has(roundId) && roundTxCounts.size >= MAX_ROUND_TX_COUNTS) {
@@ -437,9 +469,9 @@ async function main() {
             if (oldestRound !== undefined) roundTxCounts.delete(oldestRound);
           }
           roundTxCounts.set(roundId, nextCount);
-          wasmHost.ingestTx(roundId, b, gasUsed, nextCount, tx.from || "");
+          wasmHost.ingestTx(roundId, blockNum, gasUsed, nextCount, rcpt.from || "");
         }
-        lastScannedBlock = b;
+        lastScannedBlock = toBlock;
       }
     } catch {
       // Transient RPC disconnect; next interval will retry cleanly
