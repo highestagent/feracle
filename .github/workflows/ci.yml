@@ -111,6 +111,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
           - os: macos-latest
             target: darwin-arm64
     runs-on: ${{ matrix.os }}
