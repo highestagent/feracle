@@ -23,6 +23,16 @@ pub fn format_peers_csv(entries: MemVec<PeerEntry>, prefix: MemSpan, _ out: mut 
     }
 }
 
+pub fn count_csv_peers(_ csv: MemSpan) -> usize {
+    var count: usize = 0
+    for part in csv.split(b',') {
+        if !part.trim().is_empty() {
+            count += 1
+        }
+    }
+    count
+}
+
 fn hex_char(_ nibble: u8) -> u8 {
     if nibble < 10 {
         b'0' + nibble

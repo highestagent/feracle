@@ -3,7 +3,18 @@ use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr, Token}
 use std::time::Clock
 use coro::{Driver, LocalScheduler, Scheduler, TaskId, TimerId}
 use net_reactor::{NetDriver, NetPoller, SocketIo, is_would_block}
-use p2p::{Delivery, GossipConfig, GossipCore, PeerEntry, Stats, Transport, pick_fanout}
+use p2p::{
+    Delivery,
+    GossipConfig,
+    GossipCore,
+    P2pEngine,
+    PeerEntry,
+    Stats,
+    Transport,
+    format_peer_tag,
+    format_peers_csv,
+    pick_fanout,
+}
 use super::dispatch::{UdpState, handle_packet, send_datagram}
 use super::swim::SwimState
 use super::wire::{KIND_PING, encode_join, encode_ping_or_ack, encode_ping_req}
@@ -116,6 +127,18 @@ impl UdpEngine {
     }
 
     pub fn publish(mut self, _ payload: MemSpan) -> bool uses (io: mut SocketIo) {
+        self.do_publish(payload)
+    }
+
+    pub fn poll_io(mut self) -> usize uses (sched: mut Scheduler, io: mut SocketIo) {
+        self.do_poll_io()
+    }
+
+    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+        self.do_stop()
+    }
+
+    fn do_publish(mut self, _ payload: MemSpan) -> bool uses (io: mut SocketIo) {
         var frame = MemBuffer::empty()
         if !self.state.base.prepare_publish(payload, mut frame) {
             return false
@@ -160,7 +183,7 @@ impl UdpEngine {
         sent
     }
 
-    pub fn poll_io(mut self) -> usize uses (sched: mut Scheduler, io: mut SocketIo) {
+    fn do_poll_io(mut self) -> usize uses (sched: mut Scheduler, io: mut SocketIo) {
         if let Option::Some(tid) = self.timer_id {
             if sched.take_timer_fired(tid) {
                 self.timer_id = Option::None
@@ -179,7 +202,7 @@ impl UdpEngine {
         delivered
     }
 
-    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+    fn do_stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
         if let Option::Some(tid) = self.timer_id {
             sched.cancel_timer(tid)
             self.timer_id = Option::None
@@ -374,6 +397,58 @@ impl UdpEngine {
             }
         }
         delivered
+    }
+}
+
+impl P2pEngine for UdpEngine {
+    uses E = (sched: mut Scheduler, io: mut SocketIo)
+
+    fn publish(mut self, _ payload: MemSpan) -> bool uses E {
+        self.do_publish(payload)
+    }
+
+    fn poll_io(mut self) -> usize uses E {
+        self.do_poll_io()
+    }
+
+    fn recv_with_peer(mut self, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<
+        Delivery,
+    > {
+        peer_out.clear()
+        self.state.base.recv(mut out)
+    }
+
+    fn peer_count(self) -> usize {
+        self.state.base.peer_count()
+    }
+
+    fn snapshot_peers(
+        self,
+        prefix: MemSpan,
+        last_ver: u64,
+        synced: bool,
+        _ csv_out: mut MemBuffer,
+    ) -> Option<(u64, usize)> {
+        let ver = self.state.base.book.version()
+        if synced && ver == last_ver {
+            return Option::None
+        }
+        let entries = self.state.base.peer_entries()
+        format_peers_csv(entries, prefix, mut csv_out)
+        Option::Some((ver, entries.len()))
+    }
+
+    fn write_local_peer_id(self, prefix: MemSpan, _ out: mut MemBuffer) {
+        out.clear()
+        format_peer_tag(self.state.base.self_tag, prefix, mut out)
+    }
+
+    fn needs_periodic_poll(self) -> bool {
+        false
+    }
+
+    fn stop(mut self) uses E {
+        self.do_stop()
     }
 }
 

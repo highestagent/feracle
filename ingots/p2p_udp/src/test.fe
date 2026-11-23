@@ -2,8 +2,82 @@ use std::net::{Net, SocketAddr}
 use std::time::Clock
 use coro::{Driver, LocalScheduler, Scheduler}
 use net_reactor::{NetDriver, NetPoller, SocketIo}
-use p2p::{GossipConfig, Transport}
+use p2p::{GossipConfig, P2pEngine, Transport}
 use super::{UdpConfig, UdpEngine, UdpTransport}
+
+fn exercise_three_p2p_engines<P: P2pEngine>(
+    a: mut P,
+    b: mut P,
+    c: mut P,
+    driver: mut NetDriver,
+    prefix: MemSpan,
+    payload: MemSpan,
+    expected_origin: u64,
+    expected_tag: MemSpan,
+)
+uses (P::E, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+{
+    assert!(!a.needs_periodic_poll())
+    var local_id = MemBuffer::empty()
+    a.write_local_peer_id(prefix, mut local_id)
+    assert!(local_id == expected_tag)
+
+    var step: usize = 0
+    while step < 50 && (a.peer_count() < 2 || b.peer_count() < 2 || c.peer_count() < 2) {
+        driver.begin_tick()
+        let _ = a.poll_io()
+        let _ = b.poll_io()
+        let _ = c.poll_io()
+        driver.wait()
+        step += 1
+    }
+    assert!(
+        a.peer_count() == 2 && b.peer_count() == 2 && c.peer_count() == 2,
+    )
+
+    var csv = MemBuffer::empty()
+    let (ver, count) = a.snapshot_peers(prefix, last_ver: 0, synced: false, mut csv).unwrap()
+    assert!(count == 2 && !csv.is_empty())
+    assert!(
+        a.snapshot_peers(prefix, last_ver: ver, synced: true, mut csv).is_none(),
+    )
+
+    assert!(a.publish(payload))
+    var got_b = false
+    var got_c = false
+    var buf = MemBuffer::empty()
+    var peer_buf = MemBuffer::empty()
+    var gstep: usize = 0
+    while gstep < 30 && (!got_b || !got_c) {
+        driver.begin_tick()
+        let _ = a.poll_io()
+        let _ = b.poll_io()
+        let _ = c.poll_io()
+        if !got_b {
+            if let Option::Some(d) = b.recv_with_peer(mut buf, mut peer_buf) {
+                assert!(
+                    d.origin == expected_origin && buf == payload && peer_buf.is_empty(),
+                )
+                got_b = true
+            }
+        }
+        if !got_c {
+            if let Option::Some(d) = c.recv_with_peer(mut buf, mut peer_buf) {
+                assert!(
+                    d.origin == expected_origin && buf == payload && peer_buf.is_empty(),
+                )
+                got_c = true
+            }
+        }
+        driver.wait()
+        gstep += 1
+    }
+    assert!(got_b && got_c)
+
+    a.stop()
+    b.stop()
+    c.stop()
+}
 
 fn pump_all(a: mut UdpTransport, b: mut UdpTransport, c: mut UdpTransport, steps: usize)
 uses (net: mut Net, clock: Clock)
@@ -246,48 +320,15 @@ fn test_udp_three_engines_shared_reactor() uses (net: mut Net, clock: Clock) {
         )
             .unwrap()
 
-        var step: usize = 0
-        while step < 50 && (a.peer_count() < 2 || b.peer_count() < 2 || c.peer_count() < 2) {
-            driver.begin_tick()
-            let _ = a.poll_io()
-            let _ = b.poll_io()
-            let _ = c.poll_io()
-            driver.wait()
-            step += 1
-        }
-        assert!(
-            a.peer_count() == 2 && b.peer_count() == 2 && c.peer_count() == 2,
+        exercise_three_p2p_engines(
+            mut a,
+            mut b,
+            mut c,
+            mut driver,
+            prefix: "fe-udp".span(),
+            payload: "shared-udp".span(),
+            expected_origin: 101,
+            expected_tag: "fe-udp-0000000000000065".span(),
         )
-
-        assert!(a.publish("shared-udp".span()))
-        var got_b = false
-        var got_c = false
-        var buf = MemBuffer::empty()
-        var gstep: usize = 0
-        while gstep < 30 && (!got_b || !got_c) {
-            driver.begin_tick()
-            let _ = a.poll_io()
-            let _ = b.poll_io()
-            let _ = c.poll_io()
-            if !got_b {
-                if let Option::Some(d) = b.recv(mut buf) {
-                    assert!(d.origin == 101 && buf == "shared-udp")
-                    got_b = true
-                }
-            }
-            if !got_c {
-                if let Option::Some(d) = c.recv(mut buf) {
-                    assert!(d.origin == 101 && buf == "shared-udp")
-                    got_c = true
-                }
-            }
-            driver.wait()
-            gstep += 1
-        }
-        assert!(got_b && got_c)
-
-        a.stop()
-        b.stop()
-        c.stop()
     }
 }

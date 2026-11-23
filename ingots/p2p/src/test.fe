@@ -24,6 +24,7 @@ use super::{
     encode_entries,
     encode_frame,
     encode_u16_frame,
+    count_csv_peers,
     format_peer_tag,
     format_peers_csv,
     frame_len,
@@ -259,6 +260,9 @@ fn test_gossip_core_u16_and_csv() uses (clock: Clock) {
         mut csv,
     )
     assert!(csv == "fe-udp-0000000000000001")
+    assert!(count_csv_peers(csv.span()) == 1)
+    assert!(count_csv_peers(" p1 , , p2 , ".span()) == 2)
+    assert!(count_csv_peers("".span()) == 0)
 
     var frame = MemBuffer::empty()
     assert!(core_a.prepare_publish("payload-1".span(), mut frame))

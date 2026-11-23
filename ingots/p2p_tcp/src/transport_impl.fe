@@ -2,7 +2,7 @@ use std::net::{Net, SocketAddr, Token}
 use std::time::Clock
 use coro::{Driver, LocalScheduler, Scheduler}
 use net_reactor::{IoEvent, NetDriver, NetPoller, SocketIo}
-use p2p::{Delivery, PeerEntry, Stats, Transport}
+use p2p::{Delivery, P2pEngine, PeerEntry, Stats, Transport, format_peer_tag, format_peers_csv}
 use super::mesh::{close_peer, queue_to_peer}
 use super::transport::{TcpEngine, TcpTransport}
 use super::wire::{KIND_PING, encode_pex, encode_ping_or_pong}
@@ -123,6 +123,22 @@ impl TcpEngine {
     pub fn publish(mut self, _ payload: MemSpan) -> bool
     uses (sched: mut Scheduler, io: mut SocketIo)
     {
+        self.do_publish(payload)
+    }
+
+    pub fn poll_io(mut self) -> usize
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        self.do_poll_io()
+    }
+
+    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+        self.do_stop()
+    }
+
+    fn do_publish(mut self, _ payload: MemSpan) -> bool
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
         let now_ms = sched.now_ms()
         var frame = MemBuffer::empty()
         if !self.state.base.prepare_publish(payload, mut frame) {
@@ -164,7 +180,7 @@ impl TcpEngine {
         sent
     }
 
-    pub fn poll_io(mut self) -> usize
+    fn do_poll_io(mut self) -> usize
     uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
     {
         if let Option::Some(tid) = self.timer_id {
@@ -196,7 +212,7 @@ impl TcpEngine {
         }
     }
 
-    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+    fn do_stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
         if let Option::Some(tid) = self.timer_id {
             sched.cancel_timer(tid)
             self.timer_id = Option::None
@@ -250,6 +266,58 @@ impl TcpEngine {
         }
         self.timer_id = Option::Some(sched.schedule_after(self.owner, delay_ms: delay))
         self.timer_deadline_ms = Option::Some(target_deadline)
+    }
+}
+
+impl P2pEngine for TcpEngine {
+    uses E = (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+
+    fn publish(mut self, _ payload: MemSpan) -> bool uses E {
+        self.do_publish(payload)
+    }
+
+    fn poll_io(mut self) -> usize uses E {
+        self.do_poll_io()
+    }
+
+    fn recv_with_peer(mut self, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<
+        Delivery,
+    > {
+        peer_out.clear()
+        self.state.base.recv(mut out)
+    }
+
+    fn peer_count(self) -> usize {
+        self.state.base.peer_count()
+    }
+
+    fn snapshot_peers(
+        self,
+        prefix: MemSpan,
+        last_ver: u64,
+        synced: bool,
+        _ csv_out: mut MemBuffer,
+    ) -> Option<(u64, usize)> {
+        let ver = self.state.base.book.version()
+        if synced && ver == last_ver {
+            return Option::None
+        }
+        let entries = self.state.base.peer_entries()
+        format_peers_csv(entries, prefix, mut csv_out)
+        Option::Some((ver, entries.len()))
+    }
+
+    fn write_local_peer_id(self, prefix: MemSpan, _ out: mut MemBuffer) {
+        out.clear()
+        format_peer_tag(self.state.base.self_tag, prefix, mut out)
+    }
+
+    fn needs_periodic_poll(self) -> bool {
+        false
+    }
+
+    fn stop(mut self) uses E {
+        self.do_stop()
     }
 }
 

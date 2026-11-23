@@ -23,7 +23,7 @@ pub use inbox::Inbox
 pub use peer_entry::{PEER_ENTRY_LEN, PeerEntry, decode_entries, encode_entries, normalize_addr}
 pub use peers::{Liveness, Peer, PeerBook}
 pub use rng::Rng
-pub use seeds::{format_peer_tag, format_peers_csv, make_ephemeral_tag, parse_seeds}
+pub use seeds::{count_csv_peers, format_peer_tag, format_peers_csv, make_ephemeral_tag, parse_seeds}
 pub use seen::SeenCache
 pub use timer::{Backoff, MonoClock, Ticker}
-pub use transport::{Delivery, GossipConfig, Stats, Transport, pick_fanout}
+pub use transport::{Delivery, GossipConfig, P2pEngine, Stats, Transport, pick_fanout}

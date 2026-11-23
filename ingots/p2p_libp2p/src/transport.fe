@@ -4,7 +4,7 @@ use core::num::IntDowncast
 use core::ops::Drop
 use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr}
 use std::time::Clock
-use p2p::{Delivery, PeerEntry, Stats, Transport}
+use p2p::{Delivery, P2pEngine, PeerEntry, Stats, Transport, count_csv_peers, format_peer_tag}
 use super::ffi
 
 pub struct Libp2pConfig { pub listen_port: u16, pub self_tag: u64, pub bootstrap: MemBuffer }
@@ -47,6 +47,45 @@ impl Libp2pTransport {
     }
 
     pub fn stop(mut self) {
+        self.do_stop()
+    }
+
+    fn do_publish(mut self, _ payload: MemSpan) -> bool {
+        if ffi::publish(payload) == 0 {
+            self.stats.frames_tx += 1
+            self.stats.data_tx += 1
+            true
+        } else {
+            false
+        }
+    }
+
+    fn do_recv_with_peer(mut self, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<
+        Delivery,
+    > {
+        let (rc, origin) = ffi::poll_with_peer(mut out, mut peer_out)
+        if rc > 0 {
+            self.rx_seq += 1
+            self.stats.frames_rx += 1
+            self.stats.data_rx += 1
+            Option::Some(
+                Delivery { origin, seq: self.rx_seq, from: self.local_addr },
+            )
+        } else {
+            Option::None
+        }
+    }
+
+    fn do_peer_count(self) -> usize {
+        let count = ffi::peer_count()
+        if count > 0 {
+            count.downcast_unchecked()
+        } else {
+            0
+        }
+    }
+
+    fn do_stop(mut self) {
         if self.active {
             self.active = false
             let _ = ffi::stop()
@@ -66,17 +105,64 @@ impl Libp2pTransport {
     pub fn recv_with_peer(mut self, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<
         Delivery,
     > {
-        let (rc, origin) = ffi::poll_with_peer(mut out, mut peer_out)
-        if rc > 0 {
-            self.rx_seq += 1
-            self.stats.frames_rx += 1
-            self.stats.data_rx += 1
-            Option::Some(
-                Delivery { origin, seq: self.rx_seq, from: self.local_addr },
-            )
-        } else {
-            Option::None
+        self.do_recv_with_peer(mut out, mut peer_out)
+    }
+}
+
+impl P2pEngine for Libp2pTransport {
+    uses E = ()
+
+    fn publish(mut self, _ payload: MemSpan) -> bool uses E {
+        self.do_publish(payload)
+    }
+
+    fn poll_io(mut self) -> usize uses E {
+        0
+    }
+
+    fn recv_with_peer(mut self, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<
+        Delivery,
+    > {
+        self.do_recv_with_peer(mut out, mut peer_out)
+    }
+
+    fn peer_count(self) -> usize {
+        self.do_peer_count()
+    }
+
+    fn snapshot_peers(
+        self,
+        prefix: MemSpan,
+        last_ver: u64,
+        synced: bool,
+        _ csv_out: mut MemBuffer,
+    ) -> Option<(u64, usize)> {
+        let _ = prefix
+        let (ver, csv) = ffi::peers_csv()
+        if synced && ver == last_ver {
+            return Option::None
         }
+        csv_out.clear()
+        csv_out.extend_from(csv.span())
+        Option::Some((ver, count_csv_peers(csv_out.span())))
+    }
+
+    fn write_local_peer_id(self, prefix: MemSpan, _ out: mut MemBuffer) {
+        let id = ffi::local_peer_id()
+        out.clear()
+        if !id.is_empty() {
+            out.extend_from(id.span())
+        } else {
+            format_peer_tag(self.self_tag, prefix, mut out)
+        }
+    }
+
+    fn needs_periodic_poll(self) -> bool {
+        true
+    }
+
+    fn stop(mut self) uses E {
+        self.do_stop()
     }
 }
 
@@ -92,13 +178,7 @@ impl Transport for Libp2pTransport {
     fn publish(mut self, _ payload: MemSpan) -> bool
     uses (net: mut Net, clock: Clock)
     {
-        if ffi::publish(payload) == 0 {
-            self.stats.frames_tx += 1
-            self.stats.data_tx += 1
-            true
-        } else {
-            false
-        }
+        self.do_publish(payload)
     }
 
     fn poll(mut self, timeout_ms: u64) -> usize uses (net: mut Net, clock: Clock) {
@@ -110,16 +190,11 @@ impl Transport for Libp2pTransport {
 
     fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
         var peer_tmp = MemBuffer::empty()
-        self.recv_with_peer(mut out, mut peer_tmp)
+        self.do_recv_with_peer(mut out, mut peer_tmp)
     }
 
     fn peer_count(self) -> usize {
-        let count = ffi::peer_count()
-        if count > 0 {
-            count.downcast_unchecked()
-        } else {
-            0
-        }
+        self.do_peer_count()
     }
 
     fn peer_entries(self) -> MemVec<PeerEntry> {

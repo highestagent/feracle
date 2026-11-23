@@ -67,6 +67,26 @@ impl GossipConfig {
     }
 }
 
+/// Effect-polymorphic reactor-driven P2P engine interface implemented by
+/// `Libp2pTransport`, `TcpEngine`, and `UdpEngine`.
+pub trait P2pEngine {
+    uses E
+    fn publish(mut self, _ payload: MemSpan) -> bool uses E
+    fn poll_io(mut self) -> usize uses E
+    fn recv_with_peer(mut self, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<Delivery>
+    fn peer_count(self) -> usize
+    fn snapshot_peers(
+        self,
+        prefix: MemSpan,
+        last_ver: u64,
+        synced: bool,
+        _ csv_out: mut MemBuffer,
+    ) -> Option<(u64, usize)>
+    fn write_local_peer_id(self, prefix: MemSpan, _ out: mut MemBuffer)
+    fn needs_periodic_poll(self) -> bool
+    fn stop(mut self) uses E
+}
+
 /// Common non-blocking gossip transport interface implemented by `p2p_udp` and `p2p_tcp`.
 pub trait Transport {
     fn local_addr(self) -> SocketAddr

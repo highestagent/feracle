@@ -2,16 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr}
 use std::time::Clock
 use coro::Scheduler
 use net_reactor::SocketIo
-use p2p::{
-    Delivery,
-    GossipConfig,
-    PeerEntry,
-    Transport,
-    format_peer_tag,
-    format_peers_csv,
-    make_ephemeral_tag,
-    parse_seeds,
-}
+use p2p::{Delivery, GossipConfig, P2pEngine, format_peer_tag, make_ephemeral_tag, parse_seeds}
 use p2p_libp2p::{Libp2pConfig, Libp2pTransport}
 use p2p_tcp::{TcpConfig, TcpEngine}
 use p2p_udp::{UdpConfig, UdpEngine}
@@ -43,58 +34,67 @@ fn oracle_gossip_config() -> GossipConfig {
     cfg
 }
 
-fn publish_libp2p(_ t: mut Libp2pTransport, _ data: MemSpan) -> bool
-uses (net: mut Net, clock: Clock)
-{
-    t.publish(data)
-}
-
-fn recv_libp2p_with_peer(
-    _ t: mut Libp2pTransport,
-    _ out: mut MemBuffer,
-    _ peer_out: mut MemBuffer,
-) -> Option<Delivery> {
-    t.recv_with_peer(mut out, mut peer_out)
-}
-
-fn peer_count_libp2p(_ t: Libp2pTransport) -> usize {
-    t.peer_count()
-}
-
-fn local_peer_id_libp2p(_ t: Libp2pTransport) -> MemBuffer {
-    t.local_peer_id()
-}
-
-fn peers_snapshot_libp2p(_ t: Libp2pTransport) -> (u64, MemBuffer) {
-    t.peers_snapshot()
-}
-
-fn count_csv_peers(_ csv: MemSpan) -> usize {
-    var count: usize = 0
-    for part in csv.split(b',') {
-        if !part.trim().is_empty() {
-            count += 1
-        }
+pub fn backend_label(_ backend: PeerBackend) -> MemBuffer {
+    match backend {
+        PeerBackend::Libp2p => format!("libp2p"),
+        PeerBackend::Tcp => format!("fe-tcp"),
+        PeerBackend::Udp => format!("fe-udp"),
     }
-    count
+}
+
+fn engine_publish<P: P2pEngine>(_ e: mut P, _ data: MemSpan) -> bool
+uses P::E
+{
+    e.publish(data)
+}
+
+fn engine_poll_io<P: P2pEngine>(_ e: mut P) -> usize uses P::E {
+    e.poll_io()
+}
+
+fn engine_recv<P: P2pEngine>(_ e: mut P, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<
+    Delivery,
+> {
+    e.recv_with_peer(mut out, mut peer_out)
+}
+
+fn engine_snapshot_peers<P: P2pEngine>(
+    _ e: P,
+    prefix: MemSpan,
+    last_ver: u64,
+    synced: bool,
+    _ csv_out: mut MemBuffer,
+) -> Option<(u64, usize)> {
+    e.snapshot_peers(prefix, last_ver, synced, mut csv_out)
+}
+
+fn engine_local_peer_id<P: P2pEngine>(_ e: P, prefix: MemSpan, _ out: mut MemBuffer) {
+    e.write_local_peer_id(prefix: prefix, mut out)
+}
+
+fn engine_peer_count<P: P2pEngine>(_ e: P) -> usize {
+    e.peer_count()
+}
+
+fn engine_needs_periodic_poll<P: P2pEngine>(_ e: P) -> bool {
+    e.needs_periodic_poll()
+}
+
+fn engine_stop<P: P2pEngine>(_ e: mut P) uses P::E {
+    e.stop()
 }
 
 impl PeerSession {
     pub fn backend_label(_ backend: PeerBackend) -> MemBuffer {
-        match backend {
-            PeerBackend::Libp2p => format!("libp2p"),
-            PeerBackend::Tcp => format!("fe-tcp"),
-            PeerBackend::Udp => format!("fe-udp"),
-        }
+        super::network::backend_label(backend)
     }
 
     pub fn start(config: NodeConfig) -> Result<MemBuffer, Self>
     uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
     {
         let self_tag = make_ephemeral_tag(node_id: config.node_id, listen_port: config.p2p_port)
-        let prefix = Self::backend_label(config.p2p_backend)
+        let prefix = backend_label(config.p2p_backend)
         var peer_id = MemBuffer::empty()
-        format_peer_tag(self_tag, prefix: prefix.span(), mut peer_id)
 
         let inner = match config.p2p_backend {
             PeerBackend::Libp2p => {
@@ -106,10 +106,7 @@ impl PeerSession {
                     },
                 ) {
                     Result::Ok(l) => {
-                        let libp2p_id = local_peer_id_libp2p(l)
-                        if !libp2p_id.is_empty() {
-                            peer_id = libp2p_id
-                        }
+                        engine_local_peer_id(l, prefix: prefix.span(), mut peer_id)
                         EngineInner::Libp2p(l)
                     },
                     Result::Err(rc) => {
@@ -128,7 +125,10 @@ impl PeerSession {
                     TcpConfig { bind_addr, self_tag, seeds, gossip: oracle_gossip_config() },
                     owner,
                 ) {
-                    Result::Ok(t) => EngineInner::Tcp(t),
+                    Result::Ok(t) => {
+                        engine_local_peer_id(t, prefix: prefix.span(), mut peer_id)
+                        EngineInner::Tcp(t)
+                    },
                     Result::Err(err) => {
                         return Result::Err(format!("tcp bind failed: ", err.kind()))
                     },
@@ -151,7 +151,10 @@ impl PeerSession {
                     },
                     owner,
                 ) {
-                    Result::Ok(u) => EngineInner::Udp(u),
+                    Result::Ok(u) => {
+                        engine_local_peer_id(u, prefix: prefix.span(), mut peer_id)
+                        EngineInner::Udp(u)
+                    },
                     Result::Err(err) => {
                         return Result::Err(format!("udp bind failed: ", err.kind()))
                     },
@@ -170,8 +173,9 @@ impl PeerSession {
 
     pub fn needs_periodic_poll(self) -> bool {
         match self.inner {
-            EngineInner::Libp2p(_) => true,
-            _ => false,
+            EngineInner::Libp2p(ref l) => engine_needs_periodic_poll(l),
+            EngineInner::Tcp(ref t) => engine_needs_periodic_poll(t),
+            EngineInner::Udp(ref u) => engine_needs_periodic_poll(u),
         }
     }
 
@@ -179,9 +183,9 @@ impl PeerSession {
     uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
     {
         let ok = match self.inner {
-            EngineInner::Libp2p(mut l) => publish_libp2p(mut l, data),
-            EngineInner::Tcp(mut t) => t.publish(data),
-            EngineInner::Udp(mut u) => u.publish(data),
+            EngineInner::Libp2p(mut l) => engine_publish(mut l, data),
+            EngineInner::Tcp(mut t) => engine_publish(mut t, data),
+            EngineInner::Udp(mut u) => engine_publish(mut u, data),
         }
         telemetry.record_frame(is_tx: true, peer: "local".span(), data)
         ok
@@ -190,54 +194,42 @@ impl PeerSession {
     pub fn poll_driver(mut self, _ telemetry: mut TelemetrySink)
     uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
     {
-        var entries_opt: Option<MemVec<PeerEntry>> = Option::None
-        var libp2p_snap: Option<(u64, MemBuffer)> = Option::None
-        var dirty_ver: Option<u64> = Option::None
-        let want_telemetry = telemetry.is_enabled()
-        match self.inner {
-            EngineInner::Libp2p(ref l) => {
-                if want_telemetry {
-                    libp2p_snap = Option::Some(peers_snapshot_libp2p(l))
-                }
-            },
-            EngineInner::Tcp(mut t) => {
-                let _ = t.poll_io()
-                if want_telemetry {
-                    let ver = t.peers_version()
-                    if !self.peers_synced || ver != self.last_peers_ver {
-                        dirty_ver = Option::Some(ver)
-                        entries_opt = Option::Some(t.peer_entries())
-                    }
-                }
-            },
-            EngineInner::Udp(mut u) => {
-                let _ = u.poll_io()
-                if want_telemetry {
-                    let ver = u.peers_version()
-                    if !self.peers_synced || ver != self.last_peers_ver {
-                        dirty_ver = Option::Some(ver)
-                        entries_opt = Option::Some(u.peer_entries())
-                    }
-                }
-            },
+        let _ = match self.inner {
+            EngineInner::Libp2p(mut l) => engine_poll_io(mut l),
+            EngineInner::Tcp(mut t) => engine_poll_io(mut t),
+            EngineInner::Udp(mut u) => engine_poll_io(mut u),
         }
-        if let Option::Some((ver, csv)) = libp2p_snap {
-            if !self.peers_synced || ver != self.last_peers_ver {
-                self.last_peers_ver = ver
-                self.peers_synced = true
-                let count = count_csv_peers(csv.span())
-                telemetry.update_peers(peer_count: count, peers_csv: csv.span())
-            }
+        if !telemetry.is_enabled() {
             return
         }
-        if let Option::Some(ver) = dirty_ver {
+        var csv = MemBuffer::empty()
+        let snap = match self.inner {
+            EngineInner::Libp2p(ref l) => engine_snapshot_peers(
+                l,
+                prefix: self.prefix.span(),
+                last_ver: self.last_peers_ver,
+                synced: self.peers_synced,
+                mut csv,
+            ),
+            EngineInner::Tcp(ref t) => engine_snapshot_peers(
+                t,
+                prefix: self.prefix.span(),
+                last_ver: self.last_peers_ver,
+                synced: self.peers_synced,
+                mut csv,
+            ),
+            EngineInner::Udp(ref u) => engine_snapshot_peers(
+                u,
+                prefix: self.prefix.span(),
+                last_ver: self.last_peers_ver,
+                synced: self.peers_synced,
+                mut csv,
+            ),
+        }
+        if let Option::Some((ver, count)) = snap {
             self.last_peers_ver = ver
             self.peers_synced = true
-            if let Option::Some(entries) = entries_opt {
-                var csv = MemBuffer::empty()
-                format_peers_csv(entries, prefix: self.prefix.span(), mut csv)
-                telemetry.update_peers(peer_count: entries.len(), peers_csv: csv.span())
-            }
+            telemetry.update_peers(peer_count: count, peers_csv: csv.span())
         }
     }
 
@@ -246,9 +238,9 @@ impl PeerSession {
     {
         var peer_tag = MemBuffer::empty()
         let delivery_opt = match self.inner {
-            EngineInner::Libp2p(mut l) => recv_libp2p_with_peer(mut l, mut out, mut peer_tag),
-            EngineInner::Tcp(mut t) => t.recv(mut out),
-            EngineInner::Udp(mut u) => u.recv(mut out),
+            EngineInner::Libp2p(mut l) => engine_recv(mut l, mut out, mut peer_tag),
+            EngineInner::Tcp(mut t) => engine_recv(mut t, mut out, mut peer_tag),
+            EngineInner::Udp(mut u) => engine_recv(mut u, mut out, mut peer_tag),
         }
         match delivery_opt {
             Option::Some(d) => {
@@ -264,17 +256,17 @@ impl PeerSession {
 
     pub fn peer_count(self) -> usize {
         match self.inner {
-            EngineInner::Libp2p(ref l) => peer_count_libp2p(l),
-            EngineInner::Tcp(ref t) => t.peer_count(),
-            EngineInner::Udp(ref u) => u.peer_count(),
+            EngineInner::Libp2p(ref l) => engine_peer_count(l),
+            EngineInner::Tcp(ref t) => engine_peer_count(t),
+            EngineInner::Udp(ref u) => engine_peer_count(u),
         }
     }
 
-    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+    pub fn stop(mut self) uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo) {
         match self.inner {
-            EngineInner::Libp2p(mut l) => l.stop(),
-            EngineInner::Tcp(mut t) => t.stop(),
-            EngineInner::Udp(mut u) => u.stop(),
+            EngineInner::Libp2p(mut l) => engine_stop(mut l),
+            EngineInner::Tcp(mut t) => engine_stop(mut t),
+            EngineInner::Udp(mut u) => engine_stop(mut u),
         }
     }
 }
