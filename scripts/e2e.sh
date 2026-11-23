@@ -197,6 +197,7 @@ for b in range(1, tip + 1):
             submit_txs.append(tx)
 
 assert len(submit_txs) == 2, f"expected 2 submitMedians txs, got {len(submit_txs)}"
+assert all(tx.get("type") == "0x2" for tx in submit_txs), f"expected EIP-1559 type 0x2 txs: {[tx.get('type') for tx in submit_txs]}"
 assert submit_txs[0]["from"].lower() == addr1.lower(), f"round 1 leader mismatch: {submit_txs[0]['from']}"
 assert submit_txs[1]["from"].lower() == addr2.lower(), f"round 2 leader mismatch: {submit_txs[1]['from']}"
 print(

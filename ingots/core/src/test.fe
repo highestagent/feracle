@@ -11,13 +11,17 @@ use super::{
     addr20_eq,
     all_prices_nonzero,
     asset_id_from_symbol,
+    bump_fee_wei,
     compare_addr20,
+    compute_eip1559_fees,
     decode_hex_bytes,
     decode_latest_prices_abi_hex,
     decode_quote,
     decode_quote_array,
     decode_sig_msg,
     decode_sig_msg_array,
+    encode_eip1559_signed_tx,
+    encode_eip1559_unsigned_tx,
     encode_eip155_signed_tx,
     encode_eip155_unsigned_tx,
     encode_prices_be160,
@@ -45,6 +49,7 @@ use super::{
     parse_abi_word_bool,
     parse_abi_word_u64,
     parse_decimal_1e8,
+    parse_fee_history_result,
     parse_fixed_hex,
     parse_hex_addr20,
     parse_hex_u128,
@@ -579,4 +584,125 @@ fn test_submit_medians_calldata_and_rlp_eip155() {
         mut raw_signed,
     )
     assert!(raw_signed[0] == 0xf9 && raw_signed.len() > 1000)
+
+    var eip1559_unsigned = MemBuffer::empty()
+    encode_eip1559_unsigned_tx(
+        chain_id: 31337,
+        nonce: 9,
+        max_priority_fee_per_gas: 1_000_000_000 as u128,
+        max_fee_per_gas: 20_000_000_000 as u128,
+        gas_limit: 21000,
+        to20: to_buf.span(),
+        calldata: MemBuffer::empty().span(),
+        mut eip1559_unsigned,
+    )
+    assert!(
+        eip1559_unsigned.len() == 44
+            && eip1559_unsigned[0] == 0x02
+            && eip1559_unsigned[1] == 0xea
+            && eip1559_unsigned[2] == 0x82
+            && eip1559_unsigned[3] == 0x7a
+            && eip1559_unsigned[4] == 0x69
+            && eip1559_unsigned[5] == 0x09
+            && eip1559_unsigned[6] == 0x84
+            && eip1559_unsigned[11] == 0x85
+            && eip1559_unsigned[17] == 0x82
+            && eip1559_unsigned[20] == 0x94
+            && eip1559_unsigned[41] == 0x80
+            && eip1559_unsigned[42] == 0x80
+            && eip1559_unsigned[43] == 0xc0,
+    )
+
+    var eip1559_signed_empty = MemBuffer::empty()
+    encode_eip1559_signed_tx(
+        chain_id: 31337,
+        nonce: 9,
+        max_priority_fee_per_gas: 1_000_000_000 as u128,
+        max_fee_per_gas: 20_000_000_000 as u128,
+        gas_limit: 21000,
+        to20: to_buf.span(),
+        calldata: MemBuffer::empty().span(),
+        y_parity: 0,
+        r: lead_zero_hi,
+        s: lead_zero_7f,
+        mut eip1559_signed_empty,
+    )
+    assert!(
+        eip1559_signed_empty.len() == 49
+            && eip1559_signed_empty[0] == 0x02
+            && eip1559_signed_empty[1] == 0xef
+            && eip1559_signed_empty[43] == 0xc0
+            && eip1559_signed_empty[44] == 0x80
+            && eip1559_signed_empty[45] == 0x82
+            && eip1559_signed_empty[48] == 0x7f,
+    )
+
+    var eip1559_signed_call = MemBuffer::empty()
+    encode_eip1559_signed_tx(
+        chain_id: 31337,
+        nonce: 9,
+        max_priority_fee_per_gas: 1_000_000_000 as u128,
+        max_fee_per_gas: 20_000_000_000 as u128,
+        gas_limit: 21000,
+        to20: to_buf.span(),
+        calldata: calldata.span(),
+        y_parity: 1,
+        r: lead_zero_hi,
+        s: lead_zero_7f,
+        mut eip1559_signed_call,
+    )
+    assert!(
+        eip1559_signed_call[0] == 0x02
+            && eip1559_signed_call[1] == 0xf9
+            && eip1559_signed_call.len() > 1000
+            && eip1559_signed_call[eip1559_signed_call.len() - 5] == 0x01,
+    )
+}
+
+#[test]
+fn test_eip1559_fee_history_and_bump_math() {
+    let fh_json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"oldestBlock\":\"0x1\",\"baseFeePerGas\":[\"0x3b9aca00\",\"0x77359400\"],\"gasUsedRatio\":[0.5],\"reward\":[[\"0x1dcd6500\"],[\"0x59682f00\"]]}}"
+        .span()
+    let (next_base, max_rew) = parse_fee_history_result(fh_json).unwrap()
+    assert!(
+        next_base == (2_000_000_000 as u128) && max_rew == (1_500_000_000 as u128),
+    )
+
+    let fh_no_reward = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"baseFeePerGas\":[\"0x3b9aca00\"]}}"
+        .span()
+    let (nb2, mr2) = parse_fee_history_result(fh_no_reward).unwrap()
+    assert!(nb2 == (1_000_000_000 as u128) && mr2 == (0 as u128))
+
+    assert!(
+        parse_fee_history_result(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601}}".span(),
+        )
+            .is_none(),
+    )
+    assert!(
+        parse_fee_history_result("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}".span()).is_none(),
+    )
+
+    let (prio, max_f) = compute_eip1559_fees(
+        next_base_fee: 2_000_000_000 as u128,
+        reward_tip: 1_500_000_000 as u128,
+        rpc_tip: 2_000_000_000 as u128,
+        min_priority_fee: 1_000_000_000 as u128,
+        min_max_fee: 2_000_000_000 as u128,
+    )
+    assert!(
+        prio == (2_000_000_000 as u128) && max_f == (6_000_000_000 as u128),
+    )
+
+    assert!(
+        bump_fee_wei(2_000_000_000 as u128, min_bump_wei: 500_000_000 as u128)
+            == (2_500_000_000 as u128),
+    )
+    assert!(
+        bump_fee_wei(100_000_000 as u128, min_bump_wei: 500_000_000 as u128)
+            == (600_000_000 as u128),
+    )
+    assert!(
+        bump_fee_wei(100 as u128, min_bump_wei: 0 as u128) == (125 as u128),
+    )
 }

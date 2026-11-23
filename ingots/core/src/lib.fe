@@ -72,8 +72,13 @@ pub use math::{
     worst_quote_deviation,
 }
 pub use rlp::{
+    bump_fee_wei,
+    compute_eip1559_fees,
+    encode_eip1559_signed_tx,
+    encode_eip1559_unsigned_tx,
     encode_eip155_signed_tx,
     encode_eip155_unsigned_tx,
+    parse_fee_history_result,
     rlp_encode_be32_uint,
     rlp_encode_bytes,
     rlp_encode_u128,

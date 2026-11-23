@@ -1,4 +1,6 @@
-use core::num::IntDowncast
+use core::num::{Bounded, IntDowncast}
+use super::hex::parse_hex_u128
+use super::json::{json_get_raw, json_next_array_elem}
 
 fn push_minimal_usize_be(_ value: usize, _ out: mut MemBuffer) {
     if value == 0 { return }
@@ -147,4 +149,186 @@ pub fn encode_eip155_signed_tx(
     rlp_encode_be32_uint(r, mut body)
     rlp_encode_be32_uint(s, mut body)
     rlp_wrap_list(body.span(), mut out)
+}
+
+fn push_eip1559_core_fields(
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+    gas_limit: u64,
+    to20: MemSpan,
+    calldata: MemSpan,
+    _ body: mut MemBuffer,
+) {
+    rlp_encode_u64(chain_id, mut body)
+    rlp_encode_u64(nonce, mut body)
+    rlp_encode_u128(max_priority_fee_per_gas, mut body)
+    rlp_encode_u128(max_fee_per_gas, mut body)
+    rlp_encode_u64(gas_limit, mut body)
+    rlp_encode_bytes(to20, mut body)
+    rlp_encode_u64(0, mut body)
+    rlp_encode_bytes(calldata, mut body)
+    // Empty accessList [] encodes as canonical 0xc0.
+    body.push(0xc0)
+}
+
+pub fn encode_eip1559_unsigned_tx(
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+    gas_limit: u64,
+    to20: MemSpan,
+    calldata: MemSpan,
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    out.push(0x02)
+    var body = MemBuffer::with_capacity(80 + calldata.len())
+    push_eip1559_core_fields(
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        to20,
+        calldata,
+        mut body,
+    )
+    rlp_wrap_list(body.span(), mut out)
+}
+
+pub fn encode_eip1559_signed_tx(
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+    gas_limit: u64,
+    to20: MemSpan,
+    calldata: MemSpan,
+    y_parity: u8,
+    r: [u8; 32],
+    s: [u8; 32],
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    out.push(0x02)
+    var body = MemBuffer::with_capacity(160 + calldata.len())
+    push_eip1559_core_fields(
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        to20,
+        calldata,
+        mut body,
+    )
+    rlp_encode_u64((y_parity & 1) as u64, mut body)
+    rlp_encode_be32_uint(r, mut body)
+    rlp_encode_be32_uint(s, mut body)
+    rlp_wrap_list(body.span(), mut out)
+}
+
+fn max_u128(_ a: u128, _ b: u128) -> u128 {
+    if a >= b { a } else { b }
+}
+
+fn sat_add_u128(_ a: u128, _ b: u128) -> u128 {
+    let m = u128::max()
+    if a > m - b { m } else { a + b }
+}
+
+fn sat_mul_u128(_ a: u128, _ b: u128) -> u128 {
+    if b == 0 { return 0 }
+    let m = u128::max()
+    if a > m / b { m } else { a * b }
+}
+
+fn parse_quoted_hex_u128(_ tok: MemSpan) -> Option<u128> {
+    let s = tok.trim()
+    if s.len() < 2 || s.byte_at(0) != b'"' || s.byte_at(s.len() - 1) != b'"' {
+        return Option::None
+    }
+    parse_hex_u128(s.slice(offset: 1, len: s.len() - 2))
+}
+
+/// Parses an `eth_feeHistory` JSON-RPC response into `(next_base_fee, max_reward_tip)`.
+pub fn parse_fee_history_result(_ resp_body: MemSpan) -> Option<(u128, u128)> {
+    if json_get_raw(resp_body, "error".span()).is_some() {
+        return Option::None
+    }
+    let (roff, rlen) = json_get_raw(resp_body, "result".span())?
+    let res = resp_body.slice(offset: roff, len: rlen).trim()
+    if res.is_empty() || res == "null" || res.byte_at(0) != b'{' {
+        return Option::None
+    }
+
+    let (boff, blen) = json_get_raw(res, "baseFeePerGas".span())?
+    let bf_arr = res.slice(offset: boff, len: blen).trim()
+    var bf_cursor: usize = 0
+    var saw_bf = false
+    var next_base: u128 = 0
+    while true {
+        let Option::Some((eoff, elen)) = json_next_array_elem(bf_arr, mut bf_cursor) else {
+            break
+        }
+        next_base = parse_quoted_hex_u128(bf_arr.slice(offset: eoff, len: elen))?
+        saw_bf = true
+    }
+    if !saw_bf {
+        return Option::None
+    }
+
+    var max_tip: u128 = 0
+    if let Option::Some((woff, wlen)) = json_get_raw(res, "reward".span()) {
+        let rew_arr = res.slice(offset: woff, len: wlen).trim()
+        var outer_cursor: usize = 0
+        while true {
+            let Option::Some((ooff, olen)) = json_next_array_elem(rew_arr, mut outer_cursor) else {
+                break
+            }
+            let inner = rew_arr.slice(offset: ooff, len: olen).trim()
+            var inner_cursor: usize = 0
+            if let Option::Some((ioff, ilen)) = json_next_array_elem(inner, mut inner_cursor) {
+                if let Option::Some(tip) = parse_quoted_hex_u128(
+                    inner.slice(offset: ioff, len: ilen),
+                ) {
+                    max_tip = max_u128(max_tip, tip)
+                }
+            }
+        }
+    }
+    Option::Some((next_base, max_tip))
+}
+
+pub fn compute_eip1559_fees(
+    next_base_fee: u128,
+    reward_tip: u128,
+    rpc_tip: u128,
+    min_priority_fee: u128,
+    min_max_fee: u128,
+) -> (u128, u128) {
+    let priority = max_u128(max_u128(reward_tip, rpc_tip), min_priority_fee)
+    let double_base = sat_mul_u128(next_base_fee, 2 as u128)
+    let candidate_max = sat_add_u128(double_base, priority)
+    let max_fee = max_u128(max_u128(candidate_max, min_max_fee), priority)
+    (priority, max_fee)
+}
+
+pub fn bump_fee_wei(_ fee: u128, min_bump_wei: u128) -> u128 {
+    let eff_min = if min_bump_wei > 0 {
+        min_bump_wei
+    } else {
+        1 as u128
+    }
+    let additive = sat_add_u128(fee, eff_min)
+    let q = fee / (100 as u128)
+    let r = fee % (100 as u128)
+    let pct = sat_add_u128(
+        sat_mul_u128(q, 125 as u128),
+        (r * (125 as u128)) / (100 as u128),
+    )
+    max_u128(pct, additive)
 }
