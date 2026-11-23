@@ -84,30 +84,31 @@ let config = with (Cli = matches) { load_config() }
     - `ingots/wasm/` reuses `feracle_core` to decode JSON-RPC batches and 21-word `latestPrices()` responses, parse off-chain `QuoteMsg`/`SigMsg` wire frames, flag leader failovers and `>100 bps` per-asset breaches, and render a live price-board TUI, JSON snapshot, and Prometheus metrics
     - `telemetry/host.mjs` streams EVM RPC receipts and `--telemetry-port` HTTP/SSE node events into `out/telemetry_wasm.wasm`, serving `/status` and `/metrics` via `--metrics-port`
 11. **`infra/` & `scripts/`**:
-    - `infra/mock_feeds.py` (`[Python 3]`): Local mock HTTP servers matching Hyperliquid, Binance, and Coinbase JSON schemas (with configurable `--outlier-port` fault injection)
-    - `infra/Caddyfile`: Optional local TLS proxy for live exchange feeds (`:9001`–`:9003`)
-    - `scripts/install.sh`, `scripts/build-feracle.sh`, `scripts/build-wasm.sh`, `scripts/e2e.sh`, `scripts/e2e-telemetry.sh`, `scripts/dev-telemetry.sh`
+    - `infra/Caddyfile`: Default loopback TLS reverse proxy (`127.0.0.1:9001`–`:9003`) forwarding live Hyperliquid, Binance (`data-api.binance.vision`), and Coinbase feeds for `feracle-demo` and `scripts/dev-telemetry.sh`
+    - `infra/mock_feeds.py` (`[Python 3]`): Deterministic local mock HTTP servers used for `--mock-feeds` offline runs and E2E outlier fault-injection suites (with `--outlier-port`)
+    - `scripts/ensure-deps.sh`, `scripts/install.sh`, `scripts/build-feracle.sh`, `scripts/build-wasm.sh`, `scripts/e2e.sh`, `scripts/e2e-telemetry.sh`, `scripts/dev-telemetry.sh`
 
 ## Quickstart (Prebuilt Binaries)
 
-Install `feracle`, `feracle-telemetry`, and the local devnet launcher (`feracle-demo`) into `~/.local/bin` (downloads the release archive for `linux-x86_64`, `linux-arm64`, or `darwin-arm64`, or falls back to building from source):
+Install `feracle`, `feracle-telemetry`, and the local devnet launcher (`feracle-demo`) into `~/.local/bin` (downloads the release archive for `linux-x86_64`, `linux-arm64`, or `darwin-arm64`, or falls back to building from source). Missing runtime dependencies (`anvil`/`cast`, `Node.js >= 20`, `caddy`) are installed automatically on first run or upfront with `--install-deps`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/highestagent/feracle/main/scripts/install.sh | bash
 ```
 
-Optional installer flags: `--prefix <DIR>`, `--version <TAG>`, `--archive <PATH>` (install a CI artifact tarball), and `--install-foundry`. Ensure `~/.local/bin` is on your `PATH`, then run:
+Optional installer flags: `--prefix <DIR>`, `--version <TAG>`, `--archive <PATH>` (install a CI artifact tarball), `--install-foundry`, and `--install-deps`. Ensure `~/.local/bin` is on your `PATH`, then run:
 
 ```bash
 feracle                      # print node CLI options (or pass flags to run)
-feracle-telemetry --help     # WASM telemetry collector options (requires Node.js >= 20)
-feracle-demo                 # local Anvil + 3 nodes + telemetry TUI (requires Foundry & Python 3)
+feracle-telemetry --help     # WASM telemetry collector options
+feracle-demo                 # local Anvil + 3 nodes + Caddy live feeds + telemetry TUI
 feracle-demo --backend udp   # switch P2P transport (libp2p | tcp | udp)
+feracle-demo --mock-feeds    # run offline with deterministic mock_feeds.py
 ```
 
 ## Build & Test
 
-**Prerequisites:** `fe` (auto-installed via `feup` by `scripts/install.sh` if absent), Rust `cargo`, and `Node.js >= 20` (plus Foundry and `python3` for E2E and local devnet runs).
+**Prerequisites:** Missing dependencies (`fe`, Rust `cargo`, Foundry, `Node.js >= 20`, `caddy`) are installed automatically when needed by `scripts/install.sh`, `feracle-demo`, `scripts/dev-telemetry.sh`, `scripts/e2e.sh`, and `scripts/e2e-telemetry.sh` (or via `scripts/ensure-deps.sh`). `python3` is only needed for `--mock-feeds` or the E2E suites.
 
 ### Build from source
 
@@ -147,7 +148,7 @@ cargo test --manifest-path p2p-shim/Cargo.toml
 ### End-to-end & local devnet
 
 ```bash
-# Consensus & telemetry E2E suites across all 3 P2P backends
+# Consensus & telemetry E2E suites across all 3 P2P backends (uses deterministic mock feeds)
 ./scripts/e2e.sh
 P2P_BACKEND=tcp ./scripts/e2e.sh
 P2P_BACKEND=udp ./scripts/e2e.sh
@@ -155,11 +156,13 @@ P2P_BACKEND=udp ./scripts/e2e.sh
 P2P_BACKEND=tcp ./scripts/e2e-telemetry.sh
 P2P_BACKEND=udp ./scripts/e2e-telemetry.sh
 
-# Interactive live devnet (Anvil + 3 nodes + WASM telemetry TUI)
+# Interactive live devnet (Anvil + 3 nodes + Caddy live feeds + WASM telemetry TUI)
 ./scripts/dev-telemetry.sh
+# Or run offline with deterministic mock feeds
+./scripts/dev-telemetry.sh --mock-feeds
 ```
 
-> **Optional live feeds:** To test against live Hyperliquid, Binance, and Coinbase endpoints instead of `infra/mock_feeds.py`, run `caddy run --config infra/Caddyfile` and point the nodes at `127.0.0.1:9001..9003` against a local `anvil` deployment.
+> **Live vs. mock feeds:** Live Hyperliquid, Binance (`data-api.binance.vision`), and Coinbase feeds via `infra/Caddyfile` are the default for `feracle-demo` and `scripts/dev-telemetry.sh`. `infra/mock_feeds.py` is only used when `--mock-feeds` is passed or inside the deterministic fault-injection E2E suites (`scripts/e2e.sh` and `scripts/e2e-telemetry.sh`).
 
 ## License
 
