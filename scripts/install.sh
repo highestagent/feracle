@@ -473,6 +473,38 @@ extract_and_install_archive() {
 try_download_release() {
   local target="$1"
   local out_archive="$2"
+  local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  if [[ -n "$token" ]]; then
+    local api_url rel_json asset_url
+    if [[ "$RELEASE_VERSION" == "latest" ]]; then
+      api_url="https://api.github.com/repos/$FERACLE_REPO/releases/latest"
+    else
+      api_url="https://api.github.com/repos/$FERACLE_REPO/releases/tags/${RELEASE_VERSION}"
+    fi
+    echo "Checking GitHub release API $api_url for feracle-${target}.tar.gz..."
+    rel_json="$(curl -fsSL \
+      -H "Authorization: Bearer $token" \
+      -H "Accept: application/vnd.github+json" \
+      "$api_url")" || return 1
+    asset_url="$(printf '%s' "$rel_json" | awk -v target="feracle-${target}.tar.gz" '
+      BEGIN { RS="{" }
+      $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\"" target "\"" {
+        if (match($0, /https:\/\/api\.github\.com\/repos\/[^"]+\/releases\/assets\/[0-9]+/)) {
+          print substr($0, RSTART, RLENGTH)
+          exit
+        }
+      }
+    ')"
+    [[ -n "$asset_url" ]] || return 1
+    echo "Downloading release asset feracle-${target}.tar.gz..."
+    curl -fsSL \
+      -H "Authorization: Bearer $token" \
+      -H "Accept: application/octet-stream" \
+      "$asset_url" \
+      -o "$out_archive"
+    return $?
+  fi
+
   local url
   if [[ "$RELEASE_VERSION" == "latest" ]]; then
     url="https://github.com/$FERACLE_REPO/releases/latest/download/feracle-${target}.tar.gz"
@@ -507,7 +539,7 @@ main() {
     archive_abs="$(abs_existing_file "$ARCHIVE_PATH")"
     extract_and_install_archive "$archive_abs" "$PREFIX" "$work_tmp"
   elif [[ "$MODE" == "auto" ]]; then
-    if local_repo="$(find_local_repo 2>/dev/null)"; then
+    if [[ "$RELEASE_VERSION" == "latest" ]] && local_repo="$(find_local_repo 2>/dev/null)"; then
       stage_from_source "$local_repo" "$work_tmp/stage"
       install_stage_dir "$work_tmp/stage" "$PREFIX"
     else

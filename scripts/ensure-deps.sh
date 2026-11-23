@@ -129,12 +129,73 @@ ensure_foundry() {
     echo "error: curl is required to install Foundry (anvil + cast)." >&2
     return 1
   }
-  echo "Installing Foundry (anvil + cast)..."
-  curl -fsSL https://foundry.paradigm.xyz | bash
+  feracle_detect_os_arch
+
+  local foundry_os="$FERACLE_OS"
+  local foundry_arch
+  case "$FERACLE_ARCH" in
+    arm64) foundry_arch="arm64" ;;
+    x86_64) foundry_arch="amd64" ;;
+  esac
+
+  local url_eff tag archive_name sha_name base_url
+  url_eff="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/foundry-rs/foundry/releases/latest)"
+  tag="${url_eff##*/}"
+  if [[ -z "$tag" || "$tag" == "$url_eff" ]]; then
+    echo "error: failed to resolve latest Foundry release tag from $url_eff" >&2
+    return 1
+  fi
+
+  archive_name="foundry_${tag}_${foundry_os}_${foundry_arch}.tar.gz"
+  sha_name="foundry_${tag}_${foundry_os}_${foundry_arch}.sha256"
+  base_url="https://github.com/foundry-rs/foundry/releases/download/${tag}"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  echo "Installing Foundry ${tag} (${foundry_os}_${foundry_arch}) into $HOME/.foundry/bin..."
+  if ! curl -fsSL "${base_url}/${archive_name}" -o "$tmp_dir/$archive_name"; then
+    rm -rf "$tmp_dir"
+    echo "error: failed to download Foundry archive ${base_url}/${archive_name}" >&2
+    return 1
+  fi
+  if ! curl -fsSL "${base_url}/${sha_name}" -o "$tmp_dir/$sha_name"; then
+    rm -rf "$tmp_dir"
+    echo "error: failed to download Foundry checksum ${base_url}/${sha_name}" >&2
+    return 1
+  fi
+
+  local expected_sha actual_sha=""
+  expected_sha="$(awk '{print $1}' "$tmp_dir/$sha_name" | head -n 1 || true)"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_sha="$(sha256sum "$tmp_dir/$archive_name" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_sha="$(shasum -a 256 "$tmp_dir/$archive_name" | awk '{print $1}')"
+  else
+    rm -rf "$tmp_dir"
+    echo "error: sha256sum or shasum is required to verify Foundry archive" >&2
+    return 1
+  fi
+  if [[ -z "$expected_sha" || "$actual_sha" != "$expected_sha" ]]; then
+    rm -rf "$tmp_dir"
+    echo "error: SHA-256 mismatch for $archive_name (expected $expected_sha, got $actual_sha)" >&2
+    return 1
+  fi
+
+  mkdir -p "$HOME/.foundry/bin"
+  if ! tar -xzf "$tmp_dir/$archive_name" -C "$HOME/.foundry/bin"; then
+    rm -rf "$tmp_dir"
+    echo "error: failed to extract $archive_name into $HOME/.foundry/bin" >&2
+    return 1
+  fi
+  chmod +x "$HOME/.foundry/bin"/* 2>/dev/null || true
+  if [[ "$FERACLE_OS" == "darwin" ]] && command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "$HOME/.foundry/bin"/* 2>/dev/null || true
+  fi
+  rm -rf "$tmp_dir"
+
   feracle_prepend_path "$HOME/.foundry/bin"
-  "$HOME/.foundry/bin/foundryup"
-  command -v anvil >/dev/null 2>&1 && command -v cast >/dev/null 2>&1 || {
-    echo "error: Foundry installation finished but anvil/cast are still not on PATH." >&2
+  anvil --version >/dev/null 2>&1 && cast --version >/dev/null 2>&1 || {
+    echo "error: Foundry installation completed but anvil/cast verification failed." >&2
     return 1
   }
 }
@@ -327,7 +388,7 @@ ensure_python3() {
   }
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-}" == "$0" ]]; then
   set -euo pipefail
   if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<'EOF'
