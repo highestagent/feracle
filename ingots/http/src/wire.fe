@@ -1,0 +1,181 @@
+const MAX_HTTP_BODY: usize = 1_048_576
+
+fn to_ascii_lower(_ b: u8) -> u8 {
+    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
+}
+
+fn hex_nibble(_ b: u8) -> Option<u8> {
+    if b >= b'0' && b <= b'9' {
+        Option::Some(b - b'0')
+    } else if b >= b'a' && b <= b'f' {
+        Option::Some(b - b'a' + 10)
+    } else if b >= b'A' && b <= b'F' {
+        Option::Some(b - b'A' + 10)
+    } else {
+        Option::None
+    }
+}
+
+pub fn starts_with_ignore_ascii_case(_ span: MemSpan, _ prefix: MemSpan) -> bool {
+    if span.len() < prefix.len() {
+        return false
+    }
+    var i: usize = 0
+    while i < prefix.len() {
+        if to_ascii_lower(span.byte_at(i)) != to_ascii_lower(prefix.byte_at(i)) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+pub fn contains_ignore_ascii_case(_ haystack: MemSpan, _ needle: MemSpan) -> bool {
+    if needle.len() == 0 {
+        return true
+    }
+    if haystack.len() < needle.len() {
+        return false
+    }
+    var start: usize = 0
+    let limit = haystack.len() - needle.len()
+    while start <= limit {
+        if starts_with_ignore_ascii_case(haystack.tail(start), needle) {
+            return true
+        }
+        start += 1
+    }
+    false
+}
+
+pub(ingot) enum ChunkedStatus {
+    NeedMore,
+    Complete(MemBuffer),
+    Invalid,
+}
+
+pub(ingot) fn decode_chunked_status(_ raw: MemSpan, eof: bool) -> ChunkedStatus {
+    var out = MemBuffer::empty()
+    var pos: usize = 0
+    while pos < raw.len() {
+        var line_end = pos
+        while line_end < raw.len() && raw.byte_at(line_end) != b'\n' {
+            line_end += 1
+        }
+        if line_end == raw.len() {
+            return ChunkedStatus::NeedMore
+        }
+        var size_end = line_end
+        if size_end > pos && raw.byte_at(size_end - 1) == b'\r' {
+            size_end -= 1
+        }
+        var chunk_len: usize = 0
+        var i = pos
+        var saw_digit = false
+        while i < size_end {
+            let b = raw.byte_at(i)
+            if b == b';' || b == b' ' {
+                break
+            }
+            let Option::Some(d) = hex_nibble(b) else {
+                return ChunkedStatus::Invalid
+            }
+            let nibble: usize = d as usize
+            saw_digit = true
+            chunk_len = chunk_len * 16 + nibble
+            if chunk_len > MAX_HTTP_BODY {
+                return ChunkedStatus::Invalid
+            }
+            i += 1
+        }
+        if !saw_digit {
+            return ChunkedStatus::Invalid
+        }
+        pos = line_end + 1
+        if chunk_len == 0 {
+            // Require the final CRLF/LF after the zero-length chunk unless EOF already closed.
+            if pos < raw.len() {
+                if raw.byte_at(pos) == b'\n' {
+                    return ChunkedStatus::Complete(out)
+                }
+                if pos + 1 < raw.len()
+                    && raw.byte_at(pos) == b'\r'
+                    && raw.byte_at(pos + 1) == b'\n' {
+                    return ChunkedStatus::Complete(out)
+                }
+                if raw.byte_at(pos) == b'\r' {
+                    return ChunkedStatus::NeedMore
+                }
+            }
+            if eof {
+                return ChunkedStatus::Complete(out)
+            }
+            return ChunkedStatus::NeedMore
+        }
+        if pos + chunk_len > raw.len() {
+            return ChunkedStatus::NeedMore
+        }
+        if out.len() + chunk_len > MAX_HTTP_BODY {
+            return ChunkedStatus::Invalid
+        }
+        out.extend_from(raw.slice(offset: pos, len: chunk_len))
+        pos += chunk_len
+        if pos >= raw.len() {
+            return ChunkedStatus::NeedMore
+        }
+        if raw.byte_at(pos) == b'\r' {
+            if pos + 1 >= raw.len() {
+                return ChunkedStatus::NeedMore
+            }
+            if raw.byte_at(pos + 1) != b'\n' {
+                return ChunkedStatus::Invalid
+            }
+            pos += 2
+        } else if raw.byte_at(pos) == b'\n' {
+            pos += 1
+        } else {
+            return ChunkedStatus::Invalid
+        }
+    }
+    ChunkedStatus::NeedMore
+}
+
+pub fn decode_chunked(_ raw: MemSpan) -> Option<MemBuffer> {
+    match decode_chunked_status(raw, eof: true) {
+        ChunkedStatus::Complete(buf) => Option::Some(buf),
+        _ => Option::None,
+    }
+}
+
+pub(ingot) fn parse_request_head(_ req: MemSpan) -> (MemBuffer, MemBuffer, MemBuffer) {
+    let line_end = match req.index_of(b'\n') {
+        Option::Some(idx) => idx,
+        Option::None => req.len(),
+    }
+    let first_line = req.head(line_end).trim()
+    var method = MemBuffer::new(0)
+    var raw_target = MemBuffer::from_span("/".span())
+    var tok_idx: usize = 0
+    for part in first_line.split(b' ') {
+        let trimmed = part.trim()
+        if trimmed.is_empty() {
+            continue
+        }
+        if tok_idx == 0 {
+            method = MemBuffer::from_span(trimmed)
+        } else if tok_idx == 1 {
+            raw_target = MemBuffer::from_span(trimmed)
+            break
+        }
+        tok_idx += 1
+    }
+    let target_span = raw_target.span()
+    match target_span.index_of(b'?') {
+        Option::Some(q) => {
+            let path = MemBuffer::from_span(target_span.head(q))
+            let query = MemBuffer::from_span(target_span.tail(q + 1))
+            (method, path, query)
+        },
+        Option::None => (method, raw_target, MemBuffer::empty()),
+    }
+}

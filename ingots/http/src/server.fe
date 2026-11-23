@@ -1,0 +1,572 @@
+use std::io::Error
+use std::net::{Interest, Net, SocketAddr, Token}
+use coro::{Scheduler, TaskId, TimerId}
+use net_reactor::{IoEvent, SocketIo, is_would_block}
+use super::wire::parse_request_head
+
+const MAX_REQ_BYTES: usize = 4096
+const REQ_TIMEOUT_MS: u64 = 2000
+const SSE_KEEPALIVE_MS: u64 = 10_000
+const MAX_SSE_OUTBOX: usize = 65_536
+const WRITE_CHUNK: usize = 8192
+
+enum ClientKind {
+    ReadingReq,
+    WritingOnce,
+    StreamingSse,
+}
+
+impl Copy for ClientKind {}
+
+struct ClientConn {
+    token: Token,
+    kind: ClientKind,
+    inbuf: MemBuffer,
+    outbuf: MemBuffer,
+    out_offset: usize,
+    want_writable: bool,
+    deadline_timer: Option<TimerId>,
+    keepalive_timer: Option<TimerId>,
+    lagged: bool,
+}
+
+pub struct HttpRequestEvent {
+    pub token: Token,
+    pub method: MemBuffer,
+    pub path: MemBuffer,
+    pub query: MemBuffer,
+}
+
+pub enum HttpEvent {
+    Request(HttpRequestEvent),
+    SseWritableAfterLag(Token),
+}
+
+pub struct HttpServer {
+    owner: TaskId,
+    listener_token: Token,
+    local_addr: SocketAddr,
+    clients: MemVec<ClientConn>,
+}
+
+fn find_client_idx(_ clients: MemVec<ClientConn>, _ token: Token) -> Option<usize> {
+    var i: usize = 0
+    while i < clients.len() {
+        if clients[i].token == token {
+            return Option::Some(i)
+        }
+        i += 1
+    }
+    Option::None
+}
+
+impl ClientConn {
+    fn has_pending_write(self) -> bool {
+        self.out_offset < self.outbuf.len()
+    }
+
+    fn pending_bytes(self) -> usize {
+        if self.outbuf.len() >= self.out_offset {
+            self.outbuf.len() - self.out_offset
+        } else {
+            0
+        }
+    }
+
+    fn compact_outbox(mut self) {
+        if self.out_offset == 0 {
+            return
+        }
+        let rem = self.outbuf.len() - self.out_offset
+        if rem > 0 {
+            self.outbuf.span().copy_within(source: self.out_offset, dest: 0, len: rem)
+        }
+        self.outbuf.truncate(rem)
+        self.out_offset = 0
+    }
+
+    fn flush(mut self) -> bool uses (io: mut SocketIo) {
+        while self.out_offset < self.outbuf.len() {
+            let rem = self.outbuf.len() - self.out_offset
+            let send_len = if rem > WRITE_CHUNK { WRITE_CHUNK } else { rem }
+            let chunk = MemBuffer::from_span(
+                self.outbuf.slice(offset: self.out_offset, len: send_len),
+            )
+            match io.stream_write(self.token, chunk.span()) {
+                Option::Some(Result::Ok(n)) => {
+                    if n == 0 { return false }
+                    self.out_offset += n
+                },
+                Option::Some(Result::Err(err)) => {
+                    if is_would_block(err) {
+                        return true
+                    }
+                    return false
+                },
+                Option::None => {
+                    return false
+                },
+            }
+        }
+        self.outbuf.clear()
+        self.out_offset = 0
+        true
+    }
+}
+
+impl HttpServer {
+    pub fn bind(_ addr: SocketAddr, owner: TaskId) -> Result<Error, Self>
+    uses (net: mut Net, io: mut SocketIo)
+    {
+        var listener = net.listen(addr)?
+        listener.set_nonblocking(true)?
+        let local_addr = listener.local_addr()?
+        let listener_token = io.register_tcp_listener(owner, tag: 0, listener)?
+        Result::Ok(
+            HttpServer { owner, listener_token, local_addr, clients: MemVec::new() },
+        )
+    }
+
+    pub fn local_addr(self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn has_sse_clients(self) -> bool {
+        var i: usize = 0
+        while i < self.clients.len() {
+            if let ClientKind::StreamingSse = self.clients[i].kind {
+                return true
+            }
+            i += 1
+        }
+        false
+    }
+
+    pub fn has_pending_writes(self) -> bool {
+        var i: usize = 0
+        while i < self.clients.len() {
+            if self.clients[i].has_pending_write() {
+                return true
+            }
+            i += 1
+        }
+        false
+    }
+
+    fn close_client(mut self, _ idx: usize)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        let tok = self.clients[idx].token
+        if let Option::Some(tid) = self.clients[idx].deadline_timer {
+            sched.cancel_timer(tid)
+        }
+        if let Option::Some(tid) = self.clients[idx].keepalive_timer {
+            sched.cancel_timer(tid)
+        }
+        io.deregister(tok)
+        let _ = self.clients.swap_remove(idx)
+    }
+
+    fn close_by_token(mut self, _ token: Token)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        if let Option::Some(idx) = find_client_idx(self.clients, token) {
+            self.close_client(idx)
+        }
+    }
+
+    fn sync_client_interest(mut self, _ idx: usize) uses (io: mut SocketIo) {
+        let tok = self.clients[idx].token
+        let next_writable = self.clients[idx].has_pending_write()
+        if next_writable == self.clients[idx].want_writable {
+            return
+        }
+        if let Option::Some(mut c) = self.clients.get(idx) {
+            c.want_writable = next_writable
+        }
+        let interest = if next_writable {
+            Interest::BOTH
+        } else {
+            Interest::READABLE
+        }
+        let _ = io.set_interest(tok, interest)
+    }
+
+    fn flush_or_close(mut self, _ idx: usize)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        var ok = false
+        if let Option::Some(mut c) = self.clients.get(idx) {
+            ok = c.flush()
+        }
+        if !ok {
+            self.close_client(idx)
+            return
+        }
+        if let ClientKind::WritingOnce = self.clients[idx].kind {
+            if !self.clients[idx].has_pending_write() {
+                self.close_client(idx)
+                return
+            }
+        }
+        self.sync_client_interest(idx)
+    }
+
+    pub fn respond(
+        mut self,
+        _ token: Token,
+        status_line: MemSpan,
+        content_type: MemSpan,
+        extra_headers: MemSpan,
+        body: MemSpan,
+    )
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        let Option::Some(idx) = find_client_idx(self.clients, token) else {
+            return
+        }
+        let hdr = format!(
+            "HTTP/1.1 ",
+            status_line,
+            "\r\nContent-Type: ",
+            content_type,
+            "\r\n",
+            extra_headers,
+            "Content-Length: ",
+            body.len(),
+            "\r\nConnection: close\r\n\r\n",
+        )
+        if let Option::Some(mut c) = self.clients.get(idx) {
+            c.kind = ClientKind::WritingOnce
+            c.outbuf.clear()
+            c.out_offset = 0
+            c.outbuf.extend_from(hdr.span())
+            c.outbuf.extend_from(body)
+            if let Option::Some(tid) = c.deadline_timer {
+                sched.cancel_timer(tid)
+                c.deadline_timer = Option::None
+            }
+        }
+        self.flush_or_close(idx)
+    }
+
+    pub fn respond_empty(mut self, _ token: Token, status_line: MemSpan, extra_headers: MemSpan)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        let Option::Some(idx) = find_client_idx(self.clients, token) else {
+            return
+        }
+        let hdr = format!(
+            "HTTP/1.1 ",
+            status_line,
+            "\r\n",
+            extra_headers,
+            "Connection: close\r\n\r\n",
+        )
+        if let Option::Some(mut c) = self.clients.get(idx) {
+            c.kind = ClientKind::WritingOnce
+            c.outbuf.clear()
+            c.out_offset = 0
+            c.outbuf.extend_from(hdr.span())
+            if let Option::Some(tid) = c.deadline_timer {
+                sched.cancel_timer(tid)
+                c.deadline_timer = Option::None
+            }
+        }
+        self.flush_or_close(idx)
+    }
+
+    pub fn upgrade_sse(mut self, _ token: Token, extra_headers: MemSpan, initial_data: MemSpan)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        let Option::Some(idx) = find_client_idx(self.clients, token) else {
+            return
+        }
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n",
+            extra_headers,
+            "Connection: close\r\n\r\n",
+        )
+        if let Option::Some(mut c) = self.clients.get(idx) {
+            c.kind = ClientKind::StreamingSse
+            c.outbuf.clear()
+            c.out_offset = 0
+            c.outbuf.extend_from(hdr.span())
+            if !initial_data.is_empty() {
+                c.outbuf.extend_from("data: ".span())
+                c.outbuf.extend_from(initial_data)
+                c.outbuf.extend_from("\n\n".span())
+            }
+            c.lagged = false
+            if let Option::Some(tid) = c.deadline_timer {
+                sched.cancel_timer(tid)
+                c.deadline_timer = Option::None
+            }
+            c.keepalive_timer = Option::Some(
+                sched.schedule_after(self.owner, delay_ms: SSE_KEEPALIVE_MS),
+            )
+        }
+        self.flush_or_close(idx)
+    }
+
+    pub fn send_sse_data(mut self, _ token: Token, data: MemSpan)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        let Option::Some(idx) = find_client_idx(self.clients, token) else {
+            return
+        }
+        self.queue_sse_bytes(
+            idx,
+            prefix: "data: ".span(),
+            payload: data,
+            suffix: "\n\n".span(),
+        )
+    }
+
+    fn queue_sse_bytes(mut self, _ idx: usize, prefix: MemSpan, payload: MemSpan, suffix: MemSpan)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        let frame_len = prefix.len() + payload.len() + suffix.len()
+        if frame_len > MAX_SSE_OUTBOX {
+            return
+        }
+        var overflow = false
+        if let Option::Some(mut c) = self.clients.get(idx) {
+            if c.pending_bytes() + frame_len > MAX_SSE_OUTBOX {
+                c.lagged = true
+                overflow = true
+            } else {
+                if c.outbuf.len() + frame_len > MAX_SSE_OUTBOX {
+                    c.compact_outbox()
+                }
+                c.outbuf.extend_from(prefix)
+                c.outbuf.extend_from(payload)
+                c.outbuf.extend_from(suffix)
+                c.lagged = false
+            }
+        }
+        if !overflow {
+            self.flush_or_close(idx)
+        }
+    }
+
+    pub fn broadcast_sse_data(mut self, _ data: MemSpan)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        var i: usize = 0
+        while i < self.clients.len() {
+            if let ClientKind::StreamingSse = self.clients[i].kind {
+                let tok = self.clients[i].token
+                self.queue_sse_bytes(
+                    i,
+                    prefix: "data: ".span(),
+                    payload: data,
+                    suffix: "\n\n".span(),
+                )
+                // If flush closed the client via swap_remove, avoid skipping the swapped-in element.
+                if i < self.clients.len() && self.clients[i].token == tok {
+                    i += 1
+                }
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    fn accept_all(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+        while true {
+            let pair = match io.listener_accept(self.listener_token) {
+                Option::Some(Result::Ok(p)) => p,
+                _ => {
+                    return
+                },
+            }
+            var stream = pair.0
+            if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
+                continue
+            }
+            let Result::Ok(tok) = io
+                .register_tcp_stream(
+                    owner: self.owner,
+                    tag: 1,
+                    stream,
+                    Interest::READABLE,
+                ) else {
+                continue
+            }
+            let deadline = sched.schedule_after(self.owner, delay_ms: REQ_TIMEOUT_MS)
+            self.clients
+                .push(
+                    ClientConn {
+                        token: tok,
+                        kind: ClientKind::ReadingReq,
+                        inbuf: MemBuffer::with_capacity(512),
+                        outbuf: MemBuffer::empty(),
+                        out_offset: 0,
+                        want_writable: false,
+                        deadline_timer: Option::Some(deadline),
+                        keepalive_timer: Option::None,
+                        lagged: false,
+                    },
+                )
+        }
+    }
+
+    fn handle_client_read(mut self, _ token: Token, _ events_out: mut MemVec<HttpEvent>)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        let Option::Some(idx) = find_client_idx(self.clients, token) else {
+            return
+        }
+        if let ClientKind::ReadingReq = self.clients[idx].kind {} else {
+            // Drain/detect EOF on open SSE or response sockets so closed peers clean up immediately.
+            var drain = MemBuffer::new(256)
+            var close_now = false
+            let slice = mut drain.span()
+            match io.stream_read(token, mut slice) {
+                Option::Some(Result::Ok(n)) => {
+                    if n == 0 { close_now = true }
+                },
+                Option::Some(Result::Err(err)) => {
+                    if !is_would_block(err) {
+                        close_now = true
+                    }
+                },
+                Option::None => close_now = true,
+            }
+            if close_now {
+                self.close_client(idx)
+            }
+            return
+        }
+
+        var tmp = MemBuffer::new(1024)
+        var done_req = false
+        var failed = false
+        if let Option::Some(mut c) = self.clients.get(idx) {
+            while c.inbuf.len() < MAX_REQ_BYTES {
+                let room = MAX_REQ_BYTES - c.inbuf.len()
+                let max_read = if room < 1024 { room } else { 1024 }
+                let slice = mut tmp.span().head(max_read)
+                match io.stream_read(token, mut slice) {
+                    Option::Some(Result::Ok(n)) => {
+                        if n == 0 {
+                            failed = true
+                            break
+                        }
+                        c.inbuf.extend_from(tmp.span().head(n))
+                        if c.inbuf.span().index_of("\r\n\r\n").is_some()
+                            || c.inbuf.span().index_of("\n\n").is_some() {
+                            done_req = true
+                            break
+                        }
+                    },
+                    Option::Some(Result::Err(err)) => {
+                        if is_would_block(err) {
+                            break
+                        }
+                        failed = true
+                        break
+                    },
+                    Option::None => {
+                        failed = true
+                        break
+                    },
+                }
+            }
+            if !done_req && !failed && c.inbuf.len() >= MAX_REQ_BYTES {
+                failed = true
+            }
+        }
+        if failed {
+            self.close_client(idx)
+            return
+        }
+        if !done_req { return }
+
+        let (method, path, query) = parse_request_head(self.clients[idx].inbuf.span())
+        events_out.push(
+                HttpEvent::Request(HttpRequestEvent { token, method, path, query }),
+            )
+    }
+
+    pub fn poll_io(mut self, _ events_out: mut MemVec<HttpEvent>)
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        events_out.clear()
+        var io_events = MemVec<IoEvent>::new()
+        io.take_events_for(self.owner, mut io_events)
+        var ei: usize = 0
+        while ei < io_events.len() {
+            let ev = io_events[ei]
+            if ev.token == self.listener_token {
+                self.accept_all()
+            } else {
+                if ev.writable {
+                    if let Option::Some(idx) = find_client_idx(self.clients, ev.token) {
+                        self.flush_or_close(idx)
+                    }
+                }
+                if ev.readable {
+                    self.handle_client_read(ev.token, mut events_out)
+                }
+                if ev.error || ev.hangup {
+                    self.close_by_token(ev.token)
+                }
+            }
+            ei += 1
+        }
+
+        // Handle request timeouts, SSE keepalives, and lagged SSE catchup notifications.
+        var ci: usize = 0
+        while ci < self.clients.len() {
+            let tok = self.clients[ci].token
+            var timed_out = false
+            if let Option::Some(tid) = self.clients[ci].deadline_timer {
+                if sched.take_timer_fired(tid) {
+                    timed_out = true
+                }
+            }
+            if timed_out {
+                self.close_client(ci)
+                continue
+            }
+
+            var keepalive_due = false
+            if let Option::Some(tid) = self.clients[ci].keepalive_timer {
+                if sched.take_timer_fired(tid) {
+                    keepalive_due = true
+                }
+            }
+            if keepalive_due {
+                if let Option::Some(mut c) = self.clients.get(ci) {
+                    c.keepalive_timer = Option::Some(
+                        sched.schedule_after(self.owner, delay_ms: SSE_KEEPALIVE_MS),
+                    )
+                }
+                self.queue_sse_bytes(
+                    ci,
+                    prefix: "".span(),
+                    payload: ": keepalive\n\n".span(),
+                    suffix: "".span(),
+                )
+                if ci >= self.clients.len() || self.clients[ci].token != tok {
+                    continue
+                }
+            }
+
+            if let ClientKind::StreamingSse = self.clients[ci].kind {
+                if self.clients[ci].lagged && !self.clients[ci].has_pending_write() {
+                    events_out.push(HttpEvent::SseWritableAfterLag(tok))
+                }
+            }
+            ci += 1
+        }
+    }
+
+    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+        sched.cancel_owner_timers(self.owner)
+        io.deregister_owner(self.owner)
+        self.clients.clear()
+    }
+}

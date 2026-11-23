@@ -1,0 +1,377 @@
+use core::num::IntDowncast
+use core::text::parse_uint
+use std::net::{Interest, Net, SocketAddr, Token}
+use coro::{Coroutine, Poll, Scheduler, TaskId, Timeout}
+use net_reactor::{SocketIo, is_would_block}
+use super::wire::{
+    ChunkedStatus,
+    contains_ignore_ascii_case,
+    decode_chunked_status,
+    starts_with_ignore_ascii_case,
+}
+
+const MAX_HEADER_LINE: usize = 65536
+const MAX_HEADER_BLOCK: usize = 262144
+const MAX_HTTP_BODY: usize = 1_048_576
+const READ_CHUNK: usize = 4096
+
+enum HttpState {
+    Connecting,
+    Writing,
+    Reading,
+    Failed,
+    Done,
+}
+
+impl Copy for HttpState {}
+
+pub struct HttpRequest {
+    request: MemBuffer,
+    sent: usize,
+    token: Option<Token>,
+    state: HttpState,
+    inbuf: MemBuffer,
+    header_end: Option<usize>,
+    content_len: Option<usize>,
+    is_chunked: bool,
+    headers_ok: bool,
+}
+
+impl HttpRequest {
+    pub fn start(owner: TaskId, addr: SocketAddr, request_bytes: MemSpan) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        var req = MemBuffer::from_span(request_bytes)
+        let stream = match net.connect_nonblocking(addr) {
+            Result::Ok(s) => s,
+            Result::Err(_) => {
+                sched.wake(owner)
+                return HttpRequest {
+                    request: req,
+                    sent: 0,
+                    token: Option::None,
+                    state: HttpState::Failed,
+                    inbuf: MemBuffer::empty(),
+                    header_end: Option::None,
+                    content_len: Option::None,
+                    is_chunked: false,
+                    headers_ok: false,
+                }
+            },
+        }
+        var s = stream
+        let _ = s.set_nodelay(true)
+        let tok = match io.register_tcp_stream(owner, tag: 0, s, Interest::BOTH) {
+            Result::Ok(t) => t,
+            Result::Err(_) => {
+                sched.wake(owner)
+                return HttpRequest {
+                    request: req,
+                    sent: 0,
+                    token: Option::None,
+                    state: HttpState::Failed,
+                    inbuf: MemBuffer::empty(),
+                    header_end: Option::None,
+                    content_len: Option::None,
+                    is_chunked: false,
+                    headers_ok: false,
+                }
+            },
+        }
+        HttpRequest {
+            request: req,
+            sent: 0,
+            token: Option::Some(tok),
+            state: HttpState::Connecting,
+            inbuf: MemBuffer::with_capacity(4096),
+            header_end: Option::None,
+            content_len: Option::None,
+            is_chunked: false,
+            headers_ok: false,
+        }
+    }
+
+    pub fn start_with_timeout(
+        owner: TaskId,
+        addr: SocketAddr,
+        request_bytes: MemSpan,
+        timeout_ms: u64,
+    ) -> Timeout<HttpRequest>
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        Timeout::new(
+            owner,
+            delay_ms: timeout_ms,
+            Self::start(owner, addr, request_bytes),
+        )
+    }
+
+    fn finish(mut self, _ res: own Option<MemBuffer>) -> Poll<Option<MemBuffer>>
+    uses (io: mut SocketIo)
+    {
+        self.cancel()
+        Poll::Ready(res)
+    }
+
+    fn parse_headers(mut self, _ header_len: usize) -> bool {
+        let hdr_span = self.inbuf.slice(offset: 0, len: header_len)
+        var pos: usize = 0
+        var first_line = true
+        while pos <= hdr_span.len() {
+            var line_end = pos
+            while line_end < hdr_span.len() && hdr_span.byte_at(line_end) != b'\n' {
+                line_end += 1
+            }
+            if line_end - pos > MAX_HEADER_LINE {
+                return false
+            }
+            let trimmed = hdr_span.slice(offset: pos, len: line_end - pos).trim()
+            if first_line {
+                first_line = false
+                if !trimmed.starts_with("HTTP/1.") {
+                    return false
+                }
+                if !contains_ignore_ascii_case(trimmed, " 200 ".span())
+                    && !trimmed.ends_with(" 200") {
+                    return false
+                }
+            } else if !trimmed.is_empty() {
+                if starts_with_ignore_ascii_case(trimmed, "content-length:".span()) {
+                    let val_span = trimmed.tail(15).trim()
+                    if let Option::Some(n) = parse_uint(val_span) {
+                        if let Option::Some(sz) = n.downcast() {
+                            self.content_len = Option::Some(sz)
+                        } else {
+                            return false
+                        }
+                    } else {
+                        return false
+                    }
+                } else if starts_with_ignore_ascii_case(trimmed, "transfer-encoding:".span()) {
+                    if contains_ignore_ascii_case(trimmed.tail(18), "chunked".span()) {
+                        self.is_chunked = true
+                    }
+                }
+            }
+            if line_end >= hdr_span.len() {
+                break
+            }
+            pos = line_end + 1
+        }
+        if let Option::Some(cl) = self.content_len {
+            if cl > MAX_HTTP_BODY {
+                return false
+            }
+        }
+        self.headers_ok = true
+        true
+    }
+
+    fn try_parse_complete(mut self, eof: bool) -> Option<Option<MemBuffer>> {
+        if self.header_end.is_none() {
+            let span = self.inbuf.span()
+            if let Option::Some(idx) = span.index_of("\r\n\r\n") {
+                if !self.parse_headers(idx) {
+                    return Option::Some(Option::None)
+                }
+                self.header_end = Option::Some(idx + 4)
+            } else if let Option::Some(idx) = span.index_of("\n\n") {
+                if !self.parse_headers(idx) {
+                    return Option::Some(Option::None)
+                }
+                self.header_end = Option::Some(idx + 2)
+            } else {
+                if span.len() > MAX_HEADER_BLOCK || eof {
+                    return Option::Some(Option::None)
+                }
+                return Option::None
+            }
+        }
+
+        let Option::Some(body_start) = self.header_end else {
+            return Option::None
+        }
+        let body_len = self.inbuf.len() - body_start
+        if let Option::Some(expected) = self.content_len {
+            if body_len >= expected {
+                let out = MemBuffer::from_span(self.inbuf.slice(offset: body_start, len: expected))
+                return Option::Some(Option::Some(out))
+            }
+            if eof {
+                return Option::Some(Option::None)
+            }
+            return Option::None
+        }
+
+        let body_span = self.inbuf.slice(offset: body_start, len: body_len)
+        if self.is_chunked {
+            match decode_chunked_status(body_span, eof) {
+                ChunkedStatus::Complete(decoded) => {
+                    return Option::Some(Option::Some(decoded))
+                },
+                ChunkedStatus::Invalid => {
+                    return Option::Some(Option::None)
+                },
+                ChunkedStatus::NeedMore => {
+                    if eof || body_len > MAX_HTTP_BODY + 65536 {
+                        return Option::Some(Option::None)
+                    }
+                    return Option::None
+                },
+            }
+        }
+
+        if body_len > MAX_HTTP_BODY {
+            return Option::Some(Option::None)
+        }
+        if eof {
+            return Option::Some(Option::Some(MemBuffer::from_span(body_span)))
+        }
+        Option::None
+    }
+
+    fn flush_request(mut self, tok: Token) -> bool uses (io: mut SocketIo) {
+        let total = self.request.len()
+        while self.sent < total {
+            let chunk = self.request.slice(offset: self.sent, len: total - self.sent)
+            match io.stream_write(tok, chunk) {
+                Option::Some(Result::Ok(n)) => {
+                    if n == 0 { return false }
+                    self.sent += n
+                },
+                Option::Some(Result::Err(err)) => {
+                    if is_would_block(err) {
+                        return true
+                    }
+                    return false
+                },
+                Option::None => {
+                    return false
+                },
+            }
+        }
+        true
+    }
+
+    fn drain_reading(mut self, tok: Token) -> Poll<Option<MemBuffer>>
+    uses (io: mut SocketIo)
+    {
+        var tmp = MemBuffer::new(READ_CHUNK)
+        var eof = false
+        while true {
+            let slice = mut tmp.span()
+            match io.stream_read(tok, mut slice) {
+                Option::Some(Result::Ok(n)) => {
+                    if n == 0 {
+                        eof = true
+                        break
+                    }
+                    self.inbuf.extend_from(tmp.span().head(n))
+                    if let Option::Some(done) = self.try_parse_complete(eof: false) {
+                        return self.finish(done)
+                    }
+                },
+                Option::Some(Result::Err(err)) => {
+                    if is_would_block(err) {
+                        break
+                    }
+                    return self.finish(Option::None)
+                },
+                Option::None => {
+                    return self.finish(Option::None)
+                },
+            }
+        }
+        if eof {
+            let done = match self.try_parse_complete(eof: true) {
+                Option::Some(res) => res,
+                Option::None => Option::None,
+            }
+            return self.finish(done)
+        }
+        Poll::Pending
+    }
+}
+
+impl Coroutine for HttpRequest {
+    type Output = Option<MemBuffer>
+    uses E = (io: mut SocketIo)
+
+    fn poll(mut self) -> Poll<Option<MemBuffer>> uses E {
+        match self.state {
+            HttpState::Failed => {
+                self.state = HttpState::Done
+                return Poll::Ready(Option::None)
+            },
+            HttpState::Done => {
+                return Poll::Ready(Option::None)
+            },
+            _ => {},
+        }
+
+        let Option::Some(tok) = self.token else {
+            return self.finish(Option::None)
+        }
+        let Option::Some(ev) = io.take_token_event(tok) else {
+            return Poll::Pending
+        }
+
+        if let HttpState::Connecting = self.state {
+            if !ev.writable && !ev.error && !ev.hangup {
+                return Poll::Pending
+            }
+            match io.stream_take_error(tok) {
+                Option::Some(Result::Ok(Option::None)) => {},
+                _ => {
+                    return self.finish(Option::None)
+                },
+            }
+            self.state = HttpState::Writing
+            if !self.flush_request(tok) {
+                return self.finish(Option::None)
+            }
+            if self.sent >= self.request.len() {
+                if io.set_interest(tok, Interest::READABLE).is_err() {
+                    return self.finish(Option::None)
+                }
+                self.state = HttpState::Reading
+                return self.drain_reading(tok)
+            }
+            return Poll::Pending
+        }
+
+        if let HttpState::Writing = self.state {
+            if ev.error || ev.hangup {
+                return self.finish(Option::None)
+            }
+            if ev.writable {
+                if !self.flush_request(tok) {
+                    return self.finish(Option::None)
+                }
+                if self.sent >= self.request.len() {
+                    if io.set_interest(tok, Interest::READABLE).is_err() {
+                        return self.finish(Option::None)
+                    }
+                    self.state = HttpState::Reading
+                    return self.drain_reading(tok)
+                }
+            }
+            return Poll::Pending
+        }
+
+        if let HttpState::Reading = self.state {
+            if ev.readable || ev.hangup || ev.error {
+                return self.drain_reading(tok)
+            }
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if let Option::Some(tok) = self.token {
+            io.deregister(tok)
+            self.token = Option::None
+        }
+        self.state = HttpState::Done
+    }
+}

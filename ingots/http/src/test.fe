@@ -1,0 +1,434 @@
+use std::net::{IpAddr, Ipv4Addr, Interest, Net, SocketAddr, Token}
+use std::time::Clock
+use coro::{Coroutine, JoinAll, LocalScheduler, Poll, Scheduler, Timeout, block_on}
+use net_reactor::{IoEvent, NetDriver, NetPoller, SocketIo}
+use super::{HttpEvent, HttpRequest, HttpServer, decode_chunked}
+
+#[test]
+fn test_http_request_join_all_chunked_and_timeout_cancel()
+uses (net: mut Net, clock: Clock)
+{
+    var sched = LocalScheduler::new(0)
+    var io = NetPoller::new().unwrap()
+    var driver = NetDriver::new(max_wait_ms: 20)
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+
+    with (Scheduler = sched, SocketIo = io) {
+        let srv_task = sched.alloc_task()
+        let cli_task = sched.alloc_task()
+
+        var listener = net.listen(lo).unwrap()
+        listener.set_nonblocking(true).unwrap()
+        let srv_addr = listener.local_addr().unwrap()
+        let l_tok = io.register_tcp_listener(owner: srv_task, tag: 1, listener).unwrap()
+
+        var reqs = MemVec<HttpRequest>::new()
+        var i: usize = 0
+        while i < 8 {
+            let path = if i == 6 {
+                format!("/chunked")
+            } else if i == 7 {
+                format!("/fail")
+            } else {
+                format!("/item/", i)
+            }
+            let raw = format!(
+                "GET ",
+                path,
+                " HTTP/1.1\r\nHost: ",
+                srv_addr,
+                "\r\nConnection: close\r\n\r\n",
+            )
+            reqs.push(
+                HttpRequest::start(
+                    owner: cli_task,
+                    addr: srv_addr,
+                    request_bytes: raw.span(),
+                ),
+            )
+            i += 1
+        }
+        var join = JoinAll::new(reqs)
+
+        var accepted_toks = MemVec<Token>::new()
+        var accepted_bufs = MemVec<MemBuffer>::new()
+        var srv_events = MemVec<IoEvent>::new()
+        var results: Option<MemVec<Option<MemBuffer>>> = Option::None
+        var ticks: usize = 0
+
+        while results.is_none() && ticks < 200 {
+            driver.begin_tick()
+            io.take_events_for(srv_task, mut srv_events)
+            var ei: usize = 0
+            while ei < srv_events.len() {
+                let ev = srv_events[ei]
+                if ev.token == l_tok {
+                    while true {
+                        match io.listener_accept(l_tok) {
+                            Option::Some(Result::Ok((var s, _))) => {
+                                let _ = s.set_nonblocking(true)
+                                let tok = io
+                                    .register_tcp_stream(
+                                        owner: srv_task,
+                                        tag: 2,
+                                        s,
+                                        Interest::READABLE,
+                                    )
+                                    .unwrap()
+                                accepted_toks.push(tok)
+                                accepted_bufs.push(MemBuffer::empty())
+                            },
+                            _ => {
+                                break
+                            },
+                        }
+                    }
+                } else {
+                    var ci: usize = 0
+                    while ci < accepted_toks.len() {
+                        if accepted_toks[ci] == ev.token {
+                            var tmp = MemBuffer::new(1024)
+                            if let Option::Some(Result::Ok(n)) = io.stream_read(
+                                ev.token,
+                                mut tmp.span(),
+                            ) {
+                                if n > 0 {
+                                    let buf = mut accepted_bufs[ci]
+                                    buf.extend_from(tmp.span().head(n))
+                                    if buf.span().index_of("\r\n\r\n").is_some() {
+                                        let resp = if buf.span().starts_with("GET /chunked ") {
+                                            format!(
+                                                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+                                            )
+                                        } else if buf.span().starts_with("GET /fail ") {
+                                            format!(
+                                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 3\r\n\r\nerr",
+                                            )
+                                        } else {
+                                            format!(
+                                                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                                            )
+                                        }
+                                        let _ = io.stream_write(ev.token, resp.span())
+                                        if !buf.span().starts_with("GET /chunked ") {
+                                            io.deregister(ev.token)
+                                        }
+                                    }
+                                }
+                            }
+                            break
+                        }
+                        ci += 1
+                    }
+                }
+                ei += 1
+            }
+
+            if let Poll::Ready(res) = join.poll() {
+                results = Option::Some(res)
+                break
+            }
+            driver.wait()
+            ticks += 1
+        }
+
+        let Option::Some(res_vec) = results else {
+            assert!(false, "expected JoinAll to complete")
+            return
+        }
+        assert!(res_vec.len() == 8)
+        var k: usize = 0
+        while k < 6 {
+            let Option::Some(ref b) = res_vec[k] else {
+                assert!(false, "missing ok body")
+                return
+            }
+            assert!(b == "ok")
+            k += 1
+        }
+        let Option::Some(ref b6) = res_vec[6] else {
+            assert!(false, "missing chunked body")
+            return
+        }
+        assert!(b6 == "hello world")
+        assert!(res_vec[7].is_none())
+        assert!(
+            decode_chunked("5\r\nhello\r\n0\r\n\r\n".span()).unwrap() == "hello",
+        )
+
+        if accepted_toks.len() > 6 {
+            io.deregister(accepted_toks[6])
+        }
+
+        var held = MemVec<std::net::TcpStream>::new()
+        var timeout_req = HttpRequest::start_with_timeout(
+            owner: cli_task,
+            addr: srv_addr,
+            request_bytes: "GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".span(),
+            timeout_ms: 40,
+        )
+        var timed_out = false
+        var t_steps: usize = 0
+        while t_steps < 50 {
+            driver.begin_tick()
+            io.take_events_for(srv_task, mut srv_events)
+            if !srv_events.is_empty() {
+                while true {
+                    match io.listener_accept(l_tok) {
+                        Option::Some(Result::Ok((s, _))) => held.push(s),
+                        _ => {
+                            break
+                        },
+                    }
+                }
+            }
+            if let Poll::Ready(res) = timeout_req.poll() {
+                assert!(res.is_none())
+                timed_out = true
+                break
+            }
+            driver.wait()
+            t_steps += 1
+        }
+        assert!(timed_out)
+
+        sched.cancel_owner_timers(srv_task)
+        sched.cancel_owner_timers(cli_task)
+        io.deregister_owner(srv_task)
+        io.deregister_owner(cli_task)
+    }
+}
+
+#[test]
+fn test_generic_http_server_routes_and_sse() uses (net: mut Net, clock: Clock) {
+    var sched = LocalScheduler::new(0)
+    var io = NetPoller::new().unwrap()
+    var driver = NetDriver::new(max_wait_ms: 20)
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+
+    with (Scheduler = sched, SocketIo = io) {
+        let srv_task = sched.alloc_task()
+        let cli_task = sched.alloc_task()
+        var srv = HttpServer::bind(lo, owner: srv_task).unwrap()
+        let srv_addr = srv.local_addr()
+
+        let hello_raw = format!("GET /hello?a=1 HTTP/1.1\r\nHost: ", srv_addr, "\r\n\r\n")
+        var hello_req = HttpRequest::start_with_timeout(
+            owner: cli_task,
+            addr: srv_addr,
+            request_bytes: hello_raw.span(),
+            timeout_ms: 2000,
+        )
+
+        var hello_body: Option<MemBuffer> = Option::None
+        var hello_done = false
+        var evs = MemVec<HttpEvent>::new()
+        var steps: usize = 0
+        while steps < 50 && !hello_done {
+            driver.begin_tick()
+            srv.poll_io(mut evs)
+            var ei: usize = 0
+            while ei < evs.len() {
+                if let HttpEvent::Request(ref req) = evs[ei] {
+                    if req.method == "GET" && req.path == "/hello" && req.query == "a=1" {
+                        srv.respond(
+                            req.token,
+                            status_line: "200 OK".span(),
+                            content_type: "application/json".span(),
+                            extra_headers: "Access-Control-Allow-Origin: *\r\n".span(),
+                            body: "{\"hi\":true}".span(),
+                        )
+                    }
+                }
+                ei += 1
+            }
+            if let Poll::Ready(r) = hello_req.poll() {
+                hello_done = true
+                if let Option::Some(inner) = r {
+                    hello_body = inner
+                }
+                break
+            }
+            driver.wait()
+            steps += 1
+        }
+        let body = hello_body.unwrap()
+        assert!(body == "{\"hi\":true}")
+
+        var opt_stream = net.connect_nonblocking(srv_addr).unwrap()
+        let _ = opt_stream.set_nodelay(true)
+        let opt_tok = io
+            .register_tcp_stream(owner: cli_task, tag: 10, opt_stream, Interest::BOTH)
+            .unwrap()
+
+        var bad_stream = net.connect_nonblocking(srv_addr).unwrap()
+        let _ = bad_stream.set_nodelay(true)
+        let bad_tok = io
+            .register_tcp_stream(owner: cli_task, tag: 11, bad_stream, Interest::BOTH)
+            .unwrap()
+
+        var sse_stream = net.connect_nonblocking(srv_addr).unwrap()
+        let _ = sse_stream.set_nodelay(true)
+        let sse_tok = io
+            .register_tcp_stream(owner: cli_task, tag: 12, sse_stream, Interest::BOTH)
+            .unwrap()
+
+        var opt_sent = false
+        var bad_sent = false
+        var sse_sent = false
+        var broadcast_sent = false
+        var opt_buf = MemBuffer::empty()
+        var bad_buf = MemBuffer::empty()
+        var sse_buf = MemBuffer::empty()
+        var cli_events = MemVec<IoEvent>::new()
+        var tmp = MemBuffer::new(1024)
+        var s_step: usize = 0
+
+        while s_step < 80 {
+            driver.begin_tick()
+            srv.poll_io(mut evs)
+            var ei: usize = 0
+            while ei < evs.len() {
+                match evs[ei] {
+                    HttpEvent::Request(ref req) => {
+                        if req.method == "OPTIONS" {
+                            srv.respond_empty(
+                                req.token,
+                                status_line: "204 No Content".span(),
+                                extra_headers: "Access-Control-Allow-Origin: *\r\n".span(),
+                            )
+                        } else if req.method == "GET" && req.path == "/stream" {
+                            srv.upgrade_sse(
+                                req.token,
+                                extra_headers: "Access-Control-Allow-Origin: *\r\n".span(),
+                                initial_data: "{\"init\":1}".span(),
+                            )
+                        } else {
+                            srv.respond(
+                                req.token,
+                                status_line: "404 Not Found".span(),
+                                content_type: "text/plain".span(),
+                                extra_headers: "".span(),
+                                body: "Not Found".span(),
+                            )
+                        }
+                    },
+                    HttpEvent::SseWritableAfterLag(tok) => {
+                        srv.send_sse_data(tok, data: "{\"catchup\":1}".span())
+                    },
+                }
+                ei += 1
+            }
+            if srv.has_sse_clients() && !broadcast_sent {
+                srv.broadcast_sse_data("{\"tick\":2}".span())
+                broadcast_sent = true
+            }
+
+            io.take_events_for(cli_task, mut cli_events)
+            var ci: usize = 0
+            while ci < cli_events.len() {
+                let ev = cli_events[ci]
+                if ev.token == opt_tok {
+                    if ev.writable && !opt_sent {
+                        if let Option::Some(Result::Ok(n)) = io.stream_write(
+                            opt_tok,
+                            "OPTIONS /hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".span(),
+                        ) {
+                            if n > 0 {
+                                opt_sent = true
+                                let _ = io.set_interest(opt_tok, Interest::READABLE)
+                            }
+                        }
+                    }
+                    if ev.readable {
+                        while true {
+                            let slice = mut tmp.span()
+                            match io.stream_read(opt_tok, mut slice) {
+                                Option::Some(Result::Ok(n)) => {
+                                    if n == 0 { break }
+                                    opt_buf.extend_from(tmp.span().head(n))
+                                },
+                                _ => {
+                                    break
+                                },
+                            }
+                        }
+                    }
+                } else if ev.token == bad_tok {
+                    if ev.writable && !bad_sent {
+                        if let Option::Some(Result::Ok(n)) = io.stream_write(
+                            bad_tok,
+                            "GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".span(),
+                        ) {
+                            if n > 0 {
+                                bad_sent = true
+                                let _ = io.set_interest(bad_tok, Interest::READABLE)
+                            }
+                        }
+                    }
+                    if ev.readable {
+                        while true {
+                            let slice = mut tmp.span()
+                            match io.stream_read(bad_tok, mut slice) {
+                                Option::Some(Result::Ok(n)) => {
+                                    if n == 0 { break }
+                                    bad_buf.extend_from(tmp.span().head(n))
+                                },
+                                _ => {
+                                    break
+                                },
+                            }
+                        }
+                    }
+                } else if ev.token == sse_tok {
+                    if ev.writable && !sse_sent {
+                        if let Option::Some(Result::Ok(n)) = io.stream_write(
+                            sse_tok,
+                            "GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".span(),
+                        ) {
+                            if n > 0 {
+                                sse_sent = true
+                                let _ = io.set_interest(sse_tok, Interest::READABLE)
+                            }
+                        }
+                    }
+                    if ev.readable {
+                        while true {
+                            let slice = mut tmp.span()
+                            match io.stream_read(sse_tok, mut slice) {
+                                Option::Some(Result::Ok(n)) => {
+                                    if n == 0 { break }
+                                    sse_buf.extend_from(tmp.span().head(n))
+                                },
+                                _ => {
+                                    break
+                                },
+                            }
+                        }
+                    }
+                }
+                ci += 1
+            }
+
+            if opt_buf.span().starts_with("HTTP/1.1 204")
+                && bad_buf.span().starts_with("HTTP/1.1 404")
+                && sse_buf.span().index_of("data: {\"tick\":2}\n\n").is_some() {
+                break
+            }
+            driver.wait()
+            s_step += 1
+        }
+
+        assert!(opt_buf.span().starts_with("HTTP/1.1 204"))
+        assert!(bad_buf.span().starts_with("HTTP/1.1 404"))
+        assert!(
+            sse_buf.span().index_of("data: {\"init\":1}\n\n").is_some(),
+        )
+        assert!(
+            sse_buf.span().index_of("data: {\"tick\":2}\n\n").is_some(),
+        )
+
+        io.deregister_owner(cli_task)
+        srv.stop()
+    }
+}

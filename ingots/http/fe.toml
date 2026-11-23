@@ -1,0 +1,7 @@
+[ingot]
+name = "http"
+version = "0.1.0"
+
+[dependencies]
+coro = { path = "../coro" }
+net_reactor = { path = "../net_reactor" }
