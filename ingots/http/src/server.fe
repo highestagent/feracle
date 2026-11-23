@@ -9,6 +9,7 @@ const REQ_TIMEOUT_MS: u64 = 2000
 const SSE_KEEPALIVE_MS: u64 = 10_000
 const MAX_SSE_OUTBOX: usize = 131_072
 const WRITE_CHUNK: usize = 8192
+const MAX_CLIENTS: usize = 64
 
 enum ClientKind {
     ReadingReq,
@@ -47,6 +48,8 @@ pub struct HttpServer {
     listener_token: Token,
     local_addr: SocketAddr,
     clients: MemVec<ClientConn>,
+    read_buf: MemBuffer,
+    io_events: MemVec<IoEvent>,
 }
 
 fn find_client_idx(_ clients: MemVec<ClientConn>, _ token: Token) -> Option<usize> {
@@ -89,10 +92,8 @@ impl ClientConn {
         while self.out_offset < self.outbuf.len() {
             let rem = self.outbuf.len() - self.out_offset
             let send_len = if rem > WRITE_CHUNK { WRITE_CHUNK } else { rem }
-            let chunk = MemBuffer::from_span(
-                self.outbuf.slice(offset: self.out_offset, len: send_len),
-            )
-            match io.stream_write(self.token, chunk.span()) {
+            let chunk = self.outbuf.slice(offset: self.out_offset, len: send_len)
+            match io.stream_write(self.token, chunk) {
                 Option::Some(Result::Ok(n)) => {
                     if n == 0 { return false }
                     self.out_offset += n
@@ -123,7 +124,14 @@ impl HttpServer {
         let local_addr = listener.local_addr()?
         let listener_token = io.register_tcp_listener(owner, tag: 0, listener)?
         Result::Ok(
-            HttpServer { owner, listener_token, local_addr, clients: MemVec::new() },
+            HttpServer {
+                owner,
+                listener_token,
+                local_addr,
+                clients: MemVec::new(),
+                read_buf: MemBuffer::new(4096),
+                io_events: MemVec::new(),
+            },
         )
     }
 
@@ -384,6 +392,10 @@ impl HttpServer {
                     return
                 },
             }
+            if self.clients.len() >= MAX_CLIENTS {
+                let _ = pair
+                continue
+            }
             var stream = pair.0
             if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
                 continue
@@ -423,9 +435,9 @@ impl HttpServer {
         }
         if let ClientKind::ReadingReq = self.clients[idx].kind {} else {
             // Drain/detect EOF on open SSE or response sockets so closed peers clean up immediately.
-            var drain = MemBuffer::new(256)
             var close_now = false
-            let slice = mut drain.span()
+            let rbuf = mut self.read_buf
+            let slice = mut rbuf.span().head(256)
             match io.stream_read(token, mut slice) {
                 Option::Some(Result::Ok(n)) => {
                     if n == 0 { close_now = true }
@@ -443,21 +455,21 @@ impl HttpServer {
             return false
         }
 
-        var tmp = MemBuffer::new(1024)
         var done_req = false
         var failed = false
+        let rbuf = mut self.read_buf
         if let Option::Some(mut c) = self.clients.get(idx) {
             while c.inbuf.len() < MAX_REQ_BYTES {
                 let room = MAX_REQ_BYTES - c.inbuf.len()
-                let max_read = if room < 1024 { room } else { 1024 }
-                let slice = mut tmp.span().head(max_read)
+                let max_read = if room < rbuf.len() { room } else { rbuf.len() }
+                let slice = mut rbuf.span().head(max_read)
                 match io.stream_read(token, mut slice) {
                     Option::Some(Result::Ok(n)) => {
                         if n == 0 {
                             failed = true
                             break
                         }
-                        c.inbuf.extend_from(tmp.span().head(n))
+                        c.inbuf.extend_from(rbuf.span().head(n))
                         if c.inbuf.span().index_of("\r\n\r\n").is_some()
                             || c.inbuf.span().index_of("\n\n").is_some() {
                             done_req = true
@@ -498,11 +510,10 @@ impl HttpServer {
     uses (sched: mut Scheduler, io: mut SocketIo)
     {
         events_out.clear()
-        var io_events = MemVec<IoEvent>::new()
-        io.take_events_for(self.owner, mut io_events)
+        io.take_events_for(self.owner, mut self.io_events)
         var ei: usize = 0
-        while ei < io_events.len() {
-            let ev = io_events[ei]
+        while ei < self.io_events.len() {
+            let ev = self.io_events[ei]
             if ev.token == self.listener_token {
                 self.accept_all()
             } else {

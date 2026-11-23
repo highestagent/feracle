@@ -18,7 +18,7 @@ pub use envelope::{
     frame_len,
     set_ttl,
 }
-pub use gossip::{GossipCore, is_would_block}
+pub use gossip::GossipCore
 pub use inbox::Inbox
 pub use peer_entry::{PEER_ENTRY_LEN, PeerEntry, decode_entries, encode_entries, normalize_addr}
 pub use peers::{Liveness, Peer, PeerBook}

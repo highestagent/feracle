@@ -10,6 +10,8 @@ use super::dispatch::handle_frame
 use super::mesh::{TcpMeshState, close_peer, find_peer_index, queue_to_peer, sync_interest}
 use super::wire::encode_hello
 
+const MAX_TCP_PEERS: usize = 64
+
 pub struct TcpConfig {
     pub bind_addr: SocketAddr,
     pub self_tag: u64,
@@ -27,6 +29,9 @@ pub struct TcpEngine {
     pub(ingot) nonce: u64,
     pub(ingot) state: TcpMeshState,
     pub(ingot) timer_id: Option<TimerId>,
+    pub(ingot) timer_deadline_ms: Option<u64>,
+    pub(ingot) read_buf: MemBuffer,
+    pub(ingot) events_buf: MemVec<IoEvent>,
 }
 
 impl TcpEngine {
@@ -71,6 +76,9 @@ impl TcpEngine {
             nonce: 0,
             state,
             timer_id: Option::None,
+            timer_deadline_ms: Option::None,
+            read_buf: MemBuffer::new(4096),
+            events_buf: MemVec::new(),
         }
         engine.dial_due(now_ms)
         engine.reschedule_timer(now_ms)
@@ -78,8 +86,11 @@ impl TcpEngine {
     }
 
     pub(ingot) fn dial_due(mut self, _ now_ms: u64) uses (net: mut Net, io: mut SocketIo) {
+        if self.peers.len() >= MAX_TCP_PEERS {
+            return
+        }
         var attempts: usize = 0
-        while attempts < 8 {
+        while attempts < 8 && self.peers.len() < MAX_TCP_PEERS {
             let Option::Some(addr) = self
                 .state
                 .dialer
@@ -129,6 +140,10 @@ impl TcpEngine {
                 _ => {
                     return
                 },
+            }
+            if self.peers.len() >= MAX_TCP_PEERS {
+                let _ = pair
+                continue
             }
             var stream = pair.0
             let peer_addr = pair.1
@@ -232,8 +247,9 @@ impl TcpEngine {
             }
             var frames = MemVec<MemBuffer>::new()
             var dead = false
+            let rbuf = mut self.read_buf
             if let Option::Some(mut conn) = self.peers.get(idx) {
-                if !conn.read_into(now_ms).is_ok() {
+                if !conn.read_into(now_ms, mut rbuf).is_ok() {
                     dead = true
                 }
                 var one = MemBuffer::empty()

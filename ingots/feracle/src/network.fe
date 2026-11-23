@@ -192,19 +192,33 @@ impl PeerSession {
     {
         var entries_opt: Option<MemVec<PeerEntry>> = Option::None
         var libp2p_snap: Option<(u64, MemBuffer)> = Option::None
+        var dirty_ver: Option<u64> = Option::None
+        let want_telemetry = telemetry.is_enabled()
         match self.inner {
             EngineInner::Libp2p(ref l) => {
-                if telemetry.is_enabled() {
+                if want_telemetry {
                     libp2p_snap = Option::Some(peers_snapshot_libp2p(l))
                 }
             },
             EngineInner::Tcp(mut t) => {
                 let _ = t.poll_io()
-                entries_opt = Option::Some(t.peer_entries())
+                if want_telemetry {
+                    let ver = t.peers_version()
+                    if !self.peers_synced || ver != self.last_peers_ver {
+                        dirty_ver = Option::Some(ver)
+                        entries_opt = Option::Some(t.peer_entries())
+                    }
+                }
             },
             EngineInner::Udp(mut u) => {
                 let _ = u.poll_io()
-                entries_opt = Option::Some(u.peer_entries())
+                if want_telemetry {
+                    let ver = u.peers_version()
+                    if !self.peers_synced || ver != self.last_peers_ver {
+                        dirty_ver = Option::Some(ver)
+                        entries_opt = Option::Some(u.peer_entries())
+                    }
+                }
             },
         }
         if let Option::Some((ver, csv)) = libp2p_snap {
@@ -216,10 +230,14 @@ impl PeerSession {
             }
             return
         }
-        if let Option::Some(entries) = entries_opt {
-            var csv = MemBuffer::empty()
-            format_peers_csv(entries, prefix: self.prefix.span(), mut csv)
-            telemetry.update_peers(peer_count: entries.len(), peers_csv: csv.span())
+        if let Option::Some(ver) = dirty_ver {
+            self.last_peers_ver = ver
+            self.peers_synced = true
+            if let Option::Some(entries) = entries_opt {
+                var csv = MemBuffer::empty()
+                format_peers_csv(entries, prefix: self.prefix.span(), mut csv)
+                telemetry.update_peers(peer_count: entries.len(), peers_csv: csv.span())
+            }
         }
     }
 

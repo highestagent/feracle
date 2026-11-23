@@ -2,8 +2,10 @@
 
 use std::net::SocketAddr
 use cli::{App, Arg, Cli, CliError}
+use feracle_core::push_addr20_hex
 use super::args::{FeedSources, HexAddr20, HexKey32, PeerBackend, RpcEndpoint}
 use super::feeds::FeedSource
+use super::ffi
 
 pub struct NodeConfig {
     pub node_id: u64,
@@ -14,8 +16,8 @@ pub struct NodeConfig {
     pub bootstrap: MemBuffer,
     pub sources: MemVec<FeedSource>,
     pub privkey32: MemBuffer,
-    pub privkey_0x: MemBuffer,
-    pub rpc_url: MemBuffer,
+    pub self_addr20: [u8; 20],
+    pub self_addr_0x: MemBuffer,
     pub rpc_addr: SocketAddr,
     pub rpc_path: MemBuffer,
     pub chain_id: u64,
@@ -154,6 +156,17 @@ pub fn load_config() -> Result<CliError, NodeConfig> uses (cli: Cli) {
     let bootstrap: MemBuffer = cli::get_or("bootstrap", default: MemBuffer::empty())?
     let feed_sources: FeedSources = cli::require("sources")?
     let privkey: HexKey32 = cli::require("privkey-hex")?
+    let Option::Some(self_addr20) = ffi::derive_eth_addr(privkey32: privkey.raw.span()) else {
+        return Result::Err(
+            CliError::InvalidValue {
+                arg: format!("--privkey-hex"),
+                value: format!("<redacted>"),
+                detail: format!("invalid secp256k1 private key"),
+            },
+        )
+    }
+    var self_addr_0x = MemBuffer::with_capacity(42)
+    push_addr20_hex(self_addr20, mut self_addr_0x)
     let rpc: RpcEndpoint = cli::require("rpc-url")?
     let chain_id: u64 = cli::require("chain-id")?
     let contract_addr: HexAddr20 = cli::require("contract")?
@@ -170,8 +183,8 @@ pub fn load_config() -> Result<CliError, NodeConfig> uses (cli: Cli) {
             bootstrap,
             sources: feed_sources.list,
             privkey32: privkey.raw,
-            privkey_0x: privkey.prefixed,
-            rpc_url: rpc.url,
+            self_addr20,
+            self_addr_0x,
             rpc_addr: rpc.addr,
             rpc_path: rpc.path,
             chain_id,

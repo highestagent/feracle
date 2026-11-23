@@ -1,7 +1,7 @@
 use std::io::{Read, Write}
 use std::net::{SocketAddr, Token}
-use net_reactor::SocketIo
-use p2p::{decode_header, frame_len, is_would_block}
+use net_reactor::{SocketIo, is_would_block}
+use p2p::{decode_header, frame_len}
 
 const MAX_INBUF: usize = 16384
 const MAX_OUTBUF: usize = 32768
@@ -126,10 +126,8 @@ impl PeerConn {
         while self.out_offset < self.outbuf.len() {
             let rem = self.outbuf.len() - self.out_offset
             let send_len = if rem > READ_CHUNK { READ_CHUNK } else { rem }
-            let chunk = MemBuffer::from_span(
-                self.outbuf.slice(offset: self.out_offset, len: send_len),
-            )
-            match io.stream_write(self.token, chunk.span()) {
+            let chunk = self.outbuf.slice(offset: self.out_offset, len: send_len)
+            match io.stream_write(self.token, chunk) {
                 Option::Some(Result::Ok(n)) => {
                     if n == 0 {
                         return IoOutcome::Closed
@@ -152,11 +150,18 @@ impl PeerConn {
         IoOutcome::Ok
     }
 
-    pub fn read_into(mut self, now_ms: u64) -> IoOutcome uses (io: mut SocketIo) {
-        var tmp = MemBuffer::new(READ_CHUNK)
+    pub fn read_into(mut self, now_ms: u64, _ tmp: mut MemBuffer) -> IoOutcome
+    uses (io: mut SocketIo)
+    {
+        let scratch_cap = tmp.len()
         while self.inbuf.len() < MAX_INBUF {
             let room = MAX_INBUF - self.inbuf.len()
-            let max_read = if room < READ_CHUNK { room } else { READ_CHUNK }
+            let max_read = if room < scratch_cap {
+                room
+            } else {
+                scratch_cap
+            }
+            if max_read == 0 { break }
             let slice = mut tmp.span().head(max_read)
             match io.stream_read(self.token, mut slice) {
                 Option::Some(Result::Ok(n)) => {

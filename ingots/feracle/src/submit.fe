@@ -9,7 +9,6 @@ use feracle_core::{
     json_get_str_bounds,
     parse_hex_u128,
     parse_hex_u64,
-    push_addr20_hex,
     push_hex_bytes,
 }
 use http::HttpRequest
@@ -18,6 +17,7 @@ use super::ffi
 use super::rpc::{RPC_TIMEOUT_MS, flatten_http_body, parse_rpc_str_result, start_rpc_request}
 
 const SUBMIT_TIMEOUT_MS: u64 = 15000
+const RECEIPT_TIMEOUT_MS: u64 = 12_000
 const RECEIPT_POLL_MS: u64 = 150
 const TX_GAS_LIMIT: u64 = 1_500_000
 const MIN_GAS_PRICE_WEI: u128 = 2_000_000_000
@@ -52,6 +52,7 @@ pub struct SubmitMediansCoro {
     timestamp: u64,
     calldata: MemBuffer,
     started_ms: u64,
+    broadcast_ms: u64,
     tx_hash: MemBuffer,
     outcome: Option<SubmitOutcome>,
 }
@@ -61,6 +62,7 @@ impl SubmitMediansCoro {
         rpc_addr: SocketAddr,
         rpc_path: MemSpan,
         privkey32: MemSpan,
+        from_0x: MemSpan,
         chain_id: u64,
         contract20: MemSpan,
         round_id: u64,
@@ -73,11 +75,7 @@ impl SubmitMediansCoro {
         let owner = sched.alloc_task()
         let started_ms = sched.now_ms()
 
-        var empty = MemBuffer::empty()
-        let Option::Some((addr20, _, _, _)) = ffi::sign_raw_bytes(
-            privkey32,
-            data: empty.span(),
-        ) else {
+        if privkey32.len() != 32 || from_0x.len() != 42 {
             sched.wake(owner)
             return Self::failed(
                 owner,
@@ -113,8 +111,6 @@ impl SubmitMediansCoro {
         var calldata = MemBuffer::with_capacity(996)
         encode_submit_medians_calldata(round_id, prices, timestamp, sigs, mut calldata)
 
-        var from_0x = MemBuffer::with_capacity(42)
-        push_addr20_hex(addr20, mut from_0x)
         let nonce_body = format!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionCount\",\"params\":[\"",
             from_0x,
@@ -150,6 +146,7 @@ impl SubmitMediansCoro {
             timestamp,
             calldata,
             started_ms,
+            broadcast_ms: 0,
             tx_hash: MemBuffer::empty(),
             outcome: Option::None,
         }
@@ -181,6 +178,7 @@ impl SubmitMediansCoro {
             timestamp,
             calldata: MemBuffer::empty(),
             started_ms,
+            broadcast_ms: 0,
             tx_hash: MemBuffer::empty(),
             outcome: Option::Some(SubmitOutcome::Failed(err)),
         }
@@ -349,6 +347,7 @@ impl Coroutine for SubmitMediansCoro {
                     )
                 }
                 self.tx_hash = tx_hash
+                self.broadcast_ms = sched.now_ms()
                 self.start_receipt_poll()
                 return Poll::Pending
             },
@@ -412,7 +411,7 @@ impl Coroutine for SubmitMediansCoro {
                     }
                 }
 
-                if sched.now_ms() - self.started_ms >= SUBMIT_TIMEOUT_MS {
+                if sched.now_ms() - self.broadcast_ms >= RECEIPT_TIMEOUT_MS {
                     return self.finish(
                         SubmitOutcome::Failed(
                             format!(

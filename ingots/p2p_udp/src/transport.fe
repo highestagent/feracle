@@ -2,17 +2,8 @@ use std::io::Error
 use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr, Token}
 use std::time::Clock
 use coro::{Driver, LocalScheduler, Scheduler, TaskId, TimerId}
-use net_reactor::{NetDriver, NetPoller, SocketIo}
-use p2p::{
-    Delivery,
-    GossipConfig,
-    GossipCore,
-    PeerEntry,
-    Stats,
-    Transport,
-    is_would_block,
-    pick_fanout,
-}
+use net_reactor::{NetDriver, NetPoller, SocketIo, is_would_block}
+use p2p::{Delivery, GossipConfig, GossipCore, PeerEntry, Stats, Transport, pick_fanout}
 use super::dispatch::{UdpState, handle_packet, send_datagram}
 use super::swim::SwimState
 use super::wire::{KIND_PING, encode_join, encode_ping_or_ack, encode_ping_req}
@@ -33,6 +24,9 @@ pub struct UdpEngine {
     seeds: MemVec<SocketAddr>,
     state: UdpState,
     timer_id: Option<TimerId>,
+    timer_deadline_ms: Option<u64>,
+    recv_buf: MemBuffer,
+    scratch_tx: MemBuffer,
 }
 
 impl UdpEngine {
@@ -66,6 +60,9 @@ impl UdpEngine {
             seeds: config.seeds,
             state,
             timer_id: Option::None,
+            timer_deadline_ms: Option::None,
+            recv_buf: MemBuffer::new(1500),
+            scratch_tx: MemBuffer::empty(),
         }
         engine.send_join_to_seeds()
         engine.reschedule_timer(now_ms)
@@ -90,6 +87,10 @@ impl UdpEngine {
 
     pub fn peer_entries(self) -> MemVec<PeerEntry> {
         self.state.base.peer_entries()
+    }
+
+    pub fn peers_version(self) -> u64 {
+        self.state.base.book.version()
     }
 
     pub fn stats(self) -> Stats {
@@ -161,12 +162,11 @@ impl UdpEngine {
 
     pub fn poll_io(mut self) -> usize uses (sched: mut Scheduler, io: mut SocketIo) {
         if let Option::Some(tid) = self.timer_id {
-            if !sched.take_timer_fired(tid) {
-                sched.cancel_timer(tid)
+            if sched.take_timer_fired(tid) {
+                self.timer_id = Option::None
+                self.timer_deadline_ms = Option::None
             }
-            self.timer_id = Option::None
         }
-        self.step_timers(sched.now_ms())
         var delivered: usize = 0
         if let Option::Some(ev) = io.take_token_event(self.udp_token) {
             if ev.readable || ev.error || ev.hangup {
@@ -184,15 +184,12 @@ impl UdpEngine {
             sched.cancel_timer(tid)
             self.timer_id = Option::None
         }
+        self.timer_deadline_ms = Option::None
         sched.cancel_owner_timers(self.owner)
         io.deregister_owner(self.owner)
     }
 
     fn reschedule_timer(mut self, _ now_ms: u64) uses (sched: mut Scheduler) {
-        if let Option::Some(tid) = self.timer_id {
-            sched.cancel_timer(tid)
-            self.timer_id = Option::None
-        }
         let deadline = self
             .state
             .swim
@@ -206,7 +203,21 @@ impl UdpEngine {
         } else {
             1
         }
+        let target_deadline = now_ms + delay
+        if self.timer_id.is_some() {
+            if let Option::Some(cur) = self.timer_deadline_ms {
+                if cur == target_deadline {
+                    return
+                }
+            }
+        }
+        if let Option::Some(tid) = self.timer_id {
+            sched.cancel_timer(tid)
+            self.timer_id = Option::None
+            self.timer_deadline_ms = Option::None
+        }
         self.timer_id = Option::Some(sched.schedule_after(self.owner, delay_ms: delay))
+        self.timer_deadline_ms = Option::Some(target_deadline)
     }
 
     fn send_join_to_seeds(mut self) uses (io: mut SocketIo) {
@@ -275,7 +286,8 @@ impl UdpEngine {
         if tick.send_lan_join {
             self.send_lan_join()
         }
-        var tx = MemBuffer::empty()
+        let tx = mut self.scratch_tx
+        tx.clear()
         if let Option::Some((probe_id, target_addr)) = tick.send_ping {
             let seq = self.state.base.next_seq()
             encode_ping_or_ack(
@@ -331,7 +343,7 @@ impl UdpEngine {
 
     fn drain_socket(mut self, _ now_ms: u64) -> usize uses (io: mut SocketIo) {
         var delivered: usize = 0
-        var buf = MemBuffer::new(1500)
+        let buf = mut self.recv_buf
         while true {
             let recv_res = match io.udp_recv_from(self.udp_token, mut buf.span()) {
                 Option::Some(r) => r,

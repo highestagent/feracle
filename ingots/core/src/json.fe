@@ -83,40 +83,51 @@ fn scan_json_value_end(_ s: MemSpan, start: usize) -> Option<usize> {
     }
 }
 
-fn find_json_field_bounds(_ obj: MemSpan, _ key: MemSpan) -> Option<(usize, usize)> {
-    let start = skip_ws(obj, start: 0)
-    if start >= obj.len() || obj.byte_at(start) != b'{' {
+pub fn json_next_object_field(_ obj: MemSpan, _ cursor: mut usize) -> Option<
+    (usize, usize, usize, usize),
+> {
+    if cursor == 0 {
+        let start = skip_ws(obj, start: 0)
+        if start >= obj.len() || obj.byte_at(start) != b'{' {
+            return Option::None
+        }
+        cursor = start + 1
+    }
+    var i = skip_ws(obj, start: cursor)
+    while i < obj.len() && obj.byte_at(i) == b',' {
+        i = skip_ws(obj, start: i + 1)
+    }
+    if i >= obj.len() || obj.byte_at(i) == b'}' {
+        cursor = obj.len()
         return Option::None
     }
-    var i = start + 1
-    while i < obj.len() {
-        i = skip_ws(obj, start: i)
-        if i >= obj.len() {
+    if obj.byte_at(i) != b'"' {
+        cursor = obj.len()
+        return Option::None
+    }
+    let key_end_q = scan_json_string_end(obj, quote_pos: i)?
+    let key_start = i + 1
+    let key_len = key_end_q - key_start
+    var pos = skip_ws(obj, start: key_end_q + 1)
+    if pos >= obj.len() || obj.byte_at(pos) != b':' {
+        cursor = obj.len()
+        return Option::None
+    }
+    pos = skip_ws(obj, start: pos + 1)
+    let val_end = scan_json_value_end(obj, start: pos)?
+    cursor = val_end
+    Option::Some((key_start, key_len, pos, val_end - pos))
+}
+
+fn find_json_field_bounds(_ obj: MemSpan, _ key: MemSpan) -> Option<(usize, usize)> {
+    var cursor: usize = 0
+    while true {
+        let Option::Some((ks, kl, vs, vl)) = json_next_object_field(obj, mut cursor) else {
             return Option::None
         }
-        let b = obj.byte_at(i)
-        if b == b'}' {
-            return Option::None
+        if obj.slice(offset: ks, len: kl) == key {
+            return Option::Some((vs, vl))
         }
-        if b == b',' {
-            i += 1
-            continue
-        }
-        if b != b'"' {
-            return Option::None
-        }
-        let key_end_q = scan_json_string_end(obj, quote_pos: i)?
-        let field_key = obj.slice(offset: i + 1, len: key_end_q - (i + 1))
-        var pos = skip_ws(obj, start: key_end_q + 1)
-        if pos >= obj.len() || obj.byte_at(pos) != b':' {
-            return Option::None
-        }
-        pos = skip_ws(obj, start: pos + 1)
-        let val_end = scan_json_value_end(obj, start: pos)?
-        if field_key == key {
-            return Option::Some((pos, val_end - pos))
-        }
-        i = val_end
     }
     Option::None
 }

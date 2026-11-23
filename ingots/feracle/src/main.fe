@@ -53,9 +53,9 @@ impl Coroutine for NodeCoro {
         }
 
         self.peer.poll_driver(mut self.telemetry)
+        let cons_poll = self.consensus.poll(mut self.peer, mut self.telemetry)
         self.telemetry.poll()
-        if let Poll::Ready(code) = self.consensus.poll(mut self.peer, mut self.telemetry) {
-            self.telemetry.poll()
+        if let Poll::Ready(code) = cons_poll {
             if !self.telemetry.has_pending_writes() {
                 self.telemetry.stop()
                 self.peer.stop()
@@ -65,7 +65,6 @@ impl Coroutine for NodeCoro {
             self.exit_code = Option::Some(code)
             return Poll::Pending
         }
-        self.telemetry.poll()
         Poll::Pending
     }
 

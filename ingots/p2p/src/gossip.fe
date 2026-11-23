@@ -1,6 +1,5 @@
-//! Shared per-node gossip engine state and non-blocking error classification.
+//! Shared per-node gossip engine state.
 
-use std::io::{Error, ErrorKind}
 use std::net::SocketAddr
 use std::time::Clock
 use super::envelope::{Header, KIND_DATA, encode_frame, frame_len, set_ttl}
@@ -10,13 +9,6 @@ use super::peers::PeerBook
 use super::rng::Rng
 use super::seen::SeenCache
 use super::transport::{Delivery, GossipConfig, Stats}
-
-pub fn is_would_block(_ err: Error) -> bool {
-    match err.kind() {
-        ErrorKind::WouldBlock => true,
-        _ => false,
-    }
-}
 
 pub struct GossipCore {
     pub self_tag: u64,

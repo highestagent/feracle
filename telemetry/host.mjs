@@ -332,8 +332,12 @@ async function main() {
   const contractLower = opts.contract.toLowerCase();
   const nodePeerIds = new Array(opts.nodeUrls.length).fill(null);
   const seenSeqs = opts.nodeUrls.map(() => new Set());
+  const MAX_SEEN_RECEIPTS = 512;
+  const MAX_ROUND_TX_COUNTS = 256;
   const seenReceipts = new Set();
   const roundTxCounts = new Map();
+  const sseConnected = opts.nodeUrls.map(() => false);
+  const sseLastEventAt = opts.nodeUrls.map(() => 0);
   let lastScannedBlock = null;
   let stopping = false;
 
@@ -419,10 +423,18 @@ async function main() {
           if (!rcpt || rcpt.status !== "0x1") {
             continue;
           }
+          if (seenReceipts.size >= MAX_SEEN_RECEIPTS) {
+            const oldest = seenReceipts.values().next().value;
+            if (oldest !== undefined) seenReceipts.delete(oldest);
+          }
           seenReceipts.add(tx.hash);
           const roundId = Number(BigInt("0x" + input.slice(10, 74)));
           const gasUsed = Number(BigInt(rcpt.gasUsed || "0x0"));
           const nextCount = (roundTxCounts.get(roundId) || 0) + 1;
+          if (!roundTxCounts.has(roundId) && roundTxCounts.size >= MAX_ROUND_TX_COUNTS) {
+            const oldestRound = roundTxCounts.keys().next().value;
+            if (oldestRound !== undefined) roundTxCounts.delete(oldestRound);
+          }
           roundTxCounts.set(roundId, nextCount);
           wasmHost.ingestTx(roundId, b, gasUsed, nextCount, tx.from || "");
         }
@@ -434,8 +446,12 @@ async function main() {
   }
 
   async function pollNodeStatuses() {
+    const now = Date.now();
     await Promise.all(
       opts.nodeUrls.map(async (baseUrl, idx) => {
+        if (sseConnected[idx] && sseLastEventAt[idx] > 0 && now - sseLastEventAt[idx] < 15000) {
+          return;
+        }
         try {
           const resp = await fetch(`${baseUrl}/status`, {
             signal: AbortSignal.timeout(2000),
@@ -481,16 +497,20 @@ async function main() {
             signal: controller.signal,
           });
           if (!resp.ok || !resp.body) {
+            sseConnected[nodeIdx] = false;
             wasmHost.markNodeOffline(nodeIdx);
             await new Promise((r) => setTimeout(r, 500));
             continue;
           }
+          sseConnected[nodeIdx] = true;
+          sseLastEventAt[nodeIdx] = Date.now();
           const reader = resp.body.getReader();
           const decoder = new TextDecoder("utf-8");
           let buf = "";
           while (!stopping) {
             const { value, done } = await reader.read();
             if (done) {
+              sseConnected[nodeIdx] = false;
               break;
             }
             buf += decoder.decode(value, { stream: true });
@@ -507,6 +527,7 @@ async function main() {
               }
               try {
                 const ev = JSON.parse(payload);
+                sseLastEventAt[nodeIdx] = Date.now();
                 if (ev.event === "status") {
                   if (ev.peer_id) {
                     if (nodePeerIds[nodeIdx] && nodePeerIds[nodeIdx] !== ev.peer_id) {
@@ -529,10 +550,12 @@ async function main() {
             }
           }
         } catch {
+          sseConnected[nodeIdx] = false;
           if (!stopping) {
             wasmHost.markNodeOffline(nodeIdx);
           }
         }
+        sseConnected[nodeIdx] = false;
         if (!stopping) {
           await new Promise((r) => setTimeout(r, 500));
         }

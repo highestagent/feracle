@@ -7,6 +7,8 @@ pub struct DialEntry { pub addr: SocketAddr, pub backoff: Backoff, pub active: O
 
 impl Copy for DialEntry {}
 
+const MAX_DIAL_ENTRIES: usize = 128
+
 pub struct DialBook { entries: MemVec<DialEntry>, base_ms: u64, max_ms: u64 }
 
 impl DialBook {
@@ -15,7 +17,7 @@ impl DialBook {
     }
 
     pub fn add_addr(mut self, _ addr: SocketAddr) {
-        if self.find_addr(addr).is_some() {
+        if self.find_addr(addr).is_some() || self.entries.len() >= MAX_DIAL_ENTRIES {
             return
         }
         self.entries

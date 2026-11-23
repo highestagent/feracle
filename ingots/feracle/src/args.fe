@@ -27,12 +27,12 @@ impl FromArg for PeerBackend {
     }
 }
 
-pub struct HexKey32 { pub raw: MemBuffer, pub prefixed: MemBuffer }
+pub struct HexKey32 { pub raw: MemBuffer }
 
 impl FromArg for HexKey32 {
     fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
         match parse_fixed_hex(raw_span, expected_bytes: 32) {
-            Option::Some((raw, prefixed)) => Result::Ok(Self { raw, prefixed }),
+            Option::Some((raw, _)) => Result::Ok(Self { raw }),
             Option::None => Result::Err(format!("expected 32-byte hex private key")),
         }
     }
@@ -49,7 +49,7 @@ impl FromArg for HexAddr20 {
     }
 }
 
-pub struct RpcEndpoint { pub url: MemBuffer, pub addr: SocketAddr, pub path: MemBuffer }
+pub struct RpcEndpoint { pub addr: SocketAddr, pub path: MemBuffer }
 
 impl FromArg for RpcEndpoint {
     fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
@@ -75,7 +75,7 @@ impl FromArg for RpcEndpoint {
                 format!("expected URL with IP:PORT (e.g. http://127.0.0.1:8545)"),
             )
         }
-        Result::Ok(Self { url: MemBuffer::from_span(raw_span), addr, path })
+        Result::Ok(Self { addr, path })
     }
 }
 

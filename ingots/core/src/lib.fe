@@ -40,7 +40,14 @@ pub use hex::{
     strip_0x_offset,
     to_ascii_lower,
 }
-pub use json::{json_get_bool, json_get_raw, json_get_str_bounds, json_get_u64, json_next_array_elem}
+pub use json::{
+    json_get_bool,
+    json_get_raw,
+    json_get_str_bounds,
+    json_get_u64,
+    json_next_array_elem,
+    json_next_object_field,
+}
 pub use math::{
     abs_i64,
     all_prices_nonzero,

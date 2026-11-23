@@ -4,9 +4,9 @@ use std::net::{Interest, Net, SocketAddr, Token}
 use coro::{Coroutine, Poll, Scheduler, TaskId, Timeout}
 use net_reactor::{SocketIo, is_would_block}
 use super::wire::{
-    ChunkedStatus,
+    ChunkStep,
+    ChunkedDecoder,
     contains_ignore_ascii_case,
-    decode_chunked_status,
     starts_with_ignore_ascii_case,
 }
 
@@ -30,11 +30,14 @@ pub struct HttpRequest {
     sent: usize,
     token: Option<Token>,
     state: HttpState,
+    read_buf: MemBuffer,
     inbuf: MemBuffer,
     header_end: Option<usize>,
     content_len: Option<usize>,
     is_chunked: bool,
     headers_ok: bool,
+    chunked: ChunkedDecoder,
+    parse_pos: usize,
 }
 
 impl HttpRequest {
@@ -51,11 +54,14 @@ impl HttpRequest {
                     sent: 0,
                     token: Option::None,
                     state: HttpState::Failed,
+                    read_buf: MemBuffer::empty(),
                     inbuf: MemBuffer::empty(),
                     header_end: Option::None,
                     content_len: Option::None,
                     is_chunked: false,
                     headers_ok: false,
+                    chunked: ChunkedDecoder::new(),
+                    parse_pos: 0,
                 }
             },
         }
@@ -70,11 +76,14 @@ impl HttpRequest {
                     sent: 0,
                     token: Option::None,
                     state: HttpState::Failed,
+                    read_buf: MemBuffer::empty(),
                     inbuf: MemBuffer::empty(),
                     header_end: Option::None,
                     content_len: Option::None,
                     is_chunked: false,
                     headers_ok: false,
+                    chunked: ChunkedDecoder::new(),
+                    parse_pos: 0,
                 }
             },
         }
@@ -83,11 +92,14 @@ impl HttpRequest {
             sent: 0,
             token: Option::Some(tok),
             state: HttpState::Connecting,
+            read_buf: MemBuffer::new(READ_CHUNK),
             inbuf: MemBuffer::with_capacity(4096),
             header_end: Option::None,
             content_len: Option::None,
             is_chunked: false,
             headers_ok: false,
+            chunked: ChunkedDecoder::new(),
+            parse_pos: 0,
         }
     }
 
@@ -191,11 +203,13 @@ impl HttpRequest {
                     return Option::Some(Option::None)
                 }
                 self.header_end = Option::Some(idx + 4)
+                self.parse_pos = idx + 4
             } else if let Option::Some(idx) = span.index_of("\n\n") {
                 if !self.parse_headers(idx) {
                     return Option::Some(Option::None)
                 }
                 self.header_end = Option::Some(idx + 2)
+                self.parse_pos = idx + 2
             } else {
                 if span.len() > MAX_HEADER_BLOCK || eof {
                     return Option::Some(Option::None)
@@ -210,14 +224,17 @@ impl HttpRequest {
         let body_len = self.inbuf.len() - body_start
         let body_span = self.inbuf.slice(offset: body_start, len: body_len)
         if self.is_chunked {
-            match decode_chunked_status(body_span, eof) {
-                ChunkedStatus::Complete(decoded) => {
-                    return Option::Some(Option::Some(decoded))
+            let unparsed = self.inbuf.span().tail(self.parse_pos)
+            let (step, consumed) = self.chunked.feed(unparsed, eof)
+            self.parse_pos += consumed
+            match step {
+                ChunkStep::Complete => {
+                    return Option::Some(Option::Some(self.chunked.take_output()))
                 },
-                ChunkedStatus::Invalid => {
+                ChunkStep::Invalid => {
                     return Option::Some(Option::None)
                 },
-                ChunkedStatus::NeedMore => {
+                ChunkStep::NeedMore => {
                     if eof || body_len > MAX_HTTP_BODY + 65536 {
                         return Option::Some(Option::None)
                     }
@@ -272,17 +289,16 @@ impl HttpRequest {
     fn drain_reading(mut self, tok: Token) -> Poll<Option<MemBuffer>>
     uses (io: mut SocketIo)
     {
-        var tmp = MemBuffer::new(READ_CHUNK)
         var eof = false
         while true {
-            let slice = mut tmp.span()
+            let slice = mut self.read_buf.span()
             match io.stream_read(tok, mut slice) {
                 Option::Some(Result::Ok(n)) => {
                     if n == 0 {
                         eof = true
                         break
                     }
-                    self.inbuf.extend_from(tmp.span().head(n))
+                    self.inbuf.extend_from(self.read_buf.span().head(n))
                     if let Option::Some(done) = self.try_parse_complete(eof: false) {
                         return self.finish(done)
                     }

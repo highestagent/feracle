@@ -1,11 +1,12 @@
 use core::num::IntDowncast
 use std::net::{Net, SocketAddr}
-use coro::{BoundedPool, Coroutine, Poll, PoolDone, Scheduler, TaskId, Timeout}
+use coro::{BoundedPool, Coroutine, Poll, PoolDone, Scheduler, Sleep, TaskId, Timeout}
 use feracle_core::{
     ASSET_COUNT,
     asset_id_from_symbol,
     json_get_str_bounds,
     json_next_array_elem,
+    json_next_object_field,
     median_of_three,
     parse_decimal_1e8_span,
     write_asset_symbol,
@@ -15,6 +16,7 @@ use net_reactor::SocketIo
 use super::rpc::flatten_http_body
 
 const FEED_TIMEOUT_MS: u64 = 5000
+const COINBASE_RETRY_BACKOFF_MS: u64 = 100
 const MAX_COINBASE_INFLIGHT: usize = 8
 const MAX_COINBASE_RETRIES: u8 = 1
 
@@ -68,6 +70,7 @@ struct CoinbaseTask {
     retries_left: u8,
     addr: SocketAddr,
     owner: TaskId,
+    ready_at_ms: u64,
 }
 
 impl Copy for CoinbaseTask {}
@@ -119,20 +122,23 @@ fn build_coinbase_request(_ addr: SocketAddr, asset_idx: usize) -> MemBuffer {
 
 fn parse_hyperliquid_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
     var count: u32 = 0
-    var i: usize = 0
-    while i < ASSET_COUNT {
-        var sym = MemBuffer::with_capacity(8)
-        write_asset_symbol(i, mut sym)
-        if let Option::Some((off, len)) = json_get_str_bounds(body, sym.span()) {
-            let val_span = body.slice(offset: off, len)
-            if let Option::Some(price) = parse_decimal_1e8_span(val_span) {
-                if price > 0 {
-                    out_prices[i] = price
-                    count += 1
+    var cursor: usize = 0
+    while true {
+        let Option::Some((ks, kl, vs, vl)) = json_next_object_field(body, mut cursor) else {
+            break
+        }
+        let sym = body.slice(offset: ks, len: kl)
+        if let Option::Some(asset_id) = asset_id_from_symbol(sym) {
+            if vl >= 2 && body.byte_at(vs) == b'"' && body.byte_at(vs + vl - 1) == b'"' {
+                let val_span = body.slice(offset: vs + 1, len: vl - 2)
+                if let Option::Some(price) = parse_decimal_1e8_span(val_span) {
+                    if price > 0 && out_prices[asset_id] == 0 {
+                        out_prices[asset_id] = price
+                        count += 1
+                    }
                 }
             }
         }
-        i += 1
     }
     count
 }
@@ -207,6 +213,8 @@ pub struct FetchFeedsCoro {
     sources: MemVec<SourceState>,
     bulk_jobs: MemVec<BulkJob>,
     cb_pool: BoundedPool<CoinbaseTask, Timeout<HttpRequest>>,
+    pending_retries: MemVec<CoinbaseTask>,
+    retry_sleep: Option<Sleep>,
     done: bool,
 }
 
@@ -272,6 +280,7 @@ impl FetchFeedsCoro {
                                     retries_left: MAX_COINBASE_RETRIES,
                                     addr: src.addr,
                                     owner,
+                                    ready_at_ms: now_ms,
                                 },
                             )
                         asset_idx += 1
@@ -294,7 +303,15 @@ impl FetchFeedsCoro {
                 },
             )
 
-        FetchFeedsCoro { owner, sources, bulk_jobs, cb_pool, done: false }
+        FetchFeedsCoro {
+            owner,
+            sources,
+            bulk_jobs,
+            cb_pool,
+            pending_retries: MemVec::new(),
+            retry_sleep: Option::None,
+            done: false,
+        }
     }
 
     fn build_outcome(self) -> FeedFetchOutcome {
@@ -354,6 +371,45 @@ impl Coroutine for FetchFeedsCoro {
         }
 
         let now_ms = sched.now_ms()
+
+        if let Option::Some(mut rs) = self.retry_sleep {
+            if let Poll::Ready(_) = rs.poll() {
+                self.retry_sleep = Option::None
+            } else {
+                self.retry_sleep = Option::Some(rs)
+            }
+        }
+        var ri: usize = 0
+        var next_retry_ms: Option<u64> = Option::None
+        while ri < self.pending_retries.len() {
+            let t = self.pending_retries[ri]
+            if now_ms >= t.ready_at_ms {
+                let due = self.pending_retries.swap_remove(ri)
+                self.cb_pool.enqueue(due)
+            } else {
+                next_retry_ms = match next_retry_ms {
+                    Option::Some(prev) => Option::Some(
+                        if t.ready_at_ms < prev {
+                            t.ready_at_ms
+                        } else {
+                            prev
+                        },
+                    ),
+                    Option::None => Option::Some(t.ready_at_ms),
+                }
+                ri += 1
+            }
+        }
+        if let Option::Some(next_at) = next_retry_ms {
+            if self.retry_sleep.is_none() {
+                let wait = if next_at > now_ms {
+                    next_at - now_ms
+                } else {
+                    1
+                }
+                self.retry_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: wait))
+            }
+        }
 
         var bi: usize = 0
         while bi < self.bulk_jobs.len() {
@@ -425,16 +481,26 @@ impl Coroutine for FetchFeedsCoro {
                 },
                 Option::None => {
                     if task.retries_left > 0 {
-                        self.cb_pool
-                            .enqueue(
+                        let ready_at_ms = now_ms + COINBASE_RETRY_BACKOFF_MS
+                        self.pending_retries
+                            .push(
                                 CoinbaseTask {
                                     src_idx: task.src_idx,
                                     asset_idx: task.asset_idx,
                                     retries_left: task.retries_left - 1,
                                     addr: task.addr,
                                     owner: task.owner,
+                                    ready_at_ms,
                                 },
                             )
+                        if self.retry_sleep.is_none() {
+                            self.retry_sleep = Option::Some(
+                                Sleep::after(
+                                    owner: self.owner,
+                                    delay_ms: COINBASE_RETRY_BACKOFF_MS,
+                                ),
+                            )
+                        }
                     } else {
                         if let Option::Some(mut st) = self.sources.get(task.src_idx) {
                             if st.remaining > 0 {
@@ -462,7 +528,11 @@ impl Coroutine for FetchFeedsCoro {
                 },
             )
 
-        if self.bulk_jobs.is_empty() && self.cb_pool.is_done() {
+        if self.bulk_jobs.is_empty() && self.cb_pool.is_done() && self.pending_retries.is_empty() {
+            if let Option::Some(mut rs) = self.retry_sleep {
+                rs.cancel()
+                self.retry_sleep = Option::None
+            }
             self.done = true
             sched.cancel_owner_timers(self.owner)
             io.deregister_owner(self.owner)
@@ -472,6 +542,11 @@ impl Coroutine for FetchFeedsCoro {
     }
 
     fn cancel(mut self) uses E {
+        if let Option::Some(mut rs) = self.retry_sleep {
+            rs.cancel()
+            self.retry_sleep = Option::None
+        }
+        self.pending_retries.clear()
         var bi: usize = 0
         while bi < self.bulk_jobs.len() {
             if let Option::Some(mut job) = self.bulk_jobs.get(bi) {

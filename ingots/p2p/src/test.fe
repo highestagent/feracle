@@ -155,19 +155,26 @@ fn test_timers_peer_book_and_fanout() {
     assert!(backoff.failures() == 0 && backoff.ready(0))
 
     var book = PeerBook::new(self_tag: 1)
+    assert!(book.version() == 0)
     let a2 = SocketAddr::parse("127.0.0.1:7002").unwrap()
     let a3 = SocketAddr::parse("127.0.0.1:7003").unwrap()
     let a4 = SocketAddr::parse("127.0.0.1:7004").unwrap()
     assert!(!book.observe(tag: 1, addr: a2, now_ms: 10))
+    assert!(book.version() == 0)
     assert!(book.observe(tag: 2, addr: a2, now_ms: 10))
     assert!(book.learn(tag: 3, addr: a3, now_ms: 10))
     assert!(book.learn(tag: 4, addr: a4, now_ms: 10))
+    assert!(book.version() == 3)
+    assert!(!book.observe(tag: 2, addr: a2, now_ms: 20))
+    assert!(book.version() == 3)
     assert!(book.alive_count() == 3)
 
     let idx2 = book.find_tag(2).unwrap()
     book.suspect(idx2, now_ms: 100)
+    assert!(book.version() == 4)
     assert!(book.alive_count() == 2)
     assert!(book.expire(now_ms: 300, grace_ms: 150) == 1)
+    assert!(book.version() == 5)
     assert!(book.find_tag(2).is_none())
 
     var rng = Rng::new(77)
@@ -175,6 +182,20 @@ fn test_timers_peer_book_and_fanout() {
     pick_fanout(book, exclude_tag: 3, fanout: 3, rng: mut rng, mut picks)
     assert!(picks.len() == 1)
     assert!(book.get(picks[0]).tag == 4)
+
+    // Cap live peers at MAX_PEERS (128)
+    var fill_tag: u64 = 1000
+    while book.len() < 128 {
+        assert!(book.learn(tag: fill_tag, addr: a4, now_ms: 300))
+        fill_tag += 1
+    }
+    assert!(book.len() == 128)
+    assert!(!book.learn(tag: 9999, addr: a4, now_ms: 300))
+    // Suspect one peer and confirm new live peer can evict it
+    book.suspect(0, now_ms: 310)
+    assert!(book.observe(tag: 9999, addr: a4, now_ms: 320))
+    assert!(book.len() == 128)
+    assert!(book.find_tag(9999).is_some())
 }
 
 #[test]

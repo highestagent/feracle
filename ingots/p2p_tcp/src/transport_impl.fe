@@ -106,6 +106,10 @@ impl TcpEngine {
         self.state.base.peer_entries()
     }
 
+    pub fn peers_version(self) -> u64 {
+        self.state.base.book.version()
+    }
+
     pub fn stats(self) -> Stats {
         self.state.base.stats
     }
@@ -164,20 +168,17 @@ impl TcpEngine {
     uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
     {
         if let Option::Some(tid) = self.timer_id {
-            if !sched.take_timer_fired(tid) {
-                sched.cancel_timer(tid)
+            if sched.take_timer_fired(tid) {
+                self.timer_id = Option::None
+                self.timer_deadline_ms = Option::None
             }
-            self.timer_id = Option::None
         }
-        let start_ms = sched.now_ms()
-        step_timers(mut self, start_ms)
         let before = self.state.base.inbox.len()
-        var events = MemVec<IoEvent>::new()
-        io.take_events_for(self.owner, mut events)
+        io.take_events_for(self.owner, mut self.events_buf)
         let now_ms = sched.now_ms()
         var i: usize = 0
-        while i < events.len() {
-            let ev = events[i]
+        while i < self.events_buf.len() {
+            let ev = self.events_buf[i]
             if ev.token == self.listener_token {
                 self.accept_all(now_ms)
             } else {
@@ -200,16 +201,13 @@ impl TcpEngine {
             sched.cancel_timer(tid)
             self.timer_id = Option::None
         }
+        self.timer_deadline_ms = Option::None
         sched.cancel_owner_timers(self.owner)
         io.deregister_owner(self.owner)
         self.peers.clear()
     }
 
     pub(ingot) fn reschedule_timer(mut self, _ now_ms: u64) uses (sched: mut Scheduler) {
-        if let Option::Some(tid) = self.timer_id {
-            sched.cancel_timer(tid)
-            self.timer_id = Option::None
-        }
         var min_wait = self.pex_ticker.ms_until(now_ms)
         let ping_wait = self.ping_ticker.ms_until(now_ms)
         if ping_wait < min_wait {
@@ -237,7 +235,21 @@ impl TcpEngine {
             pi += 1
         }
         let delay = if min_wait > 0 { min_wait } else { 1 }
+        let target_deadline = now_ms + delay
+        if self.timer_id.is_some() {
+            if let Option::Some(cur) = self.timer_deadline_ms {
+                if cur == target_deadline {
+                    return
+                }
+            }
+        }
+        if let Option::Some(tid) = self.timer_id {
+            sched.cancel_timer(tid)
+            self.timer_id = Option::None
+            self.timer_deadline_ms = Option::None
+        }
         self.timer_id = Option::Some(sched.schedule_after(self.owner, delay_ms: delay))
+        self.timer_deadline_ms = Option::Some(target_deadline)
     }
 }
 

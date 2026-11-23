@@ -30,6 +30,7 @@ use super::{
     json_get_str_bounds,
     json_get_u64,
     json_next_array_elem,
+    json_next_object_field,
     leader_index,
     median_of_three,
     median_prices_3,
@@ -313,6 +314,32 @@ fn test_json_array_iteration() {
     let (so1, sl1) = json_get_str_bounds(arr.slice(offset: o1, len: l1), "symbol".span()).unwrap()
     assert!(arr.slice(offset: o1 + so1, len: sl1) == "ETH")
     assert!(json_next_array_elem(arr, mut cursor).is_none())
+}
+
+#[test]
+fn test_json_object_field_iteration() {
+    let empty = " { } ".span()
+    var ecursor: usize = 0
+    assert!(json_next_object_field(empty, mut ecursor).is_none())
+
+    let obj = "{\"BTC\":\"92451.50\",\"META\":{\"a\":1,\"b\":\"x\\\"y\"},\"ok\":true}".span()
+    var cursor: usize = 0
+
+    let (k0, kl0, v0, vl0) = json_next_object_field(obj, mut cursor).unwrap()
+    assert!(obj.slice(offset: k0, len: kl0) == "BTC")
+    assert!(obj.slice(offset: v0, len: vl0) == "\"92451.50\"")
+
+    let (k1, kl1, v1, vl1) = json_next_object_field(obj, mut cursor).unwrap()
+    assert!(obj.slice(offset: k1, len: kl1) == "META")
+    assert!(
+        obj.slice(offset: v1, len: vl1) == "{\"a\":1,\"b\":\"x\\\"y\"}",
+    )
+
+    let (k2, kl2, v2, vl2) = json_next_object_field(obj, mut cursor).unwrap()
+    assert!(obj.slice(offset: k2, len: kl2) == "ok")
+    assert!(obj.slice(offset: v2, len: vl2) == "true")
+
+    assert!(json_next_object_field(obj, mut cursor).is_none())
 }
 
 #[test]
