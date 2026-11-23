@@ -49,7 +49,7 @@ impl FromArg for HexAddr20 {
     }
 }
 
-pub struct RpcEndpoint { pub url: MemBuffer, pub addr: SocketAddr }
+pub struct RpcEndpoint { pub url: MemBuffer, pub addr: SocketAddr, pub path: MemBuffer }
 
 impl FromArg for RpcEndpoint {
     fn from_arg(_ raw_span: MemSpan) -> Result<MemBuffer, Self> {
@@ -65,12 +65,17 @@ impl FromArg for RpcEndpoint {
             Option::Some(slash) => slash,
             Option::None => after_scheme.len(),
         }
+        let path = if host_len < after_scheme.len() {
+            MemBuffer::from_span(after_scheme.tail(host_len))
+        } else {
+            MemBuffer::from_span("/".span())
+        }
         let Option::Some(addr) = SocketAddr::parse(after_scheme.head(host_len)) else {
             return Result::Err(
                 format!("expected URL with IP:PORT (e.g. http://127.0.0.1:8545)"),
             )
         }
-        Result::Ok(Self { url: MemBuffer::from_span(raw_span), addr })
+        Result::Ok(Self { url: MemBuffer::from_span(raw_span), addr, path })
     }
 }
 

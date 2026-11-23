@@ -148,15 +148,6 @@ impl TelemetryHub {
         }
     }
 
-    fn set_peers_list(&self, peer_count: usize, mut peers: Vec<String>) {
-        peers.sort();
-        self.peer_count.store(peer_count, Ordering::Release);
-        if let Ok(mut st) = self.state.lock() {
-            st.peers = peers;
-        }
-        self.emit_status_event();
-    }
-
     fn append_status_fields(&self, out: &mut String, st: &NodeTelemetryState) {
         let peer_id = self
             .local_peer_id
@@ -961,21 +952,16 @@ pub fn derive_eth_address(signing_key: &SigningKey) -> [u8; 20] {
     addr
 }
 
-pub fn sign_oracle_digest(
+fn sign_prehash_with_key(
     privkey: &[u8; 32],
-    chain_id: u64,
-    contract_addr: &[u8; 20],
-    round_id: u64,
-    prices: &[u64; ASSET_COUNT],
-    timestamp: u64,
+    digest: &[u8; 32],
 ) -> Result<([u8; 20], u8, [u8; 32], [u8; 32]), String> {
     let signing_key =
         SigningKey::from_bytes(privkey.into()).map_err(|e| format!("invalid private key: {e}"))?;
     let addr = derive_eth_address(&signing_key);
-    let digest = build_oracle_digest(chain_id, contract_addr, round_id, prices, timestamp);
 
     let (sig, rec_id) = signing_key
-        .sign_prehash_recoverable(&digest)
+        .sign_prehash_recoverable(digest)
         .map_err(|e| format!("ecdsa sign failed: {e}"))?;
 
     let mut normalized_sig = sig;
@@ -990,8 +976,31 @@ pub fn sign_oracle_digest(
     let mut s = [0u8; 32];
     r.copy_from_slice(&sig_bytes[0..32]);
     s.copy_from_slice(&sig_bytes[32..64]);
-    let v = 27 + (recovery_byte & 1);
-    Ok((addr, v, r, s))
+    Ok((addr, recovery_byte & 1, r, s))
+}
+
+pub fn sign_oracle_digest(
+    privkey: &[u8; 32],
+    chain_id: u64,
+    contract_addr: &[u8; 20],
+    round_id: u64,
+    prices: &[u64; ASSET_COUNT],
+    timestamp: u64,
+) -> Result<([u8; 20], u8, [u8; 32], [u8; 32]), String> {
+    let digest = build_oracle_digest(chain_id, contract_addr, round_id, prices, timestamp);
+    let (addr, rec_bit, r, s) = sign_prehash_with_key(privkey, &digest)?;
+    Ok((addr, 27 + rec_bit, r, s))
+}
+
+pub fn sign_keccak_bytes(
+    privkey: &[u8; 32],
+    data: &[u8],
+) -> Result<([u8; 20], u8, [u8; 32], [u8; 32]), String> {
+    let mut digest = [0u8; 32];
+    let mut keccak = Keccak::v256();
+    keccak.update(data);
+    keccak.finalize(&mut digest);
+    sign_prehash_with_key(privkey, &digest)
 }
 
 fn read_utf8_arg<'a>(ptr: *const u8, len: usize) -> Result<&'a str, i32> {
@@ -1006,113 +1015,9 @@ fn read_utf8_arg<'a>(ptr: *const u8, len: usize) -> Result<&'a str, i32> {
 }
 
 fn current_telemetry_hub() -> Result<Arc<TelemetryHub>, i32> {
-    if let Ok(guard) = GLOBAL_NODE.lock() {
-        if let Some(node) = guard.as_ref() {
-            return Ok(Arc::clone(node.telemetry()));
-        }
-    }
-    let guard = GLOBAL_TELEMETRY.lock().map_err(|_| -5)?;
+    let guard = GLOBAL_NODE.lock().map_err(|_| -5)?;
     let node = guard.as_ref().ok_or(-7)?;
-    Ok(Arc::clone(&node.telemetry))
-}
-
-struct TelemetryOnlyNode {
-    telemetry: Arc<TelemetryHub>,
-    watch_tx: watch::Sender<bool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-static GLOBAL_TELEMETRY: Mutex<Option<TelemetryOnlyNode>> = Mutex::new(None);
-
-impl TelemetryOnlyNode {
-    fn start(
-        p2p_port: u16,
-        telemetry_port: u16,
-        node_id: u64,
-        peer_id: String,
-    ) -> Result<Self, String> {
-        let peer_count = Arc::new(AtomicUsize::new(0));
-        let telemetry = Arc::new(TelemetryHub::new(node_id, p2p_port, peer_count));
-        telemetry.set_local_peer_id_str(&peer_id);
-
-        let (watch_tx, watch_rx) = watch::channel(false);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let hub_bg = Arc::clone(&telemetry);
-
-        let thread = std::thread::Builder::new()
-            .name("fe-oracle-telemetry".to_string())
-            .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(format!("tokio runtime error: {e}")));
-                        return;
-                    }
-                };
-                rt.block_on(async move {
-                    let listener = match TcpListener::bind(("127.0.0.1", telemetry_port)).await {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(format!(
-                                "telemetry bind on 127.0.0.1:{telemetry_port} failed: {e}"
-                            )));
-                            return;
-                        }
-                    };
-                    let _ = ready_tx.send(Ok(()));
-                    let mut accept_watch = watch_rx;
-                    loop {
-                        tokio::select! {
-                            changed = accept_watch.changed() => {
-                                if changed.is_err() || *accept_watch.borrow() {
-                                    break;
-                                }
-                            }
-                            accepted = listener.accept() => {
-                                match accepted {
-                                    Ok((stream, _)) => {
-                                        let hub_conn = Arc::clone(&hub_bg);
-                                        let conn_watch = accept_watch.clone();
-                                        tokio::spawn(async move {
-                                            handle_telemetry_conn(stream, hub_conn, conn_watch).await;
-                                        });
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
-                });
-            })
-            .map_err(|e| format!("telemetry spawn failed: {e}"))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                telemetry,
-                watch_tx,
-                thread: Some(thread),
-            }),
-            Ok(Err(err)) => {
-                let _ = thread.join();
-                Err(err)
-            }
-            Err(e) => {
-                let _ = thread.join();
-                Err(format!("telemetry init channel error: {e}"))
-            }
-        }
-    }
-
-    fn stop(mut self) {
-        let _ = self.watch_tx.send(true);
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
-    }
+    Ok(Arc::clone(node.telemetry()))
 }
 
 fn start_global_node(
@@ -1366,115 +1271,47 @@ pub extern "C" fn p2p_sleep_ms(ms: u32) {
 }
 
 #[no_mangle]
-pub extern "C" fn telemetry_start(
-    p2p_port: u32,
-    telemetry_port: u32,
-    node_id: u64,
-    peer_id_ptr: *const u8,
-    peer_id_len: usize,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let Ok(p2p_port_u16) = u16::try_from(p2p_port) else {
-            return -2;
-        };
-        let Ok(telemetry_port_u16) = u16::try_from(telemetry_port) else {
-            return -2;
-        };
-        if telemetry_port_u16 == 0 {
-            return -2;
-        }
-        let peer_id = match read_utf8_arg(peer_id_ptr, peer_id_len) {
-            Ok(s) => s.to_string(),
-            Err(code) => return code,
-        };
-        let mut guard = match GLOBAL_TELEMETRY.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        if let Some(prev) = guard.take() {
-            prev.stop();
-        }
-        match TelemetryOnlyNode::start(p2p_port_u16, telemetry_port_u16, node_id, peer_id) {
-            Ok(node) => {
-                *guard = Some(node);
-                0
-            }
-            Err(_) => -6,
-        }
-    }))
-    .unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn telemetry_set_peers(
-    peer_count: u32,
-    peers_csv_ptr: *const u8,
-    peers_csv_len: usize,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let csv = match read_utf8_arg(peers_csv_ptr, peers_csv_len) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
-        let hub = match current_telemetry_hub() {
-            Ok(h) => h,
-            Err(code) => return code,
-        };
-        let peers: Vec<String> = csv
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect();
-        hub.set_peers_list(peer_count as usize, peers);
-        0
-    }))
-    .unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn telemetry_record_frame(
-    is_tx: u32,
-    peer_ptr: *const u8,
-    peer_len: usize,
+pub extern "C" fn crypto_keccak_and_sign_bytes(
+    privkey32_ptr: *const u8,
     data_ptr: *const u8,
     data_len: usize,
+    out_addr20: *mut u8,
+    out_rec_id: *mut u8,
+    out_r32: *mut u8,
+    out_s32: *mut u8,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let peer = match read_utf8_arg(peer_ptr, peer_len) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
-        if data_len > 0 && data_ptr.is_null() {
+        if privkey32_ptr.is_null()
+            || (data_len > 0 && data_ptr.is_null())
+            || out_addr20.is_null()
+            || out_rec_id.is_null()
+            || out_r32.is_null()
+            || out_s32.is_null()
+        {
             return -2;
         }
-        let bytes = if data_len == 0 {
+        let mut privkey = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(privkey32_ptr, privkey.as_mut_ptr(), 32);
+        }
+        let data = if data_len == 0 {
             &[][..]
         } else {
             unsafe { slice::from_raw_parts(data_ptr, data_len) }
         };
-        let hub = match current_telemetry_hub() {
-            Ok(h) => h,
-            Err(code) => return code,
-        };
-        let dir = if is_tx != 0 { "tx" } else { "rx" };
-        hub.record_frame(dir, peer, bytes);
-        0
-    }))
-    .unwrap_or(-99)
-}
 
-#[no_mangle]
-pub extern "C" fn telemetry_stop() -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let mut guard = match GLOBAL_TELEMETRY.lock() {
-            Ok(g) => g,
-            Err(_) => return -5,
-        };
-        if let Some(node) = guard.take() {
-            node.stop();
+        match sign_keccak_bytes(&privkey, data) {
+            Ok((addr, rec_id, r, s)) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(addr.as_ptr(), out_addr20, 20);
+                    *out_rec_id = rec_id;
+                    std::ptr::copy_nonoverlapping(r.as_ptr(), out_r32, 32);
+                    std::ptr::copy_nonoverlapping(s.as_ptr(), out_s32, 32);
+                }
+                0
+            }
+            Err(_) => -3,
         }
-        0
     }))
     .unwrap_or(-99)
 }
@@ -1853,74 +1690,48 @@ mod tests {
     }
 
     #[test]
-    fn test_standalone_telemetry_ffi_roundtrip() {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let peer_id = b"fe-udp-0000000100001b59";
+    fn test_crypto_keccak_and_sign_bytes_recovery() {
+        let pk: [u8; 32] =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let preimage = b"\xe4\x09\x85\x04\xa8\x17\xc8\x00\x82\x52\x08\x94\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x35\x80\x80\x01\x80\x80";
+        let mut addr = [0u8; 20];
+        let mut rec_id = 9u8;
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        let rc = crypto_keccak_and_sign_bytes(
+            pk.as_ptr(),
+            preimage.as_ptr(),
+            preimage.len(),
+            addr.as_mut_ptr(),
+            &mut rec_id as *mut u8,
+            r.as_mut_ptr(),
+            s.as_mut_ptr(),
+        );
+        assert_eq!(rc, 0);
         assert_eq!(
-            telemetry_start(7001, u32::from(port), 1, peer_id.as_ptr(), peer_id.len()),
-            0
+            hex::encode(addr),
+            "f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
         );
+        assert!(rec_id == 0 || rec_id == 1);
 
-        let peers_csv = b"fe-udp-0000000200001b5a,fe-udp-0000000300001b5b";
-        assert_eq!(
-            telemetry_set_peers(2, peers_csv.as_ptr(), peers_csv.len()),
-            0
-        );
-
-        let phase = b"phase_a_quotes";
-        let local_be = prices_to_be160(&TEST_PRICES);
-        let med_be = prices_to_be160(&TEST_PRICES);
-        assert_eq!(
-            p2p_telemetry_set_phase(
-                7,
-                phase.as_ptr(),
-                phase.len(),
-                local_be.as_ptr(),
-                med_be.as_ptr(),
-                1735689600
-            ),
-            0
-        );
-
-        let mut quote = vec![0u8; QUOTE_FRAME_LEN];
-        quote[0] = MSG_TYPE_QUOTE;
-        quote[8] = 7;
-        quote[17..177].copy_from_slice(&local_be);
-        assert_eq!(
-            telemetry_record_frame(
-                0,
-                peer_id.as_ptr(),
-                peer_id.len(),
-                quote.as_ptr(),
-                quote.len()
-            ),
-            0
-        );
-
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect /status");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        stream
-            .write_all(b"GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-            .unwrap();
-        let mut resp = String::new();
-        stream.read_to_string(&mut resp).unwrap();
-
-        assert!(
-            resp.contains("\"peer_id\":\"fe-udp-0000000100001b59\""),
-            "resp={resp}"
-        );
-        assert!(resp.contains("\"peer_count\":2"), "resp={resp}");
-        assert!(resp.contains("\"round_id\":7"), "resp={resp}");
-        assert!(resp.contains(&hex::encode(&quote)), "resp={resp}");
-
-        assert_eq!(telemetry_stop(), 0);
+        let mut digest = [0u8; 32];
+        let mut keccak = Keccak::v256();
+        keccak.update(preimage);
+        keccak.finalize(&mut digest);
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[0..32].copy_from_slice(&r);
+        sig_bytes[32..64].copy_from_slice(&s);
+        let sig = k256::ecdsa::Signature::from_slice(&sig_bytes).unwrap();
+        let rid = k256::ecdsa::RecoveryId::try_from(rec_id).unwrap();
+        let recovered = VerifyingKey::recover_from_prehash(&digest, &sig, rid).unwrap();
+        let encoded = recovered.to_encoded_point(false);
+        let mut hash = [0u8; 32];
+        let mut k2 = Keccak::v256();
+        k2.update(&encoded.as_bytes()[1..65]);
+        k2.finalize(&mut hash);
+        assert_eq!(&hash[12..32], &addr);
     }
 }

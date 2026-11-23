@@ -4,7 +4,10 @@ version = "0.1.0"
 
 [dependencies]
 cli = { path = "../cli" }
+coro = { path = "../coro" }
 feracle_core = { path = "../core" }
+http = { path = "../http" }
+net_reactor = { path = "../net_reactor" }
 p2p = { path = "../p2p" }
 p2p_libp2p = { path = "../p2p_libp2p", allow_unsafe = true }
 p2p_tcp = { path = "../p2p_tcp" }

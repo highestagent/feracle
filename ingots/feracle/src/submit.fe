@@ -1,145 +1,448 @@
-use std::io::{Stderr, Stdout}
 use std::net::{Net, SocketAddr}
-use std::process::{Command, Redirect, Spawn}
-use std::time::Duration
+use coro::{Coroutine, Join2, Poll, Scheduler, Sleep, TaskId, Timeout}
 use feracle_core::{
-    ASSET_COUNT,
-    SEL_CURRENT_ROUND,
-    SEL_LATEST_PRICES,
     SigMsg,
-    decode_latest_prices_abi_hex,
+    encode_eip155_signed_tx,
+    encode_eip155_unsigned_tx,
+    encode_submit_medians_calldata,
+    json_get_raw,
     json_get_str_bounds,
-    parse_abi_word_u64,
-    push_hex_32,
+    parse_hex_u128,
+    parse_hex_u64,
+    push_addr20_hex,
+    push_hex_bytes,
 }
-use super::http::http_request
+use http::HttpRequest
+use net_reactor::SocketIo
+use super::ffi
+use super::rpc::{RPC_TIMEOUT_MS, flatten_http_body, parse_rpc_str_result, start_rpc_request}
 
-fn eth_call_raw(rpc_addr: SocketAddr, contract_0x: MemSpan, selector_0x: String<10>) -> Option<
-    MemBuffer,
->
-uses (net: mut Net)
-{
-    let rpc_body = format!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"",
-        contract_0x,
-        "\",\"data\":\"",
-        selector_0x,
-        "\"},\"latest\"]}",
-    )
-    let req = format!(
-        "POST / HTTP/1.1\r\nHost: ",
-        rpc_addr,
-        "\r\nContent-Type: application/json\r\nContent-Length: ",
-        rpc_body.len(),
-        "\r\nConnection: close\r\n\r\n",
-        rpc_body,
-    )
-    let resp_body = http_request(addr: rpc_addr, request_bytes: req.span())?
-    let (off, len) = json_get_str_bounds(resp_body.span(), "result".span())?
-    let res_hex = resp_body.span().slice(offset: off, len)
-    if !res_hex.starts_with("0x") {
-        return Option::None
-    }
-    Option::Some(MemBuffer::from_span(res_hex.tail(2)))
+const SUBMIT_TIMEOUT_MS: u64 = 15000
+const RECEIPT_POLL_MS: u64 = 150
+const TX_GAS_LIMIT: u64 = 1_500_000
+const MIN_GAS_PRICE_WEI: u128 = 2_000_000_000
+
+pub struct SubmitConfirmed { pub round_id: u64, pub btc_price: u64, pub timestamp: u64 }
+
+impl Copy for SubmitConfirmed {}
+
+pub enum SubmitOutcome {
+    Confirmed(SubmitConfirmed),
+    Failed(MemBuffer),
 }
 
-pub fn query_current_round(rpc_addr: SocketAddr, contract_0x: MemSpan) -> Option<u64>
-uses (net: mut Net)
-{
-    let raw_hex = eth_call_raw(rpc_addr, contract_0x, selector_0x: SEL_CURRENT_ROUND)?
-    parse_abi_word_u64(raw_hex.span(), word_idx: 0)
+enum SubmitPhase {
+    FetchingNonceAndGas(Join2<Timeout<HttpRequest>, Timeout<HttpRequest>>),
+    SendingRawTx(Timeout<HttpRequest>),
+    WaitingReceiptTimer(Sleep),
+    PollingReceipt(Timeout<HttpRequest>),
+    Done,
 }
 
-pub fn query_latest_prices(rpc_addr: SocketAddr, contract_0x: MemSpan) -> Option<([u64; 20], u64)>
-uses (net: mut Net)
-{
-    let raw_hex = eth_call_raw(rpc_addr, contract_0x, selector_0x: SEL_LATEST_PRICES)?
-    decode_latest_prices_abi_hex(raw_hex.span())
-}
-
-fn format_prices_array(_ prices: [u64; 20]) -> MemBuffer {
-    var out = MemBuffer::empty()
-    out.push(b'[')
-    var i: usize = 0
-    while i < ASSET_COUNT {
-        if i > 0 { out.push(b',') }
-        write!(mut out, prices[i])
-        i += 1
-    }
-    out.push(b']')
-    out
-}
-
-fn format_sigs_tuple(_ sigs: [SigMsg; 3]) -> MemBuffer {
-    var out = MemBuffer::empty()
-    out.push(b'[')
-    var i: usize = 0
-    while i < 3 {
-        if i > 0 { out.push(b',') }
-        let sig = sigs[i]
-        out.push(b'(')
-        write!(mut out, sig.v, ",")
-        push_hex_32(mut out, sig.r)
-        out.push(b',')
-        push_hex_32(mut out, sig.s)
-        out.push(b')')
-        i += 1
-    }
-    out.push(b']')
-    out
-}
-
-pub fn submit_medians(
-    rpc_url: MemSpan,
-    privkey_0x: MemSpan,
-    contract_0x: MemSpan,
+pub struct SubmitMediansCoro {
+    owner: TaskId,
+    phase: SubmitPhase,
+    rpc_addr: SocketAddr,
+    rpc_path: MemBuffer,
+    privkey32: MemBuffer,
+    chain_id: u64,
+    contract20: MemBuffer,
     round_id: u64,
-    prices: [u64; 20],
+    btc_price: u64,
     timestamp: u64,
-    sigs: [SigMsg; 3],
-) -> bool
-uses (proc: mut Spawn, out: mut Stdout, err: mut Stderr)
-{
-    let prices_arg = format_prices_array(prices)
-    let sigs_arg = format_sigs_tuple(sigs)
-    let cmd = Command::new("cast")
-        .arg("send")
-        .arg("--rpc-url")
-        .arg(rpc_url)
-        .arg("--private-key")
-        .arg(privkey_0x)
-        .arg(contract_0x)
-        .arg(
-            "submitMedians(uint256,uint256[20],uint256,(uint8,uint256,uint256)[3])",
-        )
-        .arg(round_id)
-        .arg(prices_arg)
-        .arg(timestamp)
-        .arg(sigs_arg)
-        .stdout(Redirect::Capture)
-        .stderr(Redirect::Capture)
-        .timeout(Duration::from_secs(15))
+    calldata: MemBuffer,
+    started_ms: u64,
+    tx_hash: MemBuffer,
+    outcome: Option<SubmitOutcome>,
+}
 
-    match proc.output(cmd) {
-        Result::Ok(output) => {
-            if output.status.success() {
-                println!(
-                    "submitted round ",
-                    round_id,
-                    " assets=20 btc=",
-                    prices[0],
-                    " ts=",
-                    timestamp,
+impl SubmitMediansCoro {
+    pub fn start(
+        rpc_addr: SocketAddr,
+        rpc_path: MemSpan,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        prices: [u64; 20],
+        timestamp: u64,
+        sigs: [SigMsg; 3],
+    ) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let owner = sched.alloc_task()
+        let started_ms = sched.now_ms()
+
+        var empty = MemBuffer::empty()
+        let Option::Some((addr20, _, _, _)) = ffi::sign_raw_bytes(
+            privkey32,
+            data: empty.span(),
+        ) else {
+            sched.wake(owner)
+            return Self::failed(
+                owner,
+                rpc_addr,
+                rpc_path,
+                privkey32,
+                chain_id,
+                contract20,
+                round_id,
+                btc_price: prices[0],
+                timestamp,
+                started_ms,
+                err: format!("eth_sendRawTransaction: invalid signing key"),
+            )
+        }
+        if contract20.len() != 20 {
+            sched.wake(owner)
+            return Self::failed(
+                owner,
+                rpc_addr,
+                rpc_path,
+                privkey32,
+                chain_id,
+                contract20,
+                round_id,
+                btc_price: prices[0],
+                timestamp,
+                started_ms,
+                err: format!("eth_sendRawTransaction: invalid contract address length"),
+            )
+        }
+
+        var calldata = MemBuffer::with_capacity(996)
+        encode_submit_medians_calldata(round_id, prices, timestamp, sigs, mut calldata)
+
+        var from_0x = MemBuffer::with_capacity(42)
+        push_addr20_hex(addr20, mut from_0x)
+        let nonce_body = format!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionCount\",\"params\":[\"",
+            from_0x,
+            "\",\"pending\"]}",
+        )
+        let gas_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_gasPrice\",\"params\":[]}"
+
+        let nonce_req = start_rpc_request(
+            owner,
+            rpc_addr,
+            rpc_path,
+            rpc_body: nonce_body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+        let gas_req = start_rpc_request(
+            owner,
+            rpc_addr,
+            rpc_path,
+            rpc_body: gas_body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+
+        SubmitMediansCoro {
+            owner,
+            phase: SubmitPhase::FetchingNonceAndGas(Join2::new(nonce_req, gas_req)),
+            rpc_addr,
+            rpc_path: MemBuffer::from_span(rpc_path),
+            privkey32: MemBuffer::from_span(privkey32),
+            chain_id,
+            contract20: MemBuffer::from_span(contract20),
+            round_id,
+            btc_price: prices[0],
+            timestamp,
+            calldata,
+            started_ms,
+            tx_hash: MemBuffer::empty(),
+            outcome: Option::None,
+        }
+    }
+
+    fn failed(
+        owner: TaskId,
+        rpc_addr: SocketAddr,
+        rpc_path: MemSpan,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        btc_price: u64,
+        timestamp: u64,
+        started_ms: u64,
+        err: own MemBuffer,
+    ) -> Self {
+        SubmitMediansCoro {
+            owner,
+            phase: SubmitPhase::Done,
+            rpc_addr,
+            rpc_path: MemBuffer::from_span(rpc_path),
+            privkey32: MemBuffer::from_span(privkey32),
+            chain_id,
+            contract20: MemBuffer::from_span(contract20),
+            round_id,
+            btc_price,
+            timestamp,
+            calldata: MemBuffer::empty(),
+            started_ms,
+            tx_hash: MemBuffer::empty(),
+            outcome: Option::Some(SubmitOutcome::Failed(err)),
+        }
+    }
+
+    fn finish(mut self, _ result: own SubmitOutcome) -> Poll<SubmitOutcome>
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        self.phase = SubmitPhase::Done
+        sched.cancel_owner_timers(self.owner)
+        io.deregister_owner(self.owner)
+        Poll::Ready(result)
+    }
+
+    fn start_receipt_poll(mut self)
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let body = format!(
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"eth_getTransactionReceipt\",\"params\":[\"",
+            self.tx_hash,
+            "\"]}",
+        )
+        let req = start_rpc_request(
+            owner: self.owner,
+            rpc_addr: self.rpc_addr,
+            rpc_path: self.rpc_path.span(),
+            rpc_body: body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+        self.phase = SubmitPhase::PollingReceipt(req)
+    }
+}
+
+impl Coroutine for SubmitMediansCoro {
+    type Output = SubmitOutcome
+    uses E = (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+
+    fn poll(mut self) -> Poll<SubmitOutcome> uses E {
+        match self.phase {
+            SubmitPhase::Done => {
+                if let Option::Some(res) = self.outcome.take() {
+                    return Poll::Ready(res)
+                }
+                return Poll::Ready(
+                    SubmitOutcome::Failed(format!("submission already finished")),
                 )
-                true
-            } else {
-                eprintln!("cast send failed (", output.status, "): ", output.stderr)
-                false
-            }
-        },
-        Result::Err(e) => {
-            eprintln!("failed to spawn cast send: ", e)
-            false
-        },
+            },
+            SubmitPhase::FetchingNonceAndGas(mut join) => {
+                let Poll::Ready((nonce_res, gas_res)) = join.poll() else {
+                    return Poll::Pending
+                }
+                var nonce_opt: Option<u64> = Option::None
+                if let Option::Some(body) = flatten_http_body(nonce_res) {
+                    if let Option::Some(res) = parse_rpc_str_result(body.span()) {
+                        nonce_opt = parse_hex_u64(res.span())
+                    }
+                }
+                var gas_opt: Option<u128> = Option::None
+                if let Option::Some(body) = flatten_http_body(gas_res) {
+                    if let Option::Some(res) = parse_rpc_str_result(body.span()) {
+                        gas_opt = parse_hex_u128(res.span())
+                    }
+                }
+                let Option::Some(nonce) = nonce_opt else {
+                    return self.finish(
+                        SubmitOutcome::Failed(
+                            format!(
+                                "eth_getTransactionCount failed for round ",
+                                self.round_id,
+                            ),
+                        ),
+                    )
+                }
+                let Option::Some(raw_gas) = gas_opt else {
+                    return self.finish(
+                        SubmitOutcome::Failed(
+                            format!("eth_gasPrice failed for round ", self.round_id),
+                        ),
+                    )
+                }
+                let bumped = raw_gas * (12 as u128) / (10 as u128)
+                let gas_price = if bumped > MIN_GAS_PRICE_WEI {
+                    bumped
+                } else {
+                    MIN_GAS_PRICE_WEI
+                }
+
+                var unsigned_rlp = MemBuffer::with_capacity(1100)
+                encode_eip155_unsigned_tx(
+                    nonce,
+                    gas_price,
+                    gas_limit: TX_GAS_LIMIT,
+                    to20: self.contract20.span(),
+                    calldata: self.calldata.span(),
+                    chain_id: self.chain_id,
+                    mut unsigned_rlp,
+                )
+                let Option::Some((_, rec_id, r, s)) = ffi::sign_raw_bytes(
+                    privkey32: self.privkey32.span(),
+                    data: unsigned_rlp.span(),
+                ) else {
+                    return self.finish(
+                        SubmitOutcome::Failed(
+                            format!("failed to sign raw tx for round ", self.round_id),
+                        ),
+                    )
+                }
+                let v: u128 = (self.chain_id as u128) * (2 as u128)
+                    + (35 as u128)
+                    + (rec_id as u128)
+                var signed_rlp = MemBuffer::with_capacity(1200)
+                encode_eip155_signed_tx(
+                    nonce,
+                    gas_price,
+                    gas_limit: TX_GAS_LIMIT,
+                    to20: self.contract20.span(),
+                    calldata: self.calldata.span(),
+                    v,
+                    r,
+                    s,
+                    mut signed_rlp,
+                )
+
+                var raw_hex = MemBuffer::with_capacity(2 + signed_rlp.len() * 2)
+                raw_hex.extend_from("0x".span())
+                push_hex_bytes(mut raw_hex, signed_rlp.span())
+                let send_body = format!(
+                    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"eth_sendRawTransaction\",\"params\":[\"",
+                    raw_hex,
+                    "\"]}",
+                )
+                let req = start_rpc_request(
+                    owner: self.owner,
+                    rpc_addr: self.rpc_addr,
+                    rpc_path: self.rpc_path.span(),
+                    rpc_body: send_body.span(),
+                    timeout_ms: RPC_TIMEOUT_MS,
+                )
+                self.phase = SubmitPhase::SendingRawTx(req)
+                return Poll::Pending
+            },
+            SubmitPhase::SendingRawTx(mut req) => {
+                let Poll::Ready(send_res) = req.poll() else {
+                    return Poll::Pending
+                }
+                let Option::Some(body) = flatten_http_body(send_res) else {
+                    return self.finish(
+                        SubmitOutcome::Failed(
+                            format!(
+                                "eth_sendRawTransaction HTTP failure for round ",
+                                self.round_id,
+                            ),
+                        ),
+                    )
+                }
+                let Option::Some(tx_hash) = parse_rpc_str_result(body.span()) else {
+                    return self.finish(
+                        SubmitOutcome::Failed(format!("eth_sendRawTransaction RPC error: ", body)),
+                    )
+                }
+                if !tx_hash.span().starts_with("0x") {
+                    return self.finish(
+                        SubmitOutcome::Failed(
+                            format!("eth_sendRawTransaction invalid tx hash: ", tx_hash),
+                        ),
+                    )
+                }
+                self.tx_hash = tx_hash
+                self.start_receipt_poll()
+                return Poll::Pending
+            },
+            SubmitPhase::WaitingReceiptTimer(mut sleep) => {
+                let Poll::Ready(_) = sleep.poll() else {
+                    return Poll::Pending
+                }
+                self.start_receipt_poll()
+                return Poll::Pending
+            },
+            SubmitPhase::PollingReceipt(mut req) => {
+                let Poll::Ready(receipt_res) = req.poll() else {
+                    return Poll::Pending
+                }
+                if let Option::Some(body) = flatten_http_body(receipt_res) {
+                    if let Option::Some((roff, rlen)) = json_get_raw(body.span(), "result".span()) {
+                        let trimmed = body.span().slice(offset: roff, len: rlen).trim()
+                        if trimmed != "null" {
+                            if let Option::Some((soff, slen)) = json_get_str_bounds(
+                                trimmed,
+                                "status".span(),
+                            ) {
+                                let status_span = trimmed.slice(offset: soff, len: slen)
+                                if let Option::Some(st) = parse_hex_u64(status_span) {
+                                    if st == 1 {
+                                        return self.finish(
+                                            SubmitOutcome::Confirmed(
+                                                SubmitConfirmed {
+                                                    round_id: self.round_id,
+                                                    btc_price: self.btc_price,
+                                                    timestamp: self.timestamp,
+                                                },
+                                            ),
+                                        )
+                                    }
+                                    return self.finish(
+                                        SubmitOutcome::Failed(
+                                            format!(
+                                                "eth_sendRawTransaction receipt reverted status=",
+                                                st,
+                                            ),
+                                        ),
+                                    )
+                                }
+                            }
+                            return self.finish(
+                                SubmitOutcome::Failed(
+                                    format!(
+                                        "eth_getTransactionReceipt missing status in: ",
+                                        trimmed,
+                                    ),
+                                ),
+                            )
+                        }
+                    } else if json_get_raw(body.span(), "error".span()).is_some() {
+                        return self.finish(
+                            SubmitOutcome::Failed(
+                                format!("eth_getTransactionReceipt RPC error: ", body),
+                            ),
+                        )
+                    }
+                }
+
+                if sched.now_ms() - self.started_ms >= SUBMIT_TIMEOUT_MS {
+                    return self.finish(
+                        SubmitOutcome::Failed(
+                            format!(
+                                "eth_sendRawTransaction timed out waiting for receipt round=",
+                                self.round_id,
+                                " tx=",
+                                self.tx_hash,
+                            ),
+                        ),
+                    )
+                }
+                self.phase = SubmitPhase::WaitingReceiptTimer(
+                    Sleep::after(owner: self.owner, delay_ms: RECEIPT_POLL_MS),
+                )
+                return Poll::Pending
+            },
+        }
+    }
+
+    fn cancel(mut self) uses E {
+        match self.phase {
+            SubmitPhase::FetchingNonceAndGas(mut join) => join.cancel(),
+            SubmitPhase::SendingRawTx(mut req) => req.cancel(),
+            SubmitPhase::WaitingReceiptTimer(mut sleep) => sleep.cancel(),
+            SubmitPhase::PollingReceipt(mut req) => req.cancel(),
+            SubmitPhase::Done => {},
+        }
+        self.phase = SubmitPhase::Done
+        self.outcome = Option::None
+        sched.cancel_owner_timers(self.owner)
+        io.deregister_owner(self.owner)
     }
 }

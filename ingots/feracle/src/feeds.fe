@@ -1,7 +1,6 @@
 use core::num::IntDowncast
-use std::io::Stderr
 use std::net::{Net, SocketAddr}
-use std::time::Clock
+use coro::{BoundedPool, Coroutine, Poll, PoolDone, Scheduler, TaskId, Timeout}
 use feracle_core::{
     ASSET_COUNT,
     asset_id_from_symbol,
@@ -11,7 +10,13 @@ use feracle_core::{
     parse_decimal_1e8_span,
     write_asset_symbol,
 }
-use super::http::http_request
+use http::HttpRequest
+use net_reactor::SocketIo
+use super::rpc::flatten_http_body
+
+const FEED_TIMEOUT_MS: u64 = 5000
+const MAX_COINBASE_INFLIGHT: usize = 8
+const MAX_COINBASE_RETRIES: u8 = 1
 
 pub enum FeedKind {
     Hyperliquid,
@@ -44,43 +49,42 @@ pub struct FeedReport {
 
 impl Copy for FeedReport {}
 
-fn fetch_hyperliquid_all(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
-uses (net: mut Net)
-{
+pub struct FeedFetchOutcome { pub medians: Option<[u64; 20]>, pub reports: MemVec<FeedReport> }
+
+struct SourceState {
+    src: FeedSource,
+    started_ms: u64,
+    latency_ms: u64,
+    remaining: usize,
+    prices: [u64; 20],
+    assets_ok: u32,
+}
+
+struct BulkJob { src_idx: usize, kind: FeedKind, req: Timeout<HttpRequest> }
+
+struct CoinbaseTask {
+    src_idx: usize,
+    asset_idx: usize,
+    retries_left: u8,
+    addr: SocketAddr,
+    owner: TaskId,
+}
+
+impl Copy for CoinbaseTask {}
+
+fn build_hyperliquid_request(_ addr: SocketAddr) -> MemBuffer {
     let hl_body = "{\"type\":\"allMids\"}"
-    let req = format!(
+    format!(
         "POST /info HTTP/1.1\r\nHost: ",
-        source.addr,
+        addr,
         "\r\nContent-Type: application/json\r\nContent-Length: ",
         hl_body.len(),
         "\r\nConnection: close\r\n\r\n",
         hl_body,
     )
-    let Option::Some(body) = http_request(addr: source.addr, request_bytes: req.span()) else {
-        return 0
-    }
-    var count: u32 = 0
-    var i: usize = 0
-    while i < ASSET_COUNT {
-        var sym = MemBuffer::with_capacity(8)
-        write_asset_symbol(i, mut sym)
-        if let Option::Some((off, len)) = json_get_str_bounds(body.span(), sym.span()) {
-            let val_span = body.span().slice(offset: off, len)
-            if let Option::Some(price) = parse_decimal_1e8_span(val_span) {
-                if price > 0 {
-                    out_prices[i] = price
-                    count += 1
-                }
-            }
-        }
-        i += 1
-    }
-    count
 }
 
-fn fetch_binance_all(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
-uses (net: mut Net)
-{
+fn build_binance_request(_ addr: SocketAddr) -> MemBuffer {
     var req = MemBuffer::with_capacity(512)
     req.extend_from("GET /api/v3/ticker/price?symbols=%5B".span())
     var idx: usize = 0
@@ -94,21 +98,53 @@ uses (net: mut Net)
     write!(
         mut req,
         "%5D HTTP/1.1\r\nHost: ",
-        source.addr,
+        addr,
         "\r\nConnection: close\r\n\r\n",
     )
+    req
+}
 
-    let Option::Some(body) = http_request(addr: source.addr, request_bytes: req.span()) else {
-        return 0
+fn build_coinbase_request(_ addr: SocketAddr, asset_idx: usize) -> MemBuffer {
+    var req = MemBuffer::with_capacity(160)
+    req.extend_from("GET /products/".span())
+    write_asset_symbol(asset_idx, mut req)
+    write!(
+        mut req,
+        "-USD/ticker HTTP/1.1\r\nHost: ",
+        addr,
+        "\r\nUser-Agent: fe-oracle/1.0\r\nConnection: close\r\n\r\n",
+    )
+    req
+}
+
+fn parse_hyperliquid_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
+    var count: u32 = 0
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        var sym = MemBuffer::with_capacity(8)
+        write_asset_symbol(i, mut sym)
+        if let Option::Some((off, len)) = json_get_str_bounds(body, sym.span()) {
+            let val_span = body.slice(offset: off, len)
+            if let Option::Some(price) = parse_decimal_1e8_span(val_span) {
+                if price > 0 {
+                    out_prices[i] = price
+                    count += 1
+                }
+            }
+        }
+        i += 1
     }
-    let span = body.span()
+    count
+}
+
+fn parse_binance_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
     var count: u32 = 0
     var cursor: usize = 0
     while true {
-        let Option::Some((obj_off, obj_len)) = json_next_array_elem(span, mut cursor) else {
+        let Option::Some((obj_off, obj_len)) = json_next_array_elem(body, mut cursor) else {
             break
         }
-        let obj = span.slice(offset: obj_off, len: obj_len)
+        let obj = body.slice(offset: obj_off, len: obj_len)
         if let Option::Some((soff, slen)) = json_get_str_bounds(obj, "symbol".span()) {
             let sym_full = obj.slice(offset: soff, len: slen)
             if sym_full.len() > 4 && sym_full.ends_with("USDT") {
@@ -130,113 +166,23 @@ uses (net: mut Net)
     count
 }
 
-fn fetch_coinbase_all(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
-uses (net: mut Net)
-{
-    var count: u32 = 0
-    var i: usize = 0
-    while i < ASSET_COUNT {
-        var req = MemBuffer::with_capacity(160)
-        req.extend_from("GET /products/".span())
-        write_asset_symbol(i, mut req)
-        write!(
-            mut req,
-            "-USD/ticker HTTP/1.1\r\nHost: ",
-            source.addr,
-            "\r\nUser-Agent: fe-oracle/1.0\r\nConnection: close\r\n\r\n",
-        )
-        if let Option::Some(body) = http_request(addr: source.addr, request_bytes: req.span()) {
-            if let Option::Some((off, len)) = json_get_str_bounds(body.span(), "price".span()) {
-                let val_span = body.span().slice(offset: off, len)
-                if let Option::Some(price) = parse_decimal_1e8_span(val_span) {
-                    if price > 0 {
-                        out_prices[i] = price
-                        count += 1
-                    }
-                }
-            }
-        }
-        i += 1
-    }
-    count
-}
-
-pub fn fetch_source_prices(_ source: FeedSource, _ out_prices: mut [u64; 20]) -> u32
-uses (net: mut Net)
-{
-    var i: usize = 0
-    while i < ASSET_COUNT {
-        out_prices[i] = 0
-        i += 1
-    }
-    match source.kind {
-        FeedKind::Hyperliquid => fetch_hyperliquid_all(source, mut out_prices),
-        FeedKind::Binance => fetch_binance_all(source, mut out_prices),
-        FeedKind::Coinbase => fetch_coinbase_all(source, mut out_prices),
+fn parse_coinbase_price(_ body: MemSpan) -> Option<u64> {
+    let (off, len) = json_get_str_bounds(body, "price".span())?
+    let val_span = body.slice(offset: off, len)
+    let price = parse_decimal_1e8_span(val_span)?
+    if price > 0 {
+        Option::Some(price)
+    } else {
+        Option::None
     }
 }
 
-pub fn fetch_local_medians_detailed(
-    _ sources: MemSlice<FeedSource>,
-    _ reports: mut MemVec<FeedReport>,
-) -> Option<[u64; 20]>
-uses (net: mut Net, err: mut Stderr, clock: Clock)
-{
-    reports.clear()
-    var counts: [usize; 20] = [0; 20]
-    var s0: [u64; 20] = [0; 20]
-    var s1: [u64; 20] = [0; 20]
-    var s2: [u64; 20] = [0; 20]
-
-    var i: usize = 0
-    while i < sources.len() {
-        let src = sources.at(i)
-        var fetched: [u64; 20] = [0; 20]
-        let started = clock.instant()
-        let assets_ok = fetch_source_prices(src, mut fetched)
-        let latency_ms = clock.instant().duration_since(started).as_millis()
-        let ok = assets_ok > 0
-        if !ok {
-            eprintln!(
-                "warning: failed to fetch feed source index=",
-                i,
-                " addr=",
-                src.addr,
-            )
-        }
-        reports
-            .push(
-                FeedReport {
-                    kind: src.kind,
-                    addr: src.addr,
-                    price: fetched[0],
-                    assets_ok,
-                    ok,
-                    latency_ms,
-                },
-            )
-
-        var a: usize = 0
-        while a < ASSET_COUNT {
-            let p = fetched[a]
-            if p > 0 {
-                let c = counts[a]
-                if c == 0 {
-                    s0[a] = p
-                    counts[a] = 1
-                } else if c == 1 {
-                    s1[a] = p
-                    counts[a] = 2
-                } else if c == 2 {
-                    s2[a] = p
-                    counts[a] = 3
-                }
-            }
-            a += 1
-        }
-        i += 1
-    }
-
+fn compute_medians(
+    _ counts: [usize; 20],
+    _ s0: [u64; 20],
+    _ s1: [u64; 20],
+    _ s2: [u64; 20],
+) -> Option<[u64; 20]> {
     var out: [u64; 20] = [0; 20]
     var a: usize = 0
     while a < ASSET_COUNT {
@@ -254,4 +200,289 @@ uses (net: mut Net, err: mut Stderr, clock: Clock)
         a += 1
     }
     Option::Some(out)
+}
+
+pub struct FetchFeedsCoro {
+    owner: TaskId,
+    sources: MemVec<SourceState>,
+    bulk_jobs: MemVec<BulkJob>,
+    cb_pool: BoundedPool<CoinbaseTask, Timeout<HttpRequest>>,
+    done: bool,
+}
+
+impl FetchFeedsCoro {
+    pub fn start(_ feed_sources: MemSlice<FeedSource>) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let owner = sched.alloc_task()
+        let now_ms = sched.now_ms()
+        var sources = MemVec<SourceState>::new()
+        var bulk_jobs = MemVec<BulkJob>::new()
+        var cb_pool = BoundedPool<CoinbaseTask, Timeout<HttpRequest>>::new(
+            max_inflight: MAX_COINBASE_INFLIGHT,
+        )
+
+        var i: usize = 0
+        while i < feed_sources.len() {
+            let src = feed_sources.at(i)
+            let rem: usize = match src.kind {
+                FeedKind::Coinbase => ASSET_COUNT,
+                _ => 1,
+            }
+            sources
+                .push(
+                    SourceState {
+                        src,
+                        started_ms: now_ms,
+                        latency_ms: 0,
+                        remaining: rem,
+                        prices: [0; 20],
+                        assets_ok: 0,
+                    },
+                )
+            match src.kind {
+                FeedKind::Hyperliquid => {
+                    let req_buf = build_hyperliquid_request(src.addr)
+                    let req = HttpRequest::start_with_timeout(
+                        owner,
+                        addr: src.addr,
+                        request_bytes: req_buf.span(),
+                        timeout_ms: FEED_TIMEOUT_MS,
+                    )
+                    bulk_jobs.push(BulkJob { src_idx: i, kind: src.kind, req })
+                },
+                FeedKind::Binance => {
+                    let req_buf = build_binance_request(src.addr)
+                    let req = HttpRequest::start_with_timeout(
+                        owner,
+                        addr: src.addr,
+                        request_bytes: req_buf.span(),
+                        timeout_ms: FEED_TIMEOUT_MS,
+                    )
+                    bulk_jobs.push(BulkJob { src_idx: i, kind: src.kind, req })
+                },
+                FeedKind::Coinbase => {
+                    var asset_idx: usize = 0
+                    while asset_idx < ASSET_COUNT {
+                        cb_pool
+                            .enqueue(
+                                CoinbaseTask {
+                                    src_idx: i,
+                                    asset_idx,
+                                    retries_left: MAX_COINBASE_RETRIES,
+                                    addr: src.addr,
+                                    owner,
+                                },
+                            )
+                        asset_idx += 1
+                    }
+                },
+            }
+            i += 1
+        }
+
+        cb_pool
+            .refill(
+                |task: ref CoinbaseTask| -> Timeout<HttpRequest> {
+                    let req_buf = build_coinbase_request(task.addr, asset_idx: task.asset_idx)
+                    HttpRequest::start_with_timeout(
+                        owner: task.owner,
+                        addr: task.addr,
+                        request_bytes: req_buf.span(),
+                        timeout_ms: FEED_TIMEOUT_MS,
+                    )
+                },
+            )
+
+        FetchFeedsCoro { owner, sources, bulk_jobs, cb_pool, done: false }
+    }
+
+    fn build_outcome(self) -> FeedFetchOutcome {
+        var reports = MemVec<FeedReport>::new()
+        var counts: [usize; 20] = [0; 20]
+        var s0: [u64; 20] = [0; 20]
+        var s1: [u64; 20] = [0; 20]
+        var s2: [u64; 20] = [0; 20]
+
+        var i: usize = 0
+        while i < self.sources.len() {
+            let st = ref self.sources[i]
+            let ok = st.assets_ok > 0
+            reports
+                .push(
+                    FeedReport {
+                        kind: st.src.kind,
+                        addr: st.src.addr,
+                        price: st.prices[0],
+                        assets_ok: st.assets_ok,
+                        ok,
+                        latency_ms: st.latency_ms,
+                    },
+                )
+            var a: usize = 0
+            while a < ASSET_COUNT {
+                let p = st.prices[a]
+                if p > 0 {
+                    let c = counts[a]
+                    if c == 0 {
+                        s0[a] = p
+                        counts[a] = 1
+                    } else if c == 1 {
+                        s1[a] = p
+                        counts[a] = 2
+                    } else if c == 2 {
+                        s2[a] = p
+                        counts[a] = 3
+                    }
+                }
+                a += 1
+            }
+            i += 1
+        }
+        let medians = compute_medians(counts, s0, s1, s2)
+        FeedFetchOutcome { medians, reports }
+    }
+}
+
+impl Coroutine for FetchFeedsCoro {
+    type Output = FeedFetchOutcome
+    uses E = (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+
+    fn poll(mut self) -> Poll<FeedFetchOutcome> uses E {
+        if self.done {
+            return Poll::Ready(self.build_outcome())
+        }
+
+        let now_ms = sched.now_ms()
+
+        var bi: usize = 0
+        while bi < self.bulk_jobs.len() {
+            let finished = match self.bulk_jobs.get(bi) {
+                Option::Some(mut job) => {
+                    match job.req.poll() {
+                        Poll::Ready(res) => {
+                            let body_opt = flatten_http_body(res)
+                            let sidx = job.src_idx
+                            let kind = job.kind
+                            if let Option::Some(mut st) = self.sources.get(sidx) {
+                                var p = st.prices
+                                let n = match body_opt {
+                                    Option::Some(ref body) => match kind {
+                                        FeedKind::Hyperliquid => {
+                                            parse_hyperliquid_body(body.span(), mut p)
+                                        },
+                                        FeedKind::Binance => {
+                                            parse_binance_body(body.span(), mut p)
+                                        },
+                                        FeedKind::Coinbase => 0,
+                                    },
+                                    Option::None => 0,
+                                }
+                                st.prices = p
+                                st.assets_ok = n
+                                st.remaining = 0
+                                st.latency_ms = now_ms - st.started_ms
+                            }
+                            true
+                        },
+                        Poll::Pending => false,
+                    }
+                },
+                Option::None => true,
+            }
+            if finished {
+                let _ = self.bulk_jobs.swap_remove(bi)
+            } else {
+                bi += 1
+            }
+        }
+
+        var completed = MemVec<PoolDone<CoinbaseTask, Option<Option<MemBuffer>>>>::new()
+        self.cb_pool.poll_ready(mut completed)
+        while let Option::Some(done_item) = completed.pop() {
+            let task = done_item.key
+            let body_opt = flatten_http_body(done_item.value)
+            let price_opt = match body_opt {
+                Option::Some(ref body) => parse_coinbase_price(body.span()),
+                Option::None => Option::None,
+            }
+            match price_opt {
+                Option::Some(price) => {
+                    if let Option::Some(mut st) = self.sources.get(task.src_idx) {
+                        var p = st.prices
+                        if p[task.asset_idx] == 0 {
+                            st.assets_ok += 1
+                        }
+                        p[task.asset_idx] = price
+                        st.prices = p
+                        if st.remaining > 0 {
+                            st.remaining -= 1
+                        }
+                        if st.remaining == 0 {
+                            st.latency_ms = now_ms - st.started_ms
+                        }
+                    }
+                },
+                Option::None => {
+                    if task.retries_left > 0 {
+                        self.cb_pool
+                            .enqueue(
+                                CoinbaseTask {
+                                    src_idx: task.src_idx,
+                                    asset_idx: task.asset_idx,
+                                    retries_left: task.retries_left - 1,
+                                    addr: task.addr,
+                                    owner: task.owner,
+                                },
+                            )
+                    } else {
+                        if let Option::Some(mut st) = self.sources.get(task.src_idx) {
+                            if st.remaining > 0 {
+                                st.remaining -= 1
+                            }
+                            if st.remaining == 0 {
+                                st.latency_ms = now_ms - st.started_ms
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        self.cb_pool
+            .refill(
+                |task: ref CoinbaseTask| -> Timeout<HttpRequest> {
+                    let req_buf = build_coinbase_request(task.addr, asset_idx: task.asset_idx)
+                    HttpRequest::start_with_timeout(
+                        owner: task.owner,
+                        addr: task.addr,
+                        request_bytes: req_buf.span(),
+                        timeout_ms: FEED_TIMEOUT_MS,
+                    )
+                },
+            )
+
+        if self.bulk_jobs.is_empty() && self.cb_pool.is_done() {
+            self.done = true
+            sched.cancel_owner_timers(self.owner)
+            io.deregister_owner(self.owner)
+            return Poll::Ready(self.build_outcome())
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        var bi: usize = 0
+        while bi < self.bulk_jobs.len() {
+            if let Option::Some(mut job) = self.bulk_jobs.get(bi) {
+                job.req.cancel()
+            }
+            bi += 1
+        }
+        self.bulk_jobs.clear()
+        self.cb_pool.cancel_all()
+        self.done = true
+        sched.cancel_owner_timers(self.owner)
+        io.deregister_owner(self.owner)
+    }
 }

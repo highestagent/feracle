@@ -1,0 +1,227 @@
+use std::net::{Net, SocketAddr}
+use coro::{Coroutine, Join2, Poll, Scheduler, TaskId, Timeout}
+use feracle_core::{
+    SEL_CURRENT_ROUND,
+    SEL_LATEST_PRICES,
+    decode_latest_prices_abi_hex,
+    json_get_str_bounds,
+    parse_abi_word_u64,
+}
+use http::HttpRequest
+use net_reactor::SocketIo
+
+pub const RPC_TIMEOUT_MS: u64 = 5000
+
+pub fn flatten_http_body(_ res: own Option<Option<MemBuffer>>) -> Option<MemBuffer> {
+    match res {
+        Option::Some(inner) => inner,
+        Option::None => Option::None,
+    }
+}
+
+pub fn start_rpc_request(
+    owner: TaskId,
+    rpc_addr: SocketAddr,
+    rpc_path: MemSpan,
+    rpc_body: MemSpan,
+    timeout_ms: u64,
+) -> Timeout<HttpRequest>
+uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+{
+    let req = format!(
+        "POST ",
+        rpc_path,
+        " HTTP/1.1\r\nHost: ",
+        rpc_addr,
+        "\r\nContent-Type: application/json\r\nContent-Length: ",
+        rpc_body.len(),
+        "\r\nConnection: close\r\n\r\n",
+        rpc_body,
+    )
+    HttpRequest::start_with_timeout(
+        owner,
+        addr: rpc_addr,
+        request_bytes: req.span(),
+        timeout_ms,
+    )
+}
+
+pub fn start_eth_call(
+    owner: TaskId,
+    rpc_addr: SocketAddr,
+    rpc_path: MemSpan,
+    contract_0x: MemSpan,
+    selector_0x: String<10>,
+) -> Timeout<HttpRequest>
+uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+{
+    let body = format!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"",
+        contract_0x,
+        "\",\"data\":\"",
+        selector_0x,
+        "\"},\"latest\"]}",
+    )
+    start_rpc_request(
+        owner,
+        rpc_addr,
+        rpc_path,
+        rpc_body: body.span(),
+        timeout_ms: RPC_TIMEOUT_MS,
+    )
+}
+
+pub fn parse_eth_call_hex(_ resp_body: MemSpan) -> Option<MemBuffer> {
+    let (off, len) = json_get_str_bounds(resp_body, "result".span())?
+    let res_hex = resp_body.slice(offset: off, len)
+    if !res_hex.starts_with("0x") {
+        return Option::None
+    }
+    Option::Some(MemBuffer::from_span(res_hex.tail(2)))
+}
+
+pub fn parse_rpc_str_result(_ resp_body: MemSpan) -> Option<MemBuffer> {
+    let (off, len) = json_get_str_bounds(resp_body, "result".span())?
+    Option::Some(MemBuffer::from_span(resp_body.slice(offset: off, len)))
+}
+
+pub struct RoundState { pub round_id: Option<u64>, pub last_updated: u64 }
+
+impl Copy for RoundState {}
+
+pub struct QueryCurrentRound {
+    owner: TaskId,
+    req: Timeout<HttpRequest>,
+    done: bool,
+    result: Option<u64>,
+}
+
+impl QueryCurrentRound {
+    pub fn start(rpc_addr: SocketAddr, rpc_path: MemSpan, contract_0x: MemSpan) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let owner = sched.alloc_task()
+        let req = start_eth_call(
+            owner,
+            rpc_addr,
+            rpc_path,
+            contract_0x,
+            selector_0x: SEL_CURRENT_ROUND,
+        )
+        QueryCurrentRound { owner, req, done: false, result: Option::None }
+    }
+}
+
+impl Coroutine for QueryCurrentRound {
+    type Output = Option<u64>
+    uses E = (sched: mut Scheduler, io: mut SocketIo)
+
+    fn poll(mut self) -> Poll<Option<u64>> uses E {
+        if self.done {
+            return Poll::Ready(self.result)
+        }
+        if let Poll::Ready(res) = self.req.poll() {
+            let body_opt = flatten_http_body(res)
+            self.result = match body_opt {
+                Option::Some(ref body) => match parse_eth_call_hex(body.span()) {
+                    Option::Some(raw_hex) => parse_abi_word_u64(raw_hex.span(), word_idx: 0),
+                    Option::None => Option::None,
+                },
+                Option::None => Option::None,
+            }
+            self.done = true
+            sched.cancel_owner_timers(self.owner)
+            io.deregister_owner(self.owner)
+            return Poll::Ready(self.result)
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if !self.done {
+            self.done = true
+            self.req.cancel()
+            sched.cancel_owner_timers(self.owner)
+            io.deregister_owner(self.owner)
+        }
+    }
+}
+
+pub struct QueryRoundState {
+    owner: TaskId,
+    join: Join2<Timeout<HttpRequest>, Timeout<HttpRequest>>,
+    done: bool,
+    state: RoundState,
+}
+
+impl QueryRoundState {
+    pub fn start(rpc_addr: SocketAddr, rpc_path: MemSpan, contract_0x: MemSpan) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let owner = sched.alloc_task()
+        let round_req = start_eth_call(
+            owner,
+            rpc_addr,
+            rpc_path,
+            contract_0x,
+            selector_0x: SEL_CURRENT_ROUND,
+        )
+        let prices_req = start_eth_call(
+            owner,
+            rpc_addr,
+            rpc_path,
+            contract_0x,
+            selector_0x: SEL_LATEST_PRICES,
+        )
+        QueryRoundState {
+            owner,
+            join: Join2::new(round_req, prices_req),
+            done: false,
+            state: RoundState { round_id: Option::None, last_updated: 0 },
+        }
+    }
+}
+
+impl Coroutine for QueryRoundState {
+    type Output = RoundState
+    uses E = (sched: mut Scheduler, io: mut SocketIo)
+
+    fn poll(mut self) -> Poll<RoundState> uses E {
+        if self.done {
+            return Poll::Ready(self.state)
+        }
+        if let Poll::Ready((r_opt, p_opt)) = self.join.poll() {
+            let r_body_opt = flatten_http_body(r_opt)
+            let round_id = match r_body_opt {
+                Option::Some(ref body) => match parse_eth_call_hex(body.span()) {
+                    Option::Some(raw_hex) => parse_abi_word_u64(raw_hex.span(), word_idx: 0),
+                    Option::None => Option::None,
+                },
+                Option::None => Option::None,
+            }
+            var last_updated: u64 = 0
+            if let Option::Some(body) = flatten_http_body(p_opt) {
+                if let Option::Some(raw_hex) = parse_eth_call_hex(body.span()) {
+                    if let Option::Some((_, ts)) = decode_latest_prices_abi_hex(raw_hex.span()) {
+                        last_updated = ts
+                    }
+                }
+            }
+            self.state = RoundState { round_id, last_updated }
+            self.done = true
+            sched.cancel_owner_timers(self.owner)
+            io.deregister_owner(self.owner)
+            return Poll::Ready(self.state)
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if !self.done {
+            self.done = true
+            self.join.cancel()
+            sched.cancel_owner_timers(self.owner)
+            io.deregister_owner(self.owner)
+        }
+    }
+}

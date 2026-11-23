@@ -1,6 +1,3 @@
-use core::num::IntDowncast
-use core::ptr
-
 extern {
     fn p2p_telemetry_set_phase(
         _ round_id: u64,
@@ -22,22 +19,6 @@ extern {
         _ latency_ms: u64,
     ) -> i32
     fn p2p_telemetry_record_event(_ kind: u32, _ value: u64) -> i32
-    fn telemetry_start(
-        _ p2p_port: u32,
-        _ telemetry_port: u32,
-        _ node_id: u64,
-        _ peer_id_ptr: *u8,
-        _ peer_id_len: usize,
-    ) -> i32
-    fn telemetry_set_peers(_ peer_count: u32, _ peers_csv_ptr: *u8, _ peers_csv_len: usize) -> i32
-    fn telemetry_record_frame(
-        _ is_tx: u32,
-        _ peer_ptr: *u8,
-        _ peer_len: usize,
-        _ data_ptr: *u8,
-        _ data_len: usize,
-    ) -> i32
-    fn telemetry_stop() -> i32
     fn crypto_keccak_and_sign(
         _ privkey32_ptr: *u8,
         _ chain_id: u64,
@@ -47,6 +28,15 @@ extern {
         _ timestamp: u64,
         _ out_addr20: *u8,
         _ out_v: *u8,
+        _ out_r32: *u8,
+        _ out_s32: *u8,
+    ) -> i32
+    fn crypto_keccak_and_sign_bytes(
+        _ privkey32_ptr: *u8,
+        _ data_ptr: *u8,
+        _ data_len: usize,
+        _ out_addr20: *u8,
+        _ out_rec_id: *u8,
         _ out_r32: *u8,
         _ out_s32: *u8,
     ) -> i32
@@ -101,43 +91,6 @@ pub fn telemetry_set_feed(
 pub fn telemetry_record_event(kind: u32, value: u64) {
     let _ = unsafe {
         p2p_telemetry_record_event(kind, value)
-    }
-}
-
-pub fn start_telemetry_only(
-    p2p_port: u16,
-    telemetry_port: u16,
-    node_id: u64,
-    peer_id: MemSpan,
-) -> i32 {
-    unsafe {
-        telemetry_start(
-            p2p_port as u32,
-            telemetry_port as u32,
-            node_id,
-            peer_id.ptr(),
-            peer_id.len(),
-        )
-    }
-}
-
-pub fn set_telemetry_peers(peer_count: usize, peers_csv: MemSpan) {
-    let count_u32: u32 = peer_count.downcast_saturate()
-    let _ = unsafe {
-        telemetry_set_peers(count_u32, peers_csv.ptr(), peers_csv.len())
-    }
-}
-
-pub fn record_telemetry_frame(is_tx: bool, peer: MemSpan, data: MemSpan) {
-    let dir_flag: u32 = if is_tx { 1 } else { 0 }
-    let _ = unsafe {
-        telemetry_record_frame(dir_flag, peer.ptr(), peer.len(), data.ptr(), data.len())
-    }
-}
-
-pub fn stop_telemetry_only() {
-    let _ = unsafe {
-        telemetry_stop()
     }
 }
 
@@ -203,4 +156,48 @@ pub fn sign_digest(
             s,
         },
     )
+}
+
+pub fn sign_raw_bytes(privkey32: MemSpan, data: MemSpan) -> Option<
+    ([u8; 20], u8, [u8; 32], [u8; 32]),
+> {
+    if privkey32.len() != 32 {
+        return Option::None
+    }
+    var addr_buf = MemBuffer::new(20)
+    var rec_buf = MemBuffer::new(1)
+    var r_buf = MemBuffer::new(32)
+    var s_buf = MemBuffer::new(32)
+
+    let rc = unsafe {
+        crypto_keccak_and_sign_bytes(
+            privkey32.ptr(),
+            data.ptr(),
+            data.len(),
+            addr_buf.ptr(),
+            rec_buf.ptr(),
+            r_buf.ptr(),
+            s_buf.ptr(),
+        )
+    }
+    if rc != 0 {
+        return Option::None
+    }
+
+    var addr: [u8; 20] = [0; 20]
+    var i: usize = 0
+    while i < 20 {
+        addr[i] = addr_buf[i]
+        i += 1
+    }
+    var r: [u8; 32] = [0; 32]
+    var s: [u8; 32] = [0; 32]
+    var j: usize = 0
+    while j < 32 {
+        r[j] = r_buf[j]
+        s[j] = s_buf[j]
+        j += 1
+    }
+    let rec_id = rec_buf[0]
+    Option::Some((addr, rec_id, r, s))
 }
