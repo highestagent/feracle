@@ -1,6 +1,18 @@
-use std::net::{IpAddr, Ipv4Addr, Interest, Net, SocketAddr, Token}
+use core::ops::Drop
+use std::io::Error
+use std::net::{
+    IpAddr,
+    Ipv4Addr,
+    Interest,
+    Net,
+    SocketAddr,
+    TcpListener,
+    TcpStream,
+    Token,
+    UdpSocket,
+}
 use std::time::Clock
-use coro::{Coroutine, JoinAll, LocalScheduler, Poll, Scheduler, Timeout, block_on}
+use coro::{Coroutine, JoinAll, LocalScheduler, Poll, Scheduler, TaskId, Timeout, block_on}
 use net_reactor::{IoEvent, NetDriver, NetPoller, SocketIo}
 use super::{HttpEvent, HttpRequest, HttpServer, decode_chunked}
 
@@ -24,11 +36,15 @@ uses (net: mut Net, clock: Clock)
 
         var reqs = MemVec<HttpRequest>::new()
         var i: usize = 0
-        while i < 8 {
+        while i < 10 {
             let path = if i == 6 {
                 format!("/chunked")
             } else if i == 7 {
                 format!("/fail")
+            } else if i == 8 {
+                format!("/bad_200")
+            } else if i == 9 {
+                format!("/trailer")
             } else {
                 format!("/item/", i)
             }
@@ -104,13 +120,22 @@ uses (net: mut Net, clock: Clock)
                                             format!(
                                                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 3\r\n\r\nerr",
                                             )
+                                        } else if buf.span().starts_with("GET /bad_200 ") {
+                                            format!(
+                                                "HTTP/1.1 500 Error 200\r\nContent-Length: 2\r\n\r\nok",
+                                            )
+                                        } else if buf.span().starts_with("GET /trailer ") {
+                                            format!(
+                                                "HTTP/1.1 200 OK\r\nContent-Length: 999\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\nX-Check: ok\r\n\r\n",
+                                            )
                                         } else {
                                             format!(
                                                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                                             )
                                         }
                                         let _ = io.stream_write(ev.token, resp.span())
-                                        if !buf.span().starts_with("GET /chunked ") {
+                                        if !buf.span().starts_with("GET /chunked ")
+                                            && !buf.span().starts_with("GET /trailer ") {
                                             io.deregister(ev.token)
                                         }
                                     }
@@ -136,7 +161,7 @@ uses (net: mut Net, clock: Clock)
             assert!(false, "expected JoinAll to complete")
             return
         }
-        assert!(res_vec.len() == 8)
+        assert!(res_vec.len() == 10)
         var k: usize = 0
         while k < 6 {
             let Option::Some(ref b) = res_vec[k] else {
@@ -152,12 +177,23 @@ uses (net: mut Net, clock: Clock)
         }
         assert!(b6 == "hello world")
         assert!(res_vec[7].is_none())
+        assert!(res_vec[8].is_none())
+        let Option::Some(ref b9) = res_vec[9] else {
+            assert!(false, "missing trailer chunked body")
+            return
+        }
+        assert!(b9 == "hello")
         assert!(
             decode_chunked("5\r\nhello\r\n0\r\n\r\n".span()).unwrap() == "hello",
         )
+        assert!(
+            decode_chunked("5\r\nhello\r\n0\r\nX-Check: ok\r\n\r\n".span()).unwrap() == "hello",
+        )
 
-        if accepted_toks.len() > 6 {
-            io.deregister(accepted_toks[6])
+        var clean_i: usize = 0
+        while clean_i < accepted_toks.len() {
+            io.deregister(accepted_toks[clean_i])
+            clean_i += 1
         }
 
         var held = MemVec<std::net::TcpStream>::new()
@@ -428,6 +464,160 @@ fn test_generic_http_server_routes_and_sse() uses (net: mut Net, clock: Clock) {
             sse_buf.span().index_of("data: {\"tick\":2}\n\n").is_some(),
         )
 
+        io.deregister_owner(cli_task)
+        srv.stop()
+    }
+}
+
+struct HalfCloseInjectorIo { inner: NetPoller }
+
+impl SocketIo for HalfCloseInjectorIo {
+    fn register_tcp_listener(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ listener: own TcpListener,
+    ) -> Result<Error, Token> {
+        self.inner.register_tcp_listener(owner, tag, listener)
+    }
+
+    fn register_tcp_stream(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ stream: own TcpStream,
+        _ interest: Interest,
+    ) -> Result<Error, Token> {
+        self.inner.register_tcp_stream(owner, tag, stream, interest)
+    }
+
+    fn register_udp_socket(mut self, owner: TaskId, tag: u32, _ sock: own UdpSocket) -> Result<
+        Error,
+        Token,
+    > {
+        self.inner.register_udp_socket(owner, tag, sock)
+    }
+
+    fn set_interest(mut self, _ token: Token, _ interest: Interest) -> Result<Error, ()> {
+        self.inner.set_interest(token, interest)
+    }
+
+    fn deregister(mut self, _ token: Token) {
+        self.inner.deregister(token)
+    }
+
+    fn deregister_owner(mut self, _ owner: TaskId) {
+        self.inner.deregister_owner(owner)
+    }
+
+    fn listener_accept(mut self, _ token: Token) -> Option<Result<Error, (TcpStream, SocketAddr)>> {
+        self.inner.listener_accept(token)
+    }
+
+    fn stream_read(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<Result<Error, usize>> {
+        self.inner.stream_read(token, mut buf)
+    }
+
+    fn stream_write(mut self, _ token: Token, _ bytes: MemSpan) -> Option<Result<Error, usize>> {
+        self.inner.stream_write(token, bytes)
+    }
+
+    fn stream_take_error(mut self, _ token: Token) -> Option<Result<Error, Option<Error>>> {
+        self.inner.stream_take_error(token)
+    }
+
+    fn udp_recv_from(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<
+        Result<Error, (usize, SocketAddr)>,
+    > {
+        self.inner.udp_recv_from(token, mut buf)
+    }
+
+    fn udp_send_to(mut self, _ token: Token, _ bytes: MemSpan, _ to: SocketAddr) -> Option<
+        Result<Error, usize>,
+    > {
+        self.inner.udp_send_to(token, bytes, to)
+    }
+
+    fn take_events_for(mut self, _ owner: TaskId, _ out: mut MemVec<IoEvent>) {
+        self.inner.take_events_for(owner, mut out)
+        var i: usize = 0
+        while i < out.len() {
+            if let Option::Some(mut ev) = out.get(i) {
+                if ev.tag == 1 && ev.readable {
+                    ev.hangup = true
+                }
+            }
+            i += 1
+        }
+    }
+
+    fn take_token_event(mut self, _ token: Token) -> Option<IoEvent> {
+        self.inner.take_token_event(token)
+    }
+
+    fn has_ready_io(self) -> bool {
+        self.inner.has_ready_io()
+    }
+
+    fn poll_os(mut self, timeout_ms: u64, _ woken_owners: mut MemVec<TaskId>) -> usize {
+        self.inner.poll_os(timeout_ms, mut woken_owners)
+    }
+}
+
+#[test]
+fn test_http_server_half_close_hangup_still_replies()
+uses (net: mut Net, clock: Clock)
+{
+    var sched = LocalScheduler::new(0)
+    var io = HalfCloseInjectorIo { inner: NetPoller::new().unwrap() }
+    var driver = NetDriver::new(max_wait_ms: 20)
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+
+    with (Scheduler = sched, SocketIo = io) {
+        let srv_task = sched.alloc_task()
+        let cli_task = sched.alloc_task()
+        var srv = HttpServer::bind(lo, owner: srv_task).unwrap()
+        let srv_addr = srv.local_addr()
+
+        let raw_req = format!("GET /half HTTP/1.1\r\nHost: ", srv_addr, "\r\n\r\n")
+        var req = HttpRequest::start_with_timeout(
+            owner: cli_task,
+            addr: srv_addr,
+            request_bytes: raw_req.span(),
+            timeout_ms: 2000,
+        )
+
+        var evs = MemVec<HttpEvent>::new()
+        var body_opt: Option<MemBuffer> = Option::None
+        var steps: usize = 0
+        while steps < 50 {
+            driver.begin_tick()
+            srv.poll_io(mut evs)
+            var ei: usize = 0
+            while ei < evs.len() {
+                if let HttpEvent::Request(ref r) = evs[ei] {
+                    if r.path == "/half" {
+                        srv.respond(
+                            r.token,
+                            status_line: "200 OK".span(),
+                            content_type: "application/json".span(),
+                            extra_headers: "".span(),
+                            body: "{\"half\":1}".span(),
+                        )
+                    }
+                }
+                ei += 1
+            }
+            if let Poll::Ready(res) = req.poll() {
+                if let Option::Some(inner) = res {
+                    body_opt = inner
+                }
+                break
+            }
+            driver.wait()
+            steps += 1
+        }
+        assert!(body_opt.unwrap() == "{\"half\":1}")
         io.deregister_owner(cli_task)
         srv.stop()
     }

@@ -34,6 +34,25 @@ fn push_unique_task(_ out: mut MemVec<TaskId>, _ task: TaskId) {
     out.push(task)
 }
 
+fn push_or_coalesce_io_event(_ ready_io: mut MemVec<IoEvent>, _ ev: IoEvent) {
+    var i: usize = 0
+    while i < ready_io.len() {
+        if ready_io[i].token == ev.token {
+            if let Option::Some(mut existing) = ready_io.get(i) {
+                existing.owner = ev.owner
+                existing.tag = ev.tag
+                existing.readable = existing.readable || ev.readable
+                existing.writable = existing.writable || ev.writable
+                existing.error = existing.error || ev.error
+                existing.hangup = existing.hangup || ev.hangup
+            }
+            return
+        }
+        i += 1
+    }
+    ready_io.push(ev)
+}
+
 impl SocketIo for NetPoller {
     fn register_tcp_listener(
         mut self,
@@ -269,7 +288,7 @@ impl SocketIo for NetPoller {
                 )
             }
             if let Option::Some(io_ev) = mapped {
-                self.ready_io.push(io_ev)
+                push_or_coalesce_io_event(mut self.ready_io, io_ev)
                 push_unique_task(mut woken_owners, io_ev.owner)
                 queued += 1
             }

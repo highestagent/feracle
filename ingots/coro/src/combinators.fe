@@ -1,4 +1,5 @@
-use super::task::{Coroutine, Either, Poll}
+use super::scheduler::Scheduler
+use super::task::{Coroutine, Either, Poll, TaskId}
 
 pub struct Ready<T> { val: Option<T> }
 
@@ -21,23 +22,24 @@ impl<T> Coroutine for Ready<T> {
     }
 }
 
-pub struct YieldOnce { yielded: bool }
+pub struct YieldOnce { owner: TaskId, yielded: bool }
 
 impl Copy for YieldOnce {}
 
 impl YieldOnce {
-    pub fn new() -> Self {
-        YieldOnce { yielded: false }
+    pub fn new(owner: TaskId) -> Self {
+        YieldOnce { owner, yielded: false }
     }
 }
 
 impl Coroutine for YieldOnce {
     type Output = ()
-    uses E = ()
+    uses E = (sched: mut Scheduler)
 
     fn poll(mut self) -> Poll<()> uses E {
         if !self.yielded {
             self.yielded = true
+            sched.wake(self.owner)
             return Poll::Pending
         }
         Poll::Ready(())

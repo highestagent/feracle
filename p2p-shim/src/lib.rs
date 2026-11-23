@@ -398,7 +398,7 @@ impl TelemetryHub {
 
 pub struct P2pNode {
     local_peer_id: PeerId,
-    inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    inbox: Arc<Mutex<VecDeque<(u64, String, Vec<u8>)>>>,
     peer_count: Arc<AtomicUsize>,
     telemetry: Arc<TelemetryHub>,
     tx: mpsc::Sender<ControlMsg>,
@@ -720,12 +720,14 @@ impl P2pNode {
                                                 continue;
                                             }
                                         }
-                                        telemetry_bg.record_frame("rx", &source_peer.to_string(), &data);
+                                        let origin_tag = peer_id_tag(&source_peer);
+                                        let peer_str = source_peer.to_string();
+                                        telemetry_bg.record_frame("rx", &peer_str, &data);
                                         if let Ok(mut guard) = inbox_bg.lock() {
                                             if guard.len() >= MAX_INBOX_LEN {
                                                 guard.pop_front();
                                             }
-                                            guard.push_back(data);
+                                            guard.push_back((origin_tag, peer_str, data));
                                         }
                                     }
                                     _ => {}
@@ -779,12 +781,17 @@ impl P2pNode {
 
     pub fn poll(&self) -> Option<Vec<u8>> {
         let mut guard = self.inbox.lock().ok()?;
+        guard.pop_front().map(|(_, _, data)| data)
+    }
+
+    pub fn poll_with_peer(&self) -> Option<(u64, String, Vec<u8>)> {
+        let mut guard = self.inbox.lock().ok()?;
         guard.pop_front()
     }
 
     pub fn peek_front_len(&self) -> Option<usize> {
         let guard = self.inbox.lock().ok()?;
-        guard.front().map(|v| v.len())
+        guard.front().map(|(_, _, data)| data.len())
     }
 
     pub fn stop(mut self) {
@@ -861,7 +868,7 @@ fn build_swarm(listen_port: u16) -> Result<Swarm<OracleBehaviour>, String> {
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
-    let listen_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{listen_port}")
+    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}")
         .parse()
         .map_err(|e| format!("invalid listen addr: {e}"))?;
     swarm
@@ -939,8 +946,18 @@ pub fn build_oracle_digest(
     digest
 }
 
-pub fn derive_eth_address(signing_key: &SigningKey) -> [u8; 20] {
-    let verifying_key = VerifyingKey::from(signing_key);
+fn peer_id_tag(peer_id: &PeerId) -> u64 {
+    let mut hash = [0u8; 32];
+    let mut keccak = Keccak::v256();
+    keccak.update(&peer_id.to_bytes());
+    keccak.finalize(&mut hash);
+    let raw = u64::from_be_bytes([
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+    ]);
+    raw | 1
+}
+
+fn verifying_key_to_eth_address(verifying_key: &VerifyingKey) -> [u8; 20] {
     let encoded = verifying_key.to_encoded_point(false);
     let uncompressed = encoded.as_bytes();
     let mut hash = [0u8; 32];
@@ -950,6 +967,50 @@ pub fn derive_eth_address(signing_key: &SigningKey) -> [u8; 20] {
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&hash[12..32]);
     addr
+}
+
+pub fn derive_eth_address(signing_key: &SigningKey) -> [u8; 20] {
+    let verifying_key = VerifyingKey::from(signing_key);
+    verifying_key_to_eth_address(&verifying_key)
+}
+
+pub fn derive_eth_address_bytes(privkey: &[u8; 32]) -> Result<[u8; 20], String> {
+    let signing_key =
+        SigningKey::from_bytes(privkey.into()).map_err(|e| format!("invalid private key: {e}"))?;
+    Ok(derive_eth_address(&signing_key))
+}
+
+pub fn verify_oracle_sig(
+    chain_id: u64,
+    contract_addr: &[u8; 20],
+    round_id: u64,
+    prices: &[u64; ASSET_COUNT],
+    timestamp: u64,
+    expected_addr: &[u8; 20],
+    v: u8,
+    r: &[u8; 32],
+    s: &[u8; 32],
+) -> bool {
+    if v != 27 && v != 28 {
+        return false;
+    }
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[0..32].copy_from_slice(r);
+    sig_bytes[32..64].copy_from_slice(s);
+    let Ok(sig) = k256::ecdsa::Signature::from_slice(&sig_bytes) else {
+        return false;
+    };
+    if sig.normalize_s().is_some() {
+        return false;
+    }
+    let digest = build_oracle_digest(chain_id, contract_addr, round_id, prices, timestamp);
+    let Ok(rec_id) = k256::ecdsa::RecoveryId::try_from(v - 27) else {
+        return false;
+    };
+    let Ok(recovered_vk) = VerifyingKey::recover_from_prehash(&digest, &sig, rec_id) else {
+        return false;
+    };
+    &verifying_key_to_eth_address(&recovered_vk) == expected_addr
 }
 
 fn sign_prehash_with_key(
@@ -1201,6 +1262,59 @@ pub extern "C" fn p2p_publish(data_ptr: *const u8, data_len: usize) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn p2p_poll_with_peer(
+    out_ptr: *mut u8,
+    out_cap: usize,
+    out_meta16_ptr: *mut u8,
+    out_peer_ptr: *mut u8,
+    out_peer_cap: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out_meta16_ptr.is_null() {
+            return -2;
+        }
+        let guard = match GLOBAL_NODE.lock() {
+            Ok(g) => g,
+            Err(_) => return -5,
+        };
+        let Some(node) = guard.as_ref() else {
+            return -7;
+        };
+
+        let Some(front_len) = node.peek_front_len() else {
+            return 0;
+        };
+        if front_len > out_cap || (front_len > 0 && out_ptr.is_null()) {
+            return -1;
+        }
+        let Some((origin_tag, peer_str, msg)) = node.poll_with_peer() else {
+            return 0;
+        };
+        if msg.len() > out_cap {
+            return -1;
+        }
+        if !msg.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(msg.as_ptr(), out_ptr, msg.len());
+            }
+        }
+        let peer_bytes = peer_str.as_bytes();
+        let peer_copy = peer_bytes.len().min(out_peer_cap);
+        let mut meta = [0u8; 16];
+        meta[0..8].copy_from_slice(&origin_tag.to_be_bytes());
+        meta[8..16].copy_from_slice(&(peer_copy as u64).to_be_bytes());
+        unsafe {
+            std::ptr::copy_nonoverlapping(meta.as_ptr(), out_meta16_ptr, 16);
+            if peer_copy > 0 && !out_peer_ptr.is_null() {
+                std::ptr::copy_nonoverlapping(peer_bytes.as_ptr(), out_peer_ptr, peer_copy);
+            }
+        }
+        i32::try_from(msg.len()).unwrap_or(-1)
+    }))
+    .unwrap_or(-99)
+}
+
+#[no_mangle]
 pub extern "C" fn p2p_poll(out_ptr: *mut u8, out_cap: usize) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         let guard = match GLOBAL_NODE.lock() {
@@ -1359,6 +1473,75 @@ pub extern "C" fn crypto_keccak_and_sign(
                 0
             }
             Err(_) => -3,
+        }
+    }))
+    .unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn crypto_derive_eth_addr(privkey32_ptr: *const u8, out_addr20: *mut u8) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if privkey32_ptr.is_null() || out_addr20.is_null() {
+            return -2;
+        }
+        let mut privkey = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(privkey32_ptr, privkey.as_mut_ptr(), 32);
+        }
+        match derive_eth_address_bytes(&privkey) {
+            Ok(addr) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(addr.as_ptr(), out_addr20, 20);
+                }
+                0
+            }
+            Err(_) => -3,
+        }
+    }))
+    .unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn crypto_verify_oracle_sig(
+    chain_id: u64,
+    contract20_ptr: *const u8,
+    round_id: u64,
+    prices_be160_ptr: *const u8,
+    timestamp: u64,
+    expected_addr20_ptr: *const u8,
+    v: u32,
+    r32_ptr: *const u8,
+    s32_ptr: *const u8,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if contract20_ptr.is_null()
+            || prices_be160_ptr.is_null()
+            || expected_addr20_ptr.is_null()
+            || r32_ptr.is_null()
+            || s32_ptr.is_null()
+        {
+            return -2;
+        }
+        let Ok(v_u8) = u8::try_from(v) else {
+            return 0;
+        };
+        let mut contract = [0u8; 20];
+        let mut expected = [0u8; 20];
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(contract20_ptr, contract.as_mut_ptr(), 20);
+            std::ptr::copy_nonoverlapping(expected_addr20_ptr, expected.as_mut_ptr(), 20);
+            std::ptr::copy_nonoverlapping(r32_ptr, r.as_mut_ptr(), 32);
+            std::ptr::copy_nonoverlapping(s32_ptr, s.as_mut_ptr(), 32);
+        }
+        let prices = read_prices_be160(prices_be160_ptr);
+        if verify_oracle_sig(
+            chain_id, &contract, round_id, &prices, timestamp, &expected, v_u8, &r, &s,
+        ) {
+            1
+        } else {
+            0
         }
     }))
     .unwrap_or(-99)
@@ -1733,5 +1916,116 @@ mod tests {
         k2.update(&encoded.as_bytes()[1..65]);
         k2.finalize(&mut hash);
         assert_eq!(&hash[12..32], &addr);
+    }
+
+    #[test]
+    fn test_crypto_derive_addr_and_verify_oracle_sig() {
+        let pk: [u8; 32] =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let contract20: [u8; 20] = hex::decode("3244d0de654b2d7e00fedb548d3f5a6c6175dcf0")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut derived = [0u8; 20];
+        assert_eq!(crypto_derive_eth_addr(pk.as_ptr(), derived.as_mut_ptr()), 0);
+        assert_eq!(
+            hex::encode(derived),
+            "f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        );
+
+        let prices_be = prices_to_be160(&TEST_PRICES);
+        let (_, v, r, s) = sign_oracle_digest(&pk, 1, &contract20, 1, &TEST_PRICES, 1).unwrap();
+        assert_eq!(
+            crypto_verify_oracle_sig(
+                1,
+                contract20.as_ptr(),
+                1,
+                prices_be.as_ptr(),
+                1,
+                derived.as_ptr(),
+                u32::from(v),
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            1
+        );
+
+        // Wrong claimed address fails
+        let mut wrong_addr = derived;
+        wrong_addr[0] ^= 0xff;
+        assert_eq!(
+            crypto_verify_oracle_sig(
+                1,
+                contract20.as_ptr(),
+                1,
+                prices_be.as_ptr(),
+                1,
+                wrong_addr.as_ptr(),
+                u32::from(v),
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            0
+        );
+
+        // Corrupted signature fails
+        let mut bad_r = r;
+        bad_r[0] ^= 0x01;
+        assert_eq!(
+            crypto_verify_oracle_sig(
+                1,
+                contract20.as_ptr(),
+                1,
+                prices_be.as_ptr(),
+                1,
+                derived.as_ptr(),
+                u32::from(v),
+                bad_r.as_ptr(),
+                s.as_ptr(),
+            ),
+            0
+        );
+
+        // Invalid v fails
+        assert_eq!(
+            crypto_verify_oracle_sig(
+                1,
+                contract20.as_ptr(),
+                1,
+                prices_be.as_ptr(),
+                1,
+                derived.as_ptr(),
+                26,
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            0
+        );
+
+        // High-s malleable signature (N - s) fails EIP-2 check
+        use k256::elliptic_curve::bigint::Encoding as _;
+        let n_minus_s = k256::U256::from_be_hex(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        )
+        .wrapping_sub(&k256::U256::from_be_slice(&s));
+        let high_s: [u8; 32] = n_minus_s.to_be_bytes();
+        let flipped_v = if v == 27 { 28 } else { 27 };
+        assert_eq!(
+            crypto_verify_oracle_sig(
+                1,
+                contract20.as_ptr(),
+                1,
+                prices_be.as_ptr(),
+                1,
+                derived.as_ptr(),
+                flipped_v,
+                r.as_ptr(),
+                high_s.as_ptr(),
+            ),
+            0
+        );
     }
 }

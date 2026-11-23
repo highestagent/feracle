@@ -20,12 +20,18 @@ struct TimerEntry { id: TimerId, owner: TaskId, deadline_ms: u64, fired: bool }
 
 impl Copy for TimerEntry {}
 
+const MAX_U64: u64 = 0xffffffffffffffff
+
+fn saturating_add_u64(_ a: u64, _ b: u64) -> u64 {
+    if b > MAX_U64 - a { MAX_U64 } else { a + b }
+}
+
 pub struct LocalScheduler {
     now: u64,
     timers: MemVec<TimerEntry>,
     woken: MemVec<TaskId>,
-    next_task_id: u32,
-    next_timer_id: u32,
+    next_task_id: u64,
+    next_timer_id: u64,
 }
 
 impl LocalScheduler {
@@ -72,8 +78,14 @@ impl Scheduler for LocalScheduler {
             self.wake(owner)
             return id
         }
-        self.timers.push(
-                TimerEntry { id, owner, deadline_ms: self.now + delay_ms, fired: false },
+        self.timers
+            .push(
+                TimerEntry {
+                    id,
+                    owner,
+                    deadline_ms: saturating_add_u64(self.now, delay_ms),
+                    fired: false,
+                },
             )
         id
     }
@@ -189,7 +201,7 @@ impl Scheduler for LocalScheduler {
     }
 
     fn advance_by(mut self, delta_ms: u64) -> usize {
-        self.advance_to(now_ms: self.now + delta_ms)
+        self.advance_to(now_ms: saturating_add_u64(self.now, delta_ms))
     }
 }
 

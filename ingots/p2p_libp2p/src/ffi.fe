@@ -13,6 +13,13 @@ extern {
     ) -> i32
     fn p2p_publish(_ data_ptr: *u8, _ data_len: usize) -> i32
     fn p2p_poll(_ out_ptr: *u8, _ out_cap: usize) -> i32
+    fn p2p_poll_with_peer(
+        _ out_ptr: *u8,
+        _ out_cap: usize,
+        _ out_meta16_ptr: *u8,
+        _ out_peer_ptr: *u8,
+        _ out_peer_cap: usize,
+    ) -> i32
     fn p2p_peer_count() -> i32
     fn p2p_stop() -> i32
     fn p2p_sleep_ms(_ ms: u32)
@@ -45,6 +52,40 @@ pub(ingot) fn publish(_ data: MemSpan) -> i32 {
     unsafe {
         p2p_publish(data.ptr(), data.len())
     }
+}
+
+pub(ingot) fn poll_with_peer(_ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> (i32, u64) {
+    out.clear()
+    out.reserve(1280)
+    peer_out.clear()
+    peer_out.reserve(128)
+    var meta = MemBuffer::new(16)
+    let rc = unsafe {
+        p2p_poll_with_peer(
+            out.ptr(),
+            out.capacity(),
+            meta.ptr(),
+            peer_out.ptr(),
+            peer_out.capacity(),
+        )
+    }
+    if rc > 0 {
+        let len: usize = rc.downcast_unchecked()
+        let origin = meta.span().read_be<u64>(0)
+        let peer_len_u64 = meta.span().read_be<u64>(8)
+        let peer_len: usize = peer_len_u64.downcast_saturate()
+        let bounded_peer = if peer_len <= peer_out.capacity() {
+            peer_len
+        } else {
+            peer_out.capacity()
+        }
+        unsafe {
+            out.set_len(len)
+            peer_out.set_len(bounded_peer)
+        }
+        return (rc, origin)
+    }
+    (rc, 0)
 }
 
 pub(ingot) fn poll_into(_ out: mut MemBuffer) -> i32 {

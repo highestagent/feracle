@@ -1,6 +1,6 @@
 use core::ops::Eq
 
-pub struct TaskId { pub id: u32 }
+pub struct TaskId { pub id: u64 }
 
 impl Copy for TaskId {}
 
@@ -10,7 +10,7 @@ impl Eq for TaskId {
     }
 }
 
-pub struct TimerId { pub id: u32 }
+pub struct TimerId { pub id: u64 }
 
 impl Copy for TimerId {}
 

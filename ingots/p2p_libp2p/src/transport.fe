@@ -62,6 +62,24 @@ impl Drop for Libp2pTransport {
     }
 }
 
+impl Libp2pTransport {
+    pub fn recv_with_peer(mut self, _ out: mut MemBuffer, _ peer_out: mut MemBuffer) -> Option<
+        Delivery,
+    > {
+        let (rc, origin) = ffi::poll_with_peer(mut out, mut peer_out)
+        if rc > 0 {
+            self.rx_seq += 1
+            self.stats.frames_rx += 1
+            self.stats.data_rx += 1
+            Option::Some(
+                Delivery { origin, seq: self.rx_seq, from: self.local_addr },
+            )
+        } else {
+            Option::None
+        }
+    }
+}
+
 impl Transport for Libp2pTransport {
     fn local_addr(self) -> SocketAddr {
         self.local_addr
@@ -91,16 +109,8 @@ impl Transport for Libp2pTransport {
     }
 
     fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
-        if ffi::poll_into(mut out) > 0 {
-            self.rx_seq += 1
-            self.stats.frames_rx += 1
-            self.stats.data_rx += 1
-            Option::Some(
-                Delivery { origin: 0, seq: self.rx_seq, from: self.local_addr },
-            )
-        } else {
-            Option::None
-        }
+        var peer_tmp = MemBuffer::empty()
+        self.recv_with_peer(mut out, mut peer_tmp)
     }
 
     fn peer_count(self) -> usize {

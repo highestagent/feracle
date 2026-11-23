@@ -265,7 +265,7 @@ fe test --backend native ingots/coro
 | --- | --- |
 | `Poll<T>` | Step result (`Pending` / `Ready(T)`) with `.is_ready()`, `.is_pending()`, and `.map(mut f)` |
 | `Either<A, B>` | Result sum type returned by `Select2` (`Left(A)` / `Right(B)`) |
-| `Ready<T>` / `YieldOnce` | Leaf coroutines yielding an immediate value or a single `Pending` tick |
+| `Ready<T>` / `YieldOnce` | Leaf coroutines yielding an immediate value or a single `Pending` tick (`YieldOnce::new(owner)` wakes `owner` via `Scheduler`) |
 | `Map<C, F>` | Transforms `C::Output` via `F` while propagating `(C::E, F::E)` |
 | `Sleep` | Timer coroutine (`::after`, `::until`) backed by `Scheduler` |
 | `Timeout<C>` | Races `C` against `Sleep`, cancelling whichever finishes second |

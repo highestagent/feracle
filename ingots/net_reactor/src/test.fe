@@ -201,6 +201,36 @@ uses (net: mut Net, clock: Clock)
         assert!(
             !is_would_block(std::io::Error::new(std::io::ErrorKind::TimedOut)),
         )
+
+        // Coalesce repeated OS readiness notifications for the same token in ready_io.
+        let coalesce_task = sched.alloc_task()
+        var uc = net.bind_udp(lo).unwrap()
+        var ud = net.bind_udp(lo).unwrap()
+        uc.set_nonblocking(true).unwrap()
+        ud.set_nonblocking(true).unwrap()
+        let addr_d = ud.local_addr().unwrap()
+        let tc = io.register_udp_socket(owner: coalesce_task, tag: 1, uc).unwrap()
+        let td = io.register_udp_socket(owner: coalesce_task, tag: 2, ud).unwrap()
+        let _ = io.udp_send_to(tc, "coalesce".span(), addr_d)
+        var woken = MemVec<TaskId>::new()
+        var p_step: usize = 0
+        while p_step < 5 {
+            let _ = io.poll_os(timeout_ms: 5, mut woken)
+            p_step += 1
+        }
+        var coalesced = MemVec<IoEvent>::new()
+        io.take_events_for(coalesce_task, mut coalesced)
+        var td_count: usize = 0
+        var ci: usize = 0
+        while ci < coalesced.len() {
+            if coalesced[ci].token == td {
+                td_count += 1
+                assert!(coalesced[ci].readable)
+            }
+            ci += 1
+        }
+        assert!(td_count == 1)
+        io.deregister_owner(coalesce_task)
     }
 
     var wrap = WrapperTransport {

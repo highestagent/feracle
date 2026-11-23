@@ -7,7 +7,7 @@ use super::wire::parse_request_head
 const MAX_REQ_BYTES: usize = 4096
 const REQ_TIMEOUT_MS: u64 = 2000
 const SSE_KEEPALIVE_MS: u64 = 10_000
-const MAX_SSE_OUTBOX: usize = 65_536
+const MAX_SSE_OUTBOX: usize = 131_072
 const WRITE_CHUNK: usize = 8192
 
 enum ClientKind {
@@ -328,6 +328,9 @@ impl HttpServer {
     {
         let frame_len = prefix.len() + payload.len() + suffix.len()
         if frame_len > MAX_SSE_OUTBOX {
+            if let Option::Some(mut c) = self.clients.get(idx) {
+                c.lagged = true
+            }
             return
         }
         var overflow = false
@@ -412,11 +415,11 @@ impl HttpServer {
         }
     }
 
-    fn handle_client_read(mut self, _ token: Token, _ events_out: mut MemVec<HttpEvent>)
+    fn handle_client_read(mut self, _ token: Token, _ events_out: mut MemVec<HttpEvent>) -> bool
     uses (sched: mut Scheduler, io: mut SocketIo)
     {
         let Option::Some(idx) = find_client_idx(self.clients, token) else {
-            return
+            return false
         }
         if let ClientKind::ReadingReq = self.clients[idx].kind {} else {
             // Drain/detect EOF on open SSE or response sockets so closed peers clean up immediately.
@@ -437,7 +440,7 @@ impl HttpServer {
             if close_now {
                 self.close_client(idx)
             }
-            return
+            return false
         }
 
         var tmp = MemBuffer::new(1024)
@@ -480,14 +483,15 @@ impl HttpServer {
         }
         if failed {
             self.close_client(idx)
-            return
+            return false
         }
-        if !done_req { return }
+        if !done_req { return false }
 
         let (method, path, query) = parse_request_head(self.clients[idx].inbuf.span())
         events_out.push(
                 HttpEvent::Request(HttpRequestEvent { token, method, path, query }),
             )
+        true
     }
 
     pub fn poll_io(mut self, _ events_out: mut MemVec<HttpEvent>)
@@ -507,11 +511,24 @@ impl HttpServer {
                         self.flush_or_close(idx)
                     }
                 }
+                var emitted_req = false
                 if ev.readable {
-                    self.handle_client_read(ev.token, mut events_out)
+                    emitted_req = self.handle_client_read(ev.token, mut events_out)
                 }
-                if ev.error || ev.hangup {
+                if ev.error {
                     self.close_by_token(ev.token)
+                } else if ev.hangup && !emitted_req {
+                    var keep_writing = false
+                    if let Option::Some(idx) = find_client_idx(self.clients, ev.token) {
+                        if let ClientKind::WritingOnce = self.clients[idx].kind {
+                            if self.clients[idx].has_pending_write() {
+                                keep_writing = true
+                            }
+                        }
+                    }
+                    if !keep_writing {
+                        self.close_by_token(ev.token)
+                    }
                 }
             }
             ei += 1

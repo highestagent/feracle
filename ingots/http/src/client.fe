@@ -128,11 +128,27 @@ impl HttpRequest {
             let trimmed = hdr_span.slice(offset: pos, len: line_end - pos).trim()
             if first_line {
                 first_line = false
-                if !trimmed.starts_with("HTTP/1.") {
+                if trimmed.len() < 12 || !trimmed.starts_with("HTTP/1.") {
                     return false
                 }
-                if !contains_ignore_ascii_case(trimmed, " 200 ".span())
-                    && !trimmed.ends_with(" 200") {
+                let ver_minor = trimmed.byte_at(7)
+                if ver_minor != b'0' && ver_minor != b'1' {
+                    return false
+                }
+                var sp: usize = 8
+                if sp >= trimmed.len() || trimmed.byte_at(sp) != b' ' {
+                    return false
+                }
+                while sp < trimmed.len() && trimmed.byte_at(sp) == b' ' {
+                    sp += 1
+                }
+                if sp + 3 > trimmed.len()
+                    || trimmed.byte_at(sp) != b'2'
+                    || trimmed.byte_at(sp + 1) != b'0'
+                    || trimmed.byte_at(sp + 2) != b'0' {
+                    return false
+                }
+                if sp + 3 < trimmed.len() && trimmed.byte_at(sp + 3) != b' ' {
                     return false
                 }
             } else if !trimmed.is_empty() {
@@ -192,17 +208,6 @@ impl HttpRequest {
             return Option::None
         }
         let body_len = self.inbuf.len() - body_start
-        if let Option::Some(expected) = self.content_len {
-            if body_len >= expected {
-                let out = MemBuffer::from_span(self.inbuf.slice(offset: body_start, len: expected))
-                return Option::Some(Option::Some(out))
-            }
-            if eof {
-                return Option::Some(Option::None)
-            }
-            return Option::None
-        }
-
         let body_span = self.inbuf.slice(offset: body_start, len: body_len)
         if self.is_chunked {
             match decode_chunked_status(body_span, eof) {
@@ -219,6 +224,17 @@ impl HttpRequest {
                     return Option::None
                 },
             }
+        }
+
+        if let Option::Some(expected) = self.content_len {
+            if body_len >= expected {
+                let out = MemBuffer::from_span(self.inbuf.slice(offset: body_start, len: expected))
+                return Option::Some(Option::Some(out))
+            }
+            if eof {
+                return Option::Some(Option::None)
+            }
+            return Option::None
         }
 
         if body_len > MAX_HTTP_BODY {

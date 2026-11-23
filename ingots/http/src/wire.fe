@@ -93,19 +93,31 @@ pub(ingot) fn decode_chunked_status(_ raw: MemSpan, eof: bool) -> ChunkedStatus 
         }
         pos = line_end + 1
         if chunk_len == 0 {
-            // Require the final CRLF/LF after the zero-length chunk unless EOF already closed.
-            if pos < raw.len() {
-                if raw.byte_at(pos) == b'\n' {
+            var tpos = pos
+            while tpos < raw.len() {
+                if raw.byte_at(tpos) == b'\n' {
                     return ChunkedStatus::Complete(out)
                 }
-                if pos + 1 < raw.len()
-                    && raw.byte_at(pos) == b'\r'
-                    && raw.byte_at(pos + 1) == b'\n' {
-                    return ChunkedStatus::Complete(out)
-                }
-                if raw.byte_at(pos) == b'\r' {
+                if raw.byte_at(tpos) == b'\r' {
+                    if tpos + 1 < raw.len() && raw.byte_at(tpos + 1) == b'\n' {
+                        return ChunkedStatus::Complete(out)
+                    }
+                    if eof {
+                        return ChunkedStatus::Complete(out)
+                    }
                     return ChunkedStatus::NeedMore
                 }
+                var t_end = tpos
+                while t_end < raw.len() && raw.byte_at(t_end) != b'\n' {
+                    t_end += 1
+                }
+                if t_end == raw.len() {
+                    if eof {
+                        return ChunkedStatus::Complete(out)
+                    }
+                    return ChunkedStatus::NeedMore
+                }
+                tpos = t_end + 1
             }
             if eof {
                 return ChunkedStatus::Complete(out)

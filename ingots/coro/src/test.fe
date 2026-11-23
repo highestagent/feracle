@@ -61,15 +61,28 @@ fn test_ready_yield_map_and_sleep() {
         let pr = r.poll()
         assert!(pr.is_ready())
 
-        var mapped = Map::new(YieldOnce::new(), |_ v: ()| -> u64 { 7 })
+        var yo = YieldOnce::new(owner)
+        assert!(yo.poll().is_pending())
+        assert!(sched.next_timeout_ms(max_ms: 500) == 0)
+        assert!(sched.take_woken(owner))
+        assert!(yo.poll().is_ready())
+
+        var mapped = Map::new(YieldOnce::new(owner), |_ v: ()| -> u64 { 7 })
         var drv = VirtualClockDriver::new(step_ms: 5)
         let out = block_on(mut mapped, mut drv)
         assert!(out == 7)
+        assert!(sched.now_ms() == 0)
 
         var nap = Sleep::after(owner, delay_ms: 25)
         block_on(mut nap, mut drv)
     }
-    assert!(sched.now_ms() == 30)
+    assert!(sched.now_ms() == 25)
+
+    var max_sched = LocalScheduler::new(100)
+    let max_owner = max_sched.alloc_task()
+    let max_tid = max_sched.schedule_after(max_owner, delay_ms: 0xffffffffffffffff)
+    assert!(max_sched.advance_by(delta_ms: 0xffffffffffffffff) == 1)
+    assert!(max_sched.take_timer_fired(max_tid))
 }
 
 #[test]

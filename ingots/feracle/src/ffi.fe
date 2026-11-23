@@ -40,6 +40,18 @@ extern {
         _ out_r32: *u8,
         _ out_s32: *u8,
     ) -> i32
+    fn crypto_derive_eth_addr(_ privkey32_ptr: *u8, _ out_addr20: *u8) -> i32
+    fn crypto_verify_oracle_sig(
+        _ chain_id: u64,
+        _ contract20_ptr: *u8,
+        _ round_id: u64,
+        _ prices_be160_ptr: *u8,
+        _ timestamp: u64,
+        _ expected_addr20_ptr: *u8,
+        _ v: u32,
+        _ r32_ptr: *u8,
+        _ s32_ptr: *u8,
+    ) -> i32
 }
 
 pub fn telemetry_set_phase(
@@ -200,4 +212,59 @@ pub fn sign_raw_bytes(privkey32: MemSpan, data: MemSpan) -> Option<
     }
     let rec_id = rec_buf[0]
     Option::Some((addr, rec_id, r, s))
+}
+
+pub fn derive_eth_addr(privkey32: MemSpan) -> Option<[u8; 20]> {
+    if privkey32.len() != 32 {
+        return Option::None
+    }
+    var addr_buf = MemBuffer::new(20)
+    let rc = unsafe {
+        crypto_derive_eth_addr(privkey32.ptr(), addr_buf.ptr())
+    }
+    if rc != 0 {
+        return Option::None
+    }
+    var addr: [u8; 20] = [0; 20]
+    var i: usize = 0
+    while i < 20 {
+        addr[i] = addr_buf[i]
+        i += 1
+    }
+    Option::Some(addr)
+}
+
+pub fn verify_sig(chain_id: u64, contract20: MemSpan, sig: feracle_core::SigMsg) -> bool {
+    if contract20.len() != 20 {
+        return false
+    }
+    let prices_buf = feracle_core::encode_prices_be160(sig.median_prices)
+    var expected_buf = MemBuffer::new(20)
+    var i: usize = 0
+    while i < 20 {
+        expected_buf[i] = sig.signer_addr[i]
+        i += 1
+    }
+    var r_buf = MemBuffer::new(32)
+    var s_buf = MemBuffer::new(32)
+    var j: usize = 0
+    while j < 32 {
+        r_buf[j] = sig.r[j]
+        s_buf[j] = sig.s[j]
+        j += 1
+    }
+    let rc = unsafe {
+        crypto_verify_oracle_sig(
+            chain_id,
+            contract20.ptr(),
+            sig.round_id,
+            prices_buf.ptr(),
+            sig.timestamp,
+            expected_buf.ptr(),
+            sig.v as u32,
+            r_buf.ptr(),
+            s_buf.ptr(),
+        )
+    }
+    rc == 1
 }

@@ -2,8 +2,12 @@ use std::time::Clock
 use coro::Scheduler
 use feracle_core::{QuoteMsg, SigMsg, add_sig_dedup, decode_quote, decode_sig_msg, prices_eq}
 use net_reactor::SocketIo
+use super::ffi
 use super::network::PeerSession
 use super::telemetry::TelemetrySink
+
+const MAX_PENDING_MSGS: usize = 32
+const MAX_FUTURE_ROUND_LOOKAHEAD: u64 = 2
 
 pub struct SourcedQuote { pub origin: u64, pub quote: QuoteMsg }
 
@@ -33,10 +37,19 @@ pub fn add_quote_dedup(_ list: mut MemVec<SourcedQuote>, _ item: SourcedQuote, m
     list.push(item)
 }
 
+fn add_pending_sig_bounded(_ pending_sigs: mut MemVec<SigMsg>, _ s: SigMsg) {
+    if pending_sigs.len() >= MAX_PENDING_MSGS {
+        return
+    }
+    add_sig_dedup(mut pending_sigs, s)
+}
+
 pub fn poll_all_messages(
     peer: mut PeerSession,
     telemetry: mut TelemetrySink,
     round_id: u64,
+    chain_id: u64,
+    contract20: MemSpan,
     quote_routing: QuoteRouting,
     _ quotes: mut MemVec<SourcedQuote>,
     _ pending_quotes: mut MemVec<SourcedQuote>,
@@ -60,26 +73,33 @@ uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
                             add_quote_dedup(mut quotes, sq, max_len: 3)
                         },
                         QuoteRouting::BufferPending => {
-                            add_quote_dedup(mut pending_quotes, sq, max_len: 0)
+                            add_quote_dedup(mut pending_quotes, sq, max_len: MAX_PENDING_MSGS)
                         },
                         QuoteRouting::IgnoreCurrent => {},
                     }
-                } else if q.round_id > round_id {
-                    add_quote_dedup(mut pending_quotes, sq, max_len: 0)
+                } else if q.round_id > round_id
+                    && q.round_id <= round_id + MAX_FUTURE_ROUND_LOOKAHEAD {
+                    add_quote_dedup(mut pending_quotes, sq, max_len: MAX_PENDING_MSGS)
                 }
             },
             Option::None => {
                 if let Option::Some(s) = decode_sig_msg(span) {
+                    if s.round_id < round_id || s.round_id > round_id + MAX_FUTURE_ROUND_LOOKAHEAD {
+                        continue
+                    }
+                    if !ffi::verify_sig(chain_id, contract20, sig: s) {
+                        continue
+                    }
                     if s.round_id == round_id {
                         if accept_sigs
                             && prices_eq(s.median_prices, expected_prices)
                             && s.timestamp == expected_ts {
                             add_sig_dedup(mut sigs, s)
                         } else if !accept_sigs {
-                            add_sig_dedup(mut pending_sigs, s)
+                            add_pending_sig_bounded(mut pending_sigs, s)
                         }
-                    } else if s.round_id > round_id {
-                        add_sig_dedup(mut pending_sigs, s)
+                    } else {
+                        add_pending_sig_bounded(mut pending_sigs, s)
                     }
                 }
             },

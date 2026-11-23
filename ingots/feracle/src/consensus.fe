@@ -235,6 +235,8 @@ impl ConsensusCoro {
             mut peer,
             mut telemetry,
             round_id: self.round_id,
+            chain_id: self.config.chain_id,
+            contract20: self.config.contract20.span(),
             quote_routing,
             mut self.quotes,
             mut self.pending_quotes,
@@ -650,6 +652,7 @@ impl ConsensusCoro {
         }
 
         if let ConsensusState::MeshWarmup = self.state {
+            self.drain_inbox(mut peer, mut telemetry)
             let peers = peer.peer_count()
             let elapsed_ms = sched.now_ms() - self.phase_started_ms
             if peers >= 2 || (elapsed_ms >= 5000 && peers >= 1) || elapsed_ms >= 15000 {
@@ -964,7 +967,7 @@ impl ConsensusCoro {
                         .set_phase(
                             round_id: self.round_id,
                             phase: "failover_submitting".span(),
-                            local_prices: self.group_medians,
+                            local_prices: self.local_prices,
                             group_medians: self.group_medians,
                             round_ts: self.round_ts,
                         )
