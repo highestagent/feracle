@@ -1,5 +1,5 @@
 use std::abi::sol
-use std::evm::{Address, Ctx, StorageMap, crypto, revert_error}
+use std::evm::{Address, Ctx, Log, StorageMap, crypto, revert_error}
 pub use feracle_core::{ASSET_COUNT, QUORUM}
 
 #[error]
@@ -25,6 +25,32 @@ pub struct DuplicateOrUnsortedSigner {}
 
 #[error]
 pub struct InvalidAsset {}
+
+#[error]
+pub struct PriceOverflow {}
+
+const MAX_PRICE_U64: u256 = 0xffffffffffffffff
+const SECP256K1_N_HALF: u256 = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0
+
+#[event]
+pub struct OracleAdded {
+    #[indexed]
+    pub node: Address,
+}
+
+#[event]
+pub struct OracleRemoved {
+    #[indexed]
+    pub node: Address,
+}
+
+#[event]
+pub struct MediansSubmitted {
+    #[indexed]
+    pub round_id: u256,
+    pub timestamp: u256,
+    pub btc_price: u256,
+}
 
 #[abi]
 pub struct Sig { pub v: u8, pub r: u256, pub s: u256 }
@@ -62,7 +88,7 @@ struct OracleStore {
     last_updated: u256,
 }
 
-pub contract OffchainMedianOracle uses (ctx: Ctx) {
+pub contract OffchainMedianOracle uses (ctx: Ctx, log: mut Log) {
     mut store: OracleStore,
 
     init()
@@ -74,22 +100,24 @@ pub contract OffchainMedianOracle uses (ctx: Ctx) {
     }
 
     recv OracleMsg {
-        AddOracle { node } uses (ctx, mut store) {
+        AddOracle { node } uses (ctx, mut store, mut log) {
             if ctx.caller() != store.owner {
                 revert_error(Unauthorized {})
             }
             store.is_oracle.set(key: node, value: true)
+            log.emit(OracleAdded { node })
         }
 
-        RemoveOracle { node } uses (ctx, mut store) {
+        RemoveOracle { node } uses (ctx, mut store, mut log) {
             if ctx.caller() != store.owner {
                 revert_error(Unauthorized {})
             }
             store.is_oracle.set(key: node, value: false)
+            log.emit(OracleRemoved { node })
         }
 
         SubmitMedians { round_id, prices, timestamp, sigs }
-        uses (ctx, mut store)
+        uses (ctx, mut store, mut log)
         {
             if round_id != store.current_round {
                 revert_error(InvalidRound {})
@@ -103,8 +131,12 @@ pub contract OffchainMedianOracle uses (ctx: Ctx) {
 
             var p_idx: usize = 0
             while p_idx < ASSET_COUNT {
-                if prices[p_idx] == 0 {
+                let p = prices[p_idx]
+                if p == 0 {
                     revert_error(ZeroPrice {})
+                }
+                if p > MAX_PRICE_U64 {
+                    revert_error(PriceOverflow {})
                 }
                 p_idx += 1
             }
@@ -118,6 +150,9 @@ pub contract OffchainMedianOracle uses (ctx: Ctx) {
             var i: usize = 0
             while i < QUORUM {
                 let sig = sigs[i]
+                if (sig.v != 27 && sig.v != 28) || sig.s == 0 || sig.s > SECP256K1_N_HALF {
+                    revert_error(InvalidSignature {})
+                }
                 let rec = crypto::ecrecover(hash: digest, v: sig.v as u256, r: sig.r, s: sig.s)
                 let recovered = match rec {
                     Result::Ok(Option::Some(word)) => Address::from_word_truncate(word),
@@ -136,28 +171,44 @@ pub contract OffchainMedianOracle uses (ctx: Ctx) {
                 i += 1
             }
 
-            var s_idx: usize = 0
-            while s_idx < ASSET_COUNT {
-                store.latest_prices.set(key: s_idx as u256, value: prices[s_idx])
-                s_idx += 1
+            var w: usize = 0
+            while w < 5 {
+                let base = w * 4
+                let packed: u256 = prices[base]
+                    | (prices[base + 1] << 64)
+                    | (prices[base + 2] << 128)
+                    | (prices[base + 3] << 192)
+                store.latest_prices.set(key: w as u256, value: packed)
+                w += 1
             }
             store.last_updated = timestamp
             store.current_round = round_id + 1
+            log.emit(
+                MediansSubmitted { round_id, timestamp, btc_price: prices[0] },
+            )
         }
 
         LatestPrice { asset_id } -> (u256, u256) uses (store) {
             if asset_id >= (ASSET_COUNT as u256) {
                 revert_error(InvalidAsset {})
             }
-            (store.latest_prices.get(asset_id), store.last_updated)
+            let slot = asset_id / 4
+            let shift = (asset_id % 4) * 64
+            let price = (store.latest_prices.get(slot) >> shift) & MAX_PRICE_U64
+            (price, store.last_updated)
         }
 
         LatestPrices -> ([u256; 20], u256) uses (store) {
             var out: [u256; 20] = [0; 20]
-            var i: usize = 0
-            while i < ASSET_COUNT {
-                out[i] = store.latest_prices.get(i as u256)
-                i += 1
+            var w: usize = 0
+            while w < 5 {
+                let word = store.latest_prices.get(w as u256)
+                let base = w * 4
+                out[base] = word & MAX_PRICE_U64
+                out[base + 1] = (word >> 64) & MAX_PRICE_U64
+                out[base + 2] = (word >> 128) & MAX_PRICE_U64
+                out[base + 3] = (word >> 192) & MAX_PRICE_U64
+                w += 1
             }
             (out, store.last_updated)
         }

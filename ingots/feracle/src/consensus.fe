@@ -30,24 +30,62 @@ use super::submit::{SubmitMediansCoro, SubmitOutcome}
 use super::telemetry::{TelemetryEvent, TelemetrySink}
 
 enum ConsensusState {
-    MeshWarmup,
-    QueryRoundState,
-    WaitNextSec,
-    FetchingFeeds,
-    FeedRetryDelay,
-    FeedErrorCooldown,
-    PhaseAQuotes,
-    ToleranceBreachWait,
-    PhaseCSigs,
-    PrimarySubmitting,
-    Settling,
+    MeshWarmup { started_ms: u64, tick: Sleep },
+    QueryRoundState { query: QueryRoundState },
+    WaitNextSec { sleep: Sleep },
+    FetchingFeeds {
+        try_idx: usize,
+        fetcher: FetchFeedsCoro,
+    },
+    FeedRetryDelay {
+        next_try_idx: usize,
+        sleep: Sleep,
+    },
+    FeedErrorCooldown { sleep: Sleep },
+    PhaseAQuotes {
+        started_ms: u64,
+        deadline: Sleep,
+        pub_sleep: Sleep,
+    },
+    ToleranceBreachWait {
+        deadline: Sleep,
+        rpc_sleep: Option<Sleep>,
+        round_query: Option<QueryCurrentRound>,
+    },
+    PhaseCSigs {
+        started_ms: u64,
+        deadline: Sleep,
+        pub_sleep: Sleep,
+    },
+    PrimarySubmitting {
+        started_ms: u64,
+        submit_started_ms: u64,
+        submit: SubmitMediansCoro,
+        pub_sleep: Sleep,
+    },
+    Settling {
+        started_ms: u64,
+        deadline: Sleep,
+        pub_sleep: Sleep,
+        rpc_sleep: Option<Sleep>,
+        round_query: Option<QueryCurrentRound>,
+        failover_submit: Option<SubmitMediansCoro>,
+        submit_started_ms: u64,
+        failover_started: bool,
+        backup_leader: u64,
+    },
     Done(i32),
 }
 
-pub struct ConsensusCoro {
+enum StepAction {
+    Stay,
+    Transition(ConsensusState),
+    Finish(i32),
+}
+
+struct RoundContext {
     owner: TaskId,
     config: NodeConfig,
-    state: ConsensusState,
     pending_quotes: MemVec<SourcedQuote>,
     pending_sigs: MemVec<SigMsg>,
     scratch: MemBuffer,
@@ -65,19 +103,9 @@ pub struct ConsensusCoro {
     sorted_sigs: [SigMsg; 3],
     sig_frame: MemBuffer,
     submitted: bool,
-    failover_started: bool,
-    backup_leader: u64,
-    fetch_try: usize,
-    phase_started_ms: u64,
-    submit_started_ms: u64,
-    phase_sleep: Option<Sleep>,
-    pub_sleep: Option<Sleep>,
-    rpc_sleep: Option<Sleep>,
-    round_state_coro: Option<QueryRoundState>,
-    round_query_coro: Option<QueryCurrentRound>,
-    fetch_coro: Option<FetchFeedsCoro>,
-    submit_coro: Option<SubmitMediansCoro>,
 }
+
+pub struct ConsensusCoro { ctx: RoundContext, state: ConsensusState }
 
 fn zero_sig() -> SigMsg {
     SigMsg {
@@ -123,7 +151,9 @@ uses (err: mut Stderr)
     }
 }
 
-fn sleep_ready(_ slot: mut Option<Sleep>) -> bool uses (sched: mut Scheduler) {
+fn opt_sleep_ready(_ slot: mut Option<Sleep>) -> bool
+uses (sched: mut Scheduler)
+{
     if let Option::Some(mut s) = slot {
         if let Poll::Ready(_) = s.poll() {
             slot = Option::None
@@ -133,104 +163,93 @@ fn sleep_ready(_ slot: mut Option<Sleep>) -> bool uses (sched: mut Scheduler) {
     false
 }
 
-fn cancel_sleep(_ slot: mut Option<Sleep>) uses (sched: mut Scheduler) {
+fn cancel_opt_sleep(_ slot: mut Option<Sleep>) uses (sched: mut Scheduler) {
     if let Option::Some(mut s) = slot {
         s.cancel()
         slot = Option::None
     }
 }
 
-impl ConsensusCoro {
-    pub fn new(config: own NodeConfig) -> Self uses (sched: mut Scheduler) {
-        let owner = sched.alloc_task()
-        let now_ms = sched.now_ms()
-        let tick = Sleep::after(owner, delay_ms: 50)
-        ConsensusCoro {
-            owner,
-            config,
-            state: ConsensusState::MeshWarmup,
-            pending_quotes: MemVec::new(),
-            pending_sigs: MemVec::new(),
-            scratch: MemBuffer::with_capacity(512),
-            completed_rounds: 0,
-            fallback_round: 1,
-            round_id: 1,
-            last_updated: 0,
-            local_prices: [0; 20],
-            local_ts: 0,
-            group_medians: [0; 20],
-            round_ts: 0,
-            quotes: MemVec::new(),
-            quote_frame: MemBuffer::empty(),
-            sigs: MemVec::new(),
-            sorted_sigs: [zero_sig(); 3],
-            sig_frame: MemBuffer::empty(),
-            submitted: false,
-            failover_started: false,
-            backup_leader: 0,
-            fetch_try: 0,
-            phase_started_ms: now_ms,
-            submit_started_ms: 0,
-            phase_sleep: Option::None,
-            pub_sleep: Option::None,
-            rpc_sleep: Option::Some(tick),
-            round_state_coro: Option::None,
-            round_query_coro: Option::None,
-            fetch_coro: Option::None,
-            submit_coro: Option::None,
-        }
+fn cancel_state(_ state: mut ConsensusState)
+uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+{
+    match state {
+        ConsensusState::MeshWarmup { started_ms: _, mut tick } => tick.cancel(),
+        ConsensusState::QueryRoundState { mut query } => query.cancel(),
+        ConsensusState::WaitNextSec { mut sleep } => sleep.cancel(),
+        ConsensusState::FetchingFeeds { try_idx: _, mut fetcher } => fetcher.cancel(),
+        ConsensusState::FeedRetryDelay { next_try_idx: _, mut sleep } => sleep.cancel(),
+        ConsensusState::FeedErrorCooldown { mut sleep } => sleep.cancel(),
+        ConsensusState::PhaseAQuotes { started_ms: _, mut deadline, mut pub_sleep } => {
+            deadline.cancel()
+            pub_sleep.cancel()
+        },
+        ConsensusState::ToleranceBreachWait { mut deadline, mut rpc_sleep, mut round_query } => {
+            deadline.cancel()
+            cancel_opt_sleep(mut rpc_sleep)
+            if let Option::Some(mut q) = round_query {
+                q.cancel()
+            }
+        },
+        ConsensusState::PhaseCSigs { started_ms: _, mut deadline, mut pub_sleep } => {
+            deadline.cancel()
+            pub_sleep.cancel()
+        },
+        ConsensusState::PrimarySubmitting {
+            started_ms: _,
+            submit_started_ms: _,
+            mut submit,
+            mut pub_sleep,
+        } => {
+            submit.cancel()
+            pub_sleep.cancel()
+        },
+        ConsensusState::Settling {
+            started_ms: _,
+            mut deadline,
+            mut pub_sleep,
+            mut rpc_sleep,
+            mut round_query,
+            mut failover_submit,
+            submit_started_ms: _,
+            failover_started: _,
+            backup_leader: _,
+        } => {
+            deadline.cancel()
+            pub_sleep.cancel()
+            cancel_opt_sleep(mut rpc_sleep)
+            if let Option::Some(mut q) = round_query {
+                q.cancel()
+            }
+            if let Option::Some(mut s) = failover_submit {
+                s.cancel()
+            }
+        },
+        ConsensusState::Done(_) => {},
     }
+}
 
-    fn cancel_children(mut self)
-    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
-    {
-        cancel_sleep(mut self.phase_sleep)
-        cancel_sleep(mut self.pub_sleep)
-        cancel_sleep(mut self.rpc_sleep)
-        if let Option::Some(mut c) = self.round_state_coro {
-            c.cancel()
-        }
-        if let Option::Some(mut c) = self.round_query_coro {
-            c.cancel()
-        }
-        if let Option::Some(mut c) = self.fetch_coro {
-            c.cancel()
-        }
-        if let Option::Some(mut c) = self.submit_coro {
-            c.cancel()
-        }
-        self.round_state_coro = Option::None
-        self.round_query_coro = Option::None
-        self.fetch_coro = Option::None
-        self.submit_coro = Option::None
+fn quote_routing_for(_ state: ref ConsensusState) -> (QuoteRouting, bool) {
+    match state {
+        ConsensusState::PhaseAQuotes { .. } => (QuoteRouting::AcceptCurrent, false),
+        ConsensusState::ToleranceBreachWait { .. } => (QuoteRouting::IgnoreCurrent, false),
+        ConsensusState::PhaseCSigs { .. } => (QuoteRouting::IgnoreCurrent, true),
+        ConsensusState::PrimarySubmitting { .. } => (QuoteRouting::IgnoreCurrent, true),
+        ConsensusState::Settling { .. } => (QuoteRouting::IgnoreCurrent, true),
+        _ => (QuoteRouting::BufferPending, false),
     }
+}
 
-    pub fn cancel(mut self)
-    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
-    {
-        self.cancel_children()
-        sched.cancel_owner_timers(self.owner)
-        io.deregister_owner(self.owner)
-        self.state = ConsensusState::Done(0)
-    }
-
-    fn drain_inbox(mut self, _ peer: mut PeerSession, _ telemetry: mut TelemetrySink)
+impl RoundContext {
+    fn drain_inbox(
+        mut self,
+        _ quote_routing: QuoteRouting,
+        _ accept_sigs: bool,
+        _ peer: mut PeerSession,
+        _ telemetry: mut TelemetrySink,
+    )
     uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
     {
-        let quote_routing = match self.state {
-            ConsensusState::PhaseAQuotes => QuoteRouting::AcceptCurrent,
-            ConsensusState::ToleranceBreachWait => QuoteRouting::IgnoreCurrent,
-            ConsensusState::PhaseCSigs => QuoteRouting::IgnoreCurrent,
-            ConsensusState::PrimarySubmitting => QuoteRouting::IgnoreCurrent,
-            ConsensusState::Settling => QuoteRouting::IgnoreCurrent,
-            _ => QuoteRouting::BufferPending,
-        }
-        let accept_sigs = match self.state {
-            ConsensusState::PhaseCSigs => true,
-            ConsensusState::PrimarySubmitting => true,
-            ConsensusState::Settling => true,
-            _ => false,
-        }
         poll_all_messages(
             mut peer,
             mut telemetry,
@@ -252,42 +271,39 @@ impl ConsensusCoro {
     fn step_rebroadcast(
         mut self,
         use_quote: bool,
+        _ pub_sleep: mut Sleep,
         _ peer: mut PeerSession,
         _ telemetry: mut TelemetrySink,
     )
     uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
     {
-        if sleep_ready(mut self.pub_sleep) {
+        if let Poll::Ready(_) = pub_sleep.poll() {
             if use_quote {
                 let _ = peer.publish(self.quote_frame.span(), mut telemetry)
             } else {
                 let _ = peer.publish(self.sig_frame.span(), mut telemetry)
             }
-            self.pub_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 2000))
+            pub_sleep = Sleep::after(owner: self.owner, delay_ms: 2000)
         }
     }
 
-    fn start_round(mut self)
+    fn next_round_state(mut self) -> ConsensusState
     uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
     {
-        self.cancel_children()
         if self.config.rounds > 0 && self.completed_rounds >= self.config.rounds {
-            sched.cancel_owner_timers(self.owner)
-            io.deregister_owner(self.owner)
-            self.state = ConsensusState::Done(0)
-            return
+            return ConsensusState::Done(0)
         }
         self.round_id = self.fallback_round
-        let round_state = QueryRoundState::start(
-            rpc_addr: self.config.rpc_addr,
-            rpc_path: self.config.rpc_path.span(),
-            contract_0x: self.config.contract_0x.span(),
-        )
-        self.round_state_coro = Option::Some(round_state)
-        self.state = ConsensusState::QueryRoundState
+        ConsensusState::QueryRoundState {
+            query: QueryRoundState::start(
+                rpc_addr: self.config.rpc_addr,
+                rpc_path: self.config.rpc_path.span(),
+                contract_0x: self.config.contract_0x.span(),
+            ),
+        }
     }
 
-    fn begin_fetching_feeds(mut self, _ telemetry: mut TelemetrySink)
+    fn begin_fetching_state(mut self, _ telemetry: mut TelemetrySink) -> ConsensusState
     uses (net: mut Net, out: mut Stdout, sched: mut Scheduler, io: mut SocketIo)
     {
         let zero_prices: [u64; 20] = [0; 20]
@@ -306,17 +322,18 @@ impl ConsensusCoro {
                 group_medians: zero_prices,
                 round_ts: 0,
             )
-        self.fetch_try = 0
-        self.fetch_coro = Option::Some(FetchFeedsCoro::start(self.config.sources.as_slice()))
-        self.state = ConsensusState::FetchingFeeds
+        ConsensusState::FetchingFeeds {
+            try_idx: 0,
+            fetcher: FetchFeedsCoro::start(self.config.sources.as_slice()),
+        }
     }
 
-    fn enter_phase_a(
+    fn enter_phase_a_state(
         mut self,
         _ prices: [u64; 20],
         _ peer: mut PeerSession,
         _ telemetry: mut TelemetrySink,
-    )
+    ) -> ConsensusState
     uses (
         net: mut Net,
         clock: Clock,
@@ -375,20 +392,23 @@ impl ConsensusCoro {
         let _ = peer.publish(self.quote_frame.span(), mut telemetry)
 
         if self.quotes.len() >= 3 {
-            self.enter_phase_b(mut peer, mut telemetry)
-            return
+            return self.enter_phase_b_state(mut peer, mut telemetry)
         }
-        self.phase_sleep = Option::Some(
-            Sleep::after(
+        ConsensusState::PhaseAQuotes {
+            started_ms: sched.now_ms(),
+            deadline: Sleep::after(
                 owner: self.owner,
                 delay_ms: self.config.round_timeout_secs * 1000,
             ),
-        )
-        self.pub_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 2000))
-        self.state = ConsensusState::PhaseAQuotes
+            pub_sleep: Sleep::after(owner: self.owner, delay_ms: 2000),
+        }
     }
 
-    fn enter_phase_b(mut self, _ peer: mut PeerSession, _ telemetry: mut TelemetrySink)
+    fn enter_phase_b_state(
+        mut self,
+        _ peer: mut PeerSession,
+        _ telemetry: mut TelemetrySink,
+    ) -> ConsensusState
     uses (
         net: mut Net,
         clock: Clock,
@@ -398,7 +418,6 @@ impl ConsensusCoro {
         io: mut SocketIo,
     )
     {
-        self.cancel_children()
         self.group_medians = median_prices_3(
             self.quotes[0].quote.prices,
             self.quotes[1].quote.prices,
@@ -442,21 +461,20 @@ impl ConsensusCoro {
                     group_medians: self.group_medians,
                     round_ts: self.round_ts,
                 )
-            self.phase_sleep = Option::Some(
-                Sleep::after(
+            return ConsensusState::ToleranceBreachWait {
+                deadline: Sleep::after(
                     owner: self.owner,
                     delay_ms: self.config.round_timeout_secs * 1000,
                 ),
-            )
-            self.round_query_coro = Option::Some(
-                QueryCurrentRound::start(
-                    rpc_addr: self.config.rpc_addr,
-                    rpc_path: self.config.rpc_path.span(),
-                    contract_0x: self.config.contract_0x.span(),
+                rpc_sleep: Option::None,
+                round_query: Option::Some(
+                    QueryCurrentRound::start(
+                        rpc_addr: self.config.rpc_addr,
+                        rpc_path: self.config.rpc_path.span(),
+                        contract_0x: self.config.contract_0x.span(),
+                    ),
                 ),
-            )
-            self.state = ConsensusState::ToleranceBreachWait
-            return
+            }
         }
 
         let self_sig = match ffi::sign_digest(
@@ -477,8 +495,7 @@ impl ConsensusCoro {
                     " failed to sign digest",
                 )
                 self.completed_rounds += 1
-                self.start_round()
-                return
+                return self.next_round_state()
             },
         }
 
@@ -511,29 +528,24 @@ impl ConsensusCoro {
             )
 
         if self.sigs.len() >= 3 {
-            self.enter_submit_or_settle(mut telemetry)
-            return
+            return self.enter_submit_or_settle_state(mut telemetry)
         }
-        self.phase_sleep = Option::Some(
-            Sleep::after(
+        ConsensusState::PhaseCSigs {
+            started_ms: sched.now_ms(),
+            deadline: Sleep::after(
                 owner: self.owner,
                 delay_ms: self.config.round_timeout_secs * 1000,
             ),
-        )
-        self.pub_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 2000))
-        self.state = ConsensusState::PhaseCSigs
+            pub_sleep: Sleep::after(owner: self.owner, delay_ms: 2000),
+        }
     }
 
-    fn enter_submit_or_settle(mut self, _ telemetry: mut TelemetrySink)
+    fn enter_submit_or_settle_state(mut self, _ telemetry: mut TelemetrySink) -> ConsensusState
     uses (net: mut Net, out: mut Stdout, sched: mut Scheduler, io: mut SocketIo)
     {
-        self.cancel_children()
         self.sorted_sigs = sort_three_sigs([self.sigs[0], self.sigs[1], self.sigs[2]])
         let primary_leader = leader_index(round_id: self.round_id, node_count: NODE_COUNT)
-        self.backup_leader = leader_index(round_id: self.round_id + 1, node_count: NODE_COUNT)
         self.submitted = false
-        self.failover_started = false
-        self.pub_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 2000))
 
         if self.config.node_id == primary_leader {
             println!(
@@ -552,22 +564,25 @@ impl ConsensusCoro {
                     group_medians: self.group_medians,
                     round_ts: self.round_ts,
                 )
-            self.submit_started_ms = sched.now_ms()
-            self.submit_coro = Option::Some(
-                SubmitMediansCoro::start(
-                    rpc_addr: self.config.rpc_addr,
-                    rpc_path: self.config.rpc_path.span(),
-                    privkey32: self.config.privkey32.span(),
-                    from_0x: self.config.self_addr_0x.span(),
-                    chain_id: self.config.chain_id,
-                    contract20: self.config.contract20.span(),
-                    round_id: self.round_id,
-                    prices: self.group_medians,
-                    timestamp: self.round_ts,
-                    sigs: self.sorted_sigs,
-                ),
+            let now_ms = sched.now_ms()
+            let submit = SubmitMediansCoro::start(
+                rpc_addr: self.config.rpc_addr,
+                rpc_path: self.config.rpc_path.span(),
+                privkey32: self.config.privkey32.span(),
+                from_0x: self.config.self_addr_0x.span(),
+                chain_id: self.config.chain_id,
+                contract20: self.config.contract20.span(),
+                round_id: self.round_id,
+                prices: self.group_medians,
+                timestamp: self.round_ts,
+                sigs: self.sorted_sigs,
             )
-            self.state = ConsensusState::PrimarySubmitting
+            ConsensusState::PrimarySubmitting {
+                started_ms: now_ms,
+                submit_started_ms: now_ms,
+                submit,
+                pub_sleep: Sleep::after(owner: self.owner, delay_ms: 2000),
+            }
         } else {
             println!(
                 "node ",
@@ -577,11 +592,11 @@ impl ConsensusCoro {
                 " to settle round ",
                 self.round_id,
             )
-            self.enter_settling(mut telemetry)
+            self.enter_settling_state(mut telemetry)
         }
     }
 
-    fn enter_settling(mut self, _ telemetry: mut TelemetrySink)
+    fn enter_settling_state(mut self, _ telemetry: mut TelemetrySink) -> ConsensusState
     uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
     {
         telemetry
@@ -592,31 +607,38 @@ impl ConsensusCoro {
                 group_medians: self.group_medians,
                 round_ts: self.round_ts,
             )
-        self.phase_started_ms = sched.now_ms()
-        self.phase_sleep = Option::Some(
-            Sleep::after(
+        let backup_leader = leader_index(round_id: self.round_id + 1, node_count: NODE_COUNT)
+        ConsensusState::Settling {
+            started_ms: sched.now_ms(),
+            deadline: Sleep::after(
                 owner: self.owner,
                 delay_ms: self.config.round_timeout_secs * 2000,
             ),
-        )
-        self.round_query_coro = Option::Some(
-            QueryCurrentRound::start(
-                rpc_addr: self.config.rpc_addr,
-                rpc_path: self.config.rpc_path.span(),
-                contract_0x: self.config.contract_0x.span(),
+            pub_sleep: Sleep::after(owner: self.owner, delay_ms: 2000),
+            rpc_sleep: Option::None,
+            round_query: Option::Some(
+                QueryCurrentRound::start(
+                    rpc_addr: self.config.rpc_addr,
+                    rpc_path: self.config.rpc_path.span(),
+                    contract_0x: self.config.contract_0x.span(),
+                ),
             ),
-        )
-        self.state = ConsensusState::Settling
+            failover_submit: Option::None,
+            submit_started_ms: 0,
+            failover_started: false,
+            backup_leader,
+        }
     }
 
     fn handle_submit_outcome(
         mut self,
         _ outcome: SubmitOutcome,
+        submit_started_ms: u64,
         _ telemetry: mut TelemetrySink,
     ) -> bool
     uses (out: mut Stdout, err: mut Stderr, sched: mut Scheduler, io: mut SocketIo)
     {
-        let sub_ms = sched.now_ms() - self.submit_started_ms
+        let sub_ms = sched.now_ms() - submit_started_ms
         match outcome {
             SubmitOutcome::Confirmed(ok) => {
                 println!(
@@ -637,6 +659,54 @@ impl ConsensusCoro {
             },
         }
     }
+}
+
+impl ConsensusCoro {
+    pub fn new(config: own NodeConfig) -> Self uses (sched: mut Scheduler) {
+        let owner = sched.alloc_task()
+        let now_ms = sched.now_ms()
+        let ctx = RoundContext {
+            owner,
+            config,
+            pending_quotes: MemVec::new(),
+            pending_sigs: MemVec::new(),
+            scratch: MemBuffer::with_capacity(512),
+            completed_rounds: 0,
+            fallback_round: 1,
+            round_id: 1,
+            last_updated: 0,
+            local_prices: [0; 20],
+            local_ts: 0,
+            group_medians: [0; 20],
+            round_ts: 0,
+            quotes: MemVec::new(),
+            quote_frame: MemBuffer::empty(),
+            sigs: MemVec::new(),
+            sorted_sigs: [zero_sig(); 3],
+            sig_frame: MemBuffer::empty(),
+            submitted: false,
+        }
+        let state = ConsensusState::MeshWarmup {
+            started_ms: now_ms,
+            tick: Sleep::after(owner, delay_ms: 50),
+        }
+        ConsensusCoro { ctx, state }
+    }
+
+    fn transition(mut self, _ next: own ConsensusState)
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        cancel_state(mut self.state)
+        self.state = next
+    }
+
+    pub fn cancel(mut self)
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        self.transition(ConsensusState::Done(0))
+        sched.cancel_owner_timers(self.ctx.owner)
+        io.deregister_owner(self.ctx.owner)
+    }
 
     pub fn poll(mut self, _ peer: mut PeerSession, _ telemetry: mut TelemetrySink) -> Poll<i32>
     uses (
@@ -652,373 +722,382 @@ impl ConsensusCoro {
             return Poll::Ready(code)
         }
 
-        if let ConsensusState::MeshWarmup = self.state {
-            self.drain_inbox(mut peer, mut telemetry)
-            let peers = peer.peer_count()
-            let elapsed_ms = sched.now_ms() - self.phase_started_ms
-            if peers >= 2 || (elapsed_ms >= 5000 && peers >= 1) || elapsed_ms >= 15000 {
-                println!(
-                    "node ",
-                    self.config.node_id,
-                    " mesh ready with peer_count=",
-                    peers,
-                )
-                self.start_round()
-                if let ConsensusState::Done(code) = self.state {
-                    return Poll::Ready(code)
-                }
-                return Poll::Pending
-            }
-            if sleep_ready(mut self.rpc_sleep) {
-                self.rpc_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 50))
-            }
-            return Poll::Pending
-        }
+        let (quote_routing, accept_sigs) = quote_routing_for(ref self.state)
+        self.ctx.drain_inbox(quote_routing, accept_sigs, mut peer, mut telemetry)
 
-        self.drain_inbox(mut peer, mut telemetry)
-
-        match self.state {
-            ConsensusState::Done(code) => {
-                return Poll::Ready(code)
-            },
-            ConsensusState::MeshWarmup => {},
-            ConsensusState::QueryRoundState => {
-                var ready: Option<(Option<u64>, u64)> = Option::None
-                if let Option::Some(mut c) = self.round_state_coro {
-                    if let Poll::Ready(rs) = c.poll() {
-                        ready = Option::Some((rs.round_id, rs.last_updated))
+        let ctx = mut self.ctx
+        let action = match self.state {
+            ConsensusState::Done(code) => StepAction::Finish(code),
+            ConsensusState::MeshWarmup { started_ms, mut tick } => {
+                let peers = peer.peer_count()
+                let elapsed_ms = sched.now_ms() - started_ms
+                if peers >= 2 || (elapsed_ms >= 5000 && peers >= 1) || elapsed_ms >= 15000 {
+                    println!(
+                        "node ",
+                        ctx.config.node_id,
+                        " mesh ready with peer_count=",
+                        peers,
+                    )
+                    StepAction::Transition(ctx.next_round_state())
+                } else {
+                    if let Poll::Ready(_) = tick.poll() {
+                        tick = Sleep::after(owner: ctx.owner, delay_ms: 50)
                     }
+                    StepAction::Stay
                 }
-                if let Option::Some((round_opt, last_updated)) = ready {
-                    self.round_state_coro = Option::None
-                    self.round_id = match round_opt {
+            },
+            ConsensusState::QueryRoundState { mut query } => {
+                if let Poll::Ready(rs) = query.poll() {
+                    ctx.round_id = match rs.round_id {
                         Option::Some(r) => r,
                         Option::None => {
                             eprintln!(
                                 "node ",
-                                self.config.node_id,
+                                ctx.config.node_id,
                                 " warning: failed to query currentRound, using fallback=",
-                                self.fallback_round,
+                                ctx.fallback_round,
                             )
-                            self.fallback_round
+                            ctx.fallback_round
                         },
                     }
-                    self.last_updated = last_updated
-                    if clock.now().as_secs() <= self.last_updated {
-                        self.phase_sleep = Option::Some(
-                            Sleep::after(owner: self.owner, delay_ms: 100),
+                    ctx.last_updated = rs.last_updated
+                    if clock.now().as_secs() <= ctx.last_updated {
+                        StepAction::Transition(
+                            ConsensusState::WaitNextSec {
+                                sleep: Sleep::after(owner: ctx.owner, delay_ms: 100),
+                            },
                         )
-                        self.state = ConsensusState::WaitNextSec
                     } else {
-                        self.begin_fetching_feeds(mut telemetry)
+                        StepAction::Transition(ctx.begin_fetching_state(mut telemetry))
                     }
+                } else {
+                    StepAction::Stay
                 }
             },
-            ConsensusState::WaitNextSec => {
-                if clock.now().as_secs() > self.last_updated {
-                    self.cancel_children()
-                    self.begin_fetching_feeds(mut telemetry)
-                } else if sleep_ready(mut self.phase_sleep) {
-                    self.phase_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 100))
+            ConsensusState::WaitNextSec { mut sleep } => {
+                if clock.now().as_secs() > ctx.last_updated {
+                    StepAction::Transition(ctx.begin_fetching_state(mut telemetry))
+                } else {
+                    if let Poll::Ready(_) = sleep.poll() {
+                        sleep = Sleep::after(owner: ctx.owner, delay_ms: 100)
+                    }
+                    StepAction::Stay
                 }
             },
-            ConsensusState::FetchingFeeds => {
-                var medians_opt: Option<Option<[u64; 20]>> = Option::None
-                var reports = MemVec<FeedReport>::new()
-                if let Option::Some(mut c) = self.fetch_coro {
-                    if let Poll::Ready(outcome) = c.poll() {
-                        medians_opt = Option::Some(outcome.medians)
-                        reports = outcome.reports
-                    }
-                }
-                if let Option::Some(m_opt) = medians_opt {
-                    self.fetch_coro = Option::None
-                    if let Option::Some(prices) = m_opt {
-                        emit_feed_reports(reports, mut telemetry)
-                        self.enter_phase_a(prices, mut peer, mut telemetry)
+            ConsensusState::FetchingFeeds { try_idx, mut fetcher } => {
+                if let Poll::Ready(outcome) = fetcher.poll() {
+                    if let Option::Some(prices) = outcome.medians {
+                        emit_feed_reports(outcome.reports, mut telemetry)
+                        StepAction::Transition(
+                            ctx.enter_phase_a_state(prices, mut peer, mut telemetry),
+                        )
                     } else {
-                        self.fetch_try += 1
-                        if self.fetch_try < 3 {
-                            self.phase_sleep = Option::Some(
-                                Sleep::after(owner: self.owner, delay_ms: 500),
+                        let next_try = try_idx + 1
+                        if next_try < 3 {
+                            StepAction::Transition(
+                                ConsensusState::FeedRetryDelay {
+                                    next_try_idx: next_try,
+                                    sleep: Sleep::after(owner: ctx.owner, delay_ms: 500),
+                                },
                             )
-                            self.state = ConsensusState::FeedRetryDelay
                         } else {
                             let zero_prices: [u64; 20] = [0; 20]
-                            emit_feed_reports(reports, mut telemetry)
+                            emit_feed_reports(outcome.reports, mut telemetry)
                             eprintln!(
                                 "node ",
-                                self.config.node_id,
+                                ctx.config.node_id,
                                 " round ",
-                                self.round_id,
+                                ctx.round_id,
                                 " error: incomplete price feeds for 20-asset basket",
                             )
                             telemetry
                                 .set_phase(
-                                    round_id: self.round_id,
+                                    round_id: ctx.round_id,
                                     phase: "feed_error".span(),
                                     local_prices: zero_prices,
                                     group_medians: zero_prices,
                                     round_ts: 0,
                                 )
-                            self.completed_rounds += 1
-                            self.phase_sleep = Option::Some(
-                                Sleep::after(owner: self.owner, delay_ms: 1000),
+                            ctx.completed_rounds += 1
+                            StepAction::Transition(
+                                ConsensusState::FeedErrorCooldown {
+                                    sleep: Sleep::after(owner: ctx.owner, delay_ms: 1000),
+                                },
                             )
-                            self.state = ConsensusState::FeedErrorCooldown
                         }
                     }
+                } else {
+                    StepAction::Stay
                 }
             },
-            ConsensusState::FeedRetryDelay => {
-                if sleep_ready(mut self.phase_sleep) {
-                    self.fetch_coro = Option::Some(
-                        FetchFeedsCoro::start(self.config.sources.as_slice()),
+            ConsensusState::FeedRetryDelay { next_try_idx, mut sleep } => {
+                if let Poll::Ready(_) = sleep.poll() {
+                    StepAction::Transition(
+                        ConsensusState::FetchingFeeds {
+                            try_idx: next_try_idx,
+                            fetcher: FetchFeedsCoro::start(ctx.config.sources.as_slice()),
+                        },
                     )
-                    self.state = ConsensusState::FetchingFeeds
+                } else {
+                    StepAction::Stay
                 }
             },
-            ConsensusState::FeedErrorCooldown => {
-                if sleep_ready(mut self.phase_sleep) {
-                    self.start_round()
+            ConsensusState::FeedErrorCooldown { mut sleep } => {
+                if let Poll::Ready(_) = sleep.poll() {
+                    StepAction::Transition(ctx.next_round_state())
+                } else {
+                    StepAction::Stay
                 }
             },
-            ConsensusState::PhaseAQuotes => {
-                if self.quotes.len() >= 3 {
-                    self.enter_phase_b(mut peer, mut telemetry)
-                } else if sleep_ready(mut self.phase_sleep) {
+            ConsensusState::PhaseAQuotes { started_ms: _, mut deadline, mut pub_sleep } => {
+                if ctx.quotes.len() >= 3 {
+                    StepAction::Transition(ctx.enter_phase_b_state(mut peer, mut telemetry))
+                } else if let Poll::Ready(_) = deadline.poll() {
                     let zero_prices: [u64; 20] = [0; 20]
-                    self.cancel_children()
                     eprintln!(
                         "node ",
-                        self.config.node_id,
+                        ctx.config.node_id,
                         " round ",
-                        self.round_id,
+                        ctx.round_id,
                         " timed out in Phase A with ",
-                        self.quotes.len(),
+                        ctx.quotes.len(),
                         " quotes",
                     )
                     telemetry
                         .set_phase(
-                            round_id: self.round_id,
+                            round_id: ctx.round_id,
                             phase: "timeout_phase_a".span(),
-                            local_prices: self.local_prices,
+                            local_prices: ctx.local_prices,
                             group_medians: zero_prices,
-                            round_ts: self.local_ts,
+                            round_ts: ctx.local_ts,
                         )
-                    self.completed_rounds += 1
-                    self.start_round()
+                    ctx.completed_rounds += 1
+                    StepAction::Transition(ctx.next_round_state())
                 } else {
-                    self.step_rebroadcast(use_quote: true, mut peer, mut telemetry)
+                    ctx.step_rebroadcast(use_quote: true, mut pub_sleep, mut peer, mut telemetry)
+                    StepAction::Stay
                 }
             },
-            ConsensusState::ToleranceBreachWait => {
-                var query_done = false
-                var next_round_opt: Option<u64> = Option::None
-                if let Option::Some(mut c) = self.round_query_coro {
-                    if let Poll::Ready(r) = c.poll() {
-                        query_done = true
-                        next_round_opt = r
-                    }
-                }
-                if query_done {
-                    self.round_query_coro = Option::None
-                    if let Option::Some(r) = next_round_opt {
-                        if r > self.round_id {
-                            self.fallback_round = r
-                            self.cancel_children()
-                            self.completed_rounds += 1
-                            self.start_round()
-                            return self.check_done()
+            ConsensusState::ToleranceBreachWait {
+                mut deadline,
+                mut rpc_sleep,
+                mut round_query,
+            } => {
+                var advanced_round = false
+                if let Option::Some(mut q) = round_query {
+                    if let Poll::Ready(next_round_opt) = q.poll() {
+                        round_query = Option::None
+                        if let Option::Some(r) = next_round_opt {
+                            if r > ctx.round_id {
+                                ctx.fallback_round = r
+                                ctx.completed_rounds += 1
+                                advanced_round = true
+                            }
+                        }
+                        if !advanced_round {
+                            rpc_sleep = Option::Some(Sleep::after(owner: ctx.owner, delay_ms: 150))
                         }
                     }
-                    self.rpc_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 150))
                 }
-                if self.round_query_coro.is_none() && sleep_ready(mut self.rpc_sleep) {
-                    self.round_query_coro = Option::Some(
-                        QueryCurrentRound::start(
-                            rpc_addr: self.config.rpc_addr,
-                            rpc_path: self.config.rpc_path.span(),
-                            contract_0x: self.config.contract_0x.span(),
-                        ),
-                    )
-                }
-                if sleep_ready(mut self.phase_sleep) {
-                    self.cancel_children()
-                    self.completed_rounds += 1
-                    self.start_round()
+                if advanced_round {
+                    StepAction::Transition(ctx.next_round_state())
+                } else {
+                    if round_query.is_none() && opt_sleep_ready(mut rpc_sleep) {
+                        round_query = Option::Some(
+                            QueryCurrentRound::start(
+                                rpc_addr: ctx.config.rpc_addr,
+                                rpc_path: ctx.config.rpc_path.span(),
+                                contract_0x: ctx.config.contract_0x.span(),
+                            ),
+                        )
+                    }
+                    if let Poll::Ready(_) = deadline.poll() {
+                        ctx.completed_rounds += 1
+                        StepAction::Transition(ctx.next_round_state())
+                    } else {
+                        StepAction::Stay
+                    }
                 }
             },
-            ConsensusState::PhaseCSigs => {
-                if self.sigs.len() >= 3 {
-                    self.enter_submit_or_settle(mut telemetry)
-                } else if sleep_ready(mut self.phase_sleep) {
-                    self.cancel_children()
+            ConsensusState::PhaseCSigs { started_ms: _, mut deadline, mut pub_sleep } => {
+                if ctx.sigs.len() >= 3 {
+                    StepAction::Transition(ctx.enter_submit_or_settle_state(mut telemetry))
+                } else if let Poll::Ready(_) = deadline.poll() {
                     eprintln!(
                         "node ",
-                        self.config.node_id,
+                        ctx.config.node_id,
                         " round ",
-                        self.round_id,
+                        ctx.round_id,
                         " timed out in Phase C with ",
-                        self.sigs.len(),
+                        ctx.sigs.len(),
                         " sigs",
                     )
                     telemetry
                         .set_phase(
-                            round_id: self.round_id,
+                            round_id: ctx.round_id,
                             phase: "timeout_phase_c".span(),
-                            local_prices: self.local_prices,
-                            group_medians: self.group_medians,
-                            round_ts: self.round_ts,
+                            local_prices: ctx.local_prices,
+                            group_medians: ctx.group_medians,
+                            round_ts: ctx.round_ts,
                         )
-                    self.completed_rounds += 1
-                    self.start_round()
+                    ctx.completed_rounds += 1
+                    StepAction::Transition(ctx.next_round_state())
                 } else {
-                    self.step_rebroadcast(use_quote: false, mut peer, mut telemetry)
+                    ctx.step_rebroadcast(use_quote: false, mut pub_sleep, mut peer, mut telemetry)
+                    StepAction::Stay
                 }
             },
-            ConsensusState::PrimarySubmitting => {
-                self.step_rebroadcast(use_quote: false, mut peer, mut telemetry)
-                var submit_done: Option<SubmitOutcome> = Option::None
-                if let Option::Some(mut c) = self.submit_coro {
-                    if let Poll::Ready(res) = c.poll() {
-                        submit_done = Option::Some(res)
-                    }
-                }
-                if let Option::Some(res) = submit_done {
-                    self.submit_coro = Option::None
-                    self.submitted = self.handle_submit_outcome(res, mut telemetry)
-                    self.enter_settling(mut telemetry)
+            ConsensusState::PrimarySubmitting {
+                started_ms: _,
+                submit_started_ms,
+                mut submit,
+                mut pub_sleep,
+            } => {
+                ctx.step_rebroadcast(use_quote: false, mut pub_sleep, mut peer, mut telemetry)
+                if let Poll::Ready(res) = submit.poll() {
+                    ctx.submitted = ctx.handle_submit_outcome(res, submit_started_ms, mut telemetry)
+                    StepAction::Transition(ctx.enter_settling_state(mut telemetry))
+                } else {
+                    StepAction::Stay
                 }
             },
-            ConsensusState::Settling => {
-                self.step_rebroadcast(use_quote: false, mut peer, mut telemetry)
-
-                var fb_done: Option<SubmitOutcome> = Option::None
-                if let Option::Some(mut c) = self.submit_coro {
-                    if let Poll::Ready(res) = c.poll() {
-                        fb_done = Option::Some(res)
+            ConsensusState::Settling {
+                started_ms,
+                mut deadline,
+                mut pub_sleep,
+                mut rpc_sleep,
+                mut round_query,
+                mut failover_submit,
+                mut submit_started_ms,
+                mut failover_started,
+                backup_leader,
+            } => {
+                ctx.step_rebroadcast(use_quote: false, mut pub_sleep, mut peer, mut telemetry)
+                if let Option::Some(mut fb) = failover_submit {
+                    if let Poll::Ready(res) = fb.poll() {
+                        failover_submit = Option::None
+                        ctx.submitted = ctx
+                            .handle_submit_outcome(res, submit_started_ms, mut telemetry)
                     }
                 }
-                if let Option::Some(res) = fb_done {
-                    self.submit_coro = Option::None
-                    self.submitted = self.handle_submit_outcome(res, mut telemetry)
-                }
-
-                var query_done = false
-                var onchain_opt: Option<u64> = Option::None
-                if let Option::Some(mut c) = self.round_query_coro {
-                    if let Poll::Ready(r) = c.poll() {
-                        query_done = true
-                        onchain_opt = r
-                    }
-                }
-                if query_done {
-                    self.round_query_coro = Option::None
-                    if let Option::Some(onchain_round) = onchain_opt {
-                        if onchain_round > self.round_id {
-                            self.cancel_children()
-                            self.fallback_round = onchain_round
-                            println!(
-                                "node ",
-                                self.config.node_id,
-                                " confirmed round ",
-                                self.round_id,
-                                " settled on-chain",
-                            )
-                            telemetry
-                                .set_phase(
-                                    round_id: self.round_id,
-                                    phase: "settled".span(),
-                                    local_prices: self.local_prices,
-                                    group_medians: self.group_medians,
-                                    round_ts: self.round_ts,
+                var settled_onchain = false
+                if let Option::Some(mut q) = round_query {
+                    if let Poll::Ready(onchain_opt) = q.poll() {
+                        round_query = Option::None
+                        if let Option::Some(onchain_round) = onchain_opt {
+                            if onchain_round > ctx.round_id {
+                                ctx.fallback_round = onchain_round
+                                println!(
+                                    "node ",
+                                    ctx.config.node_id,
+                                    " confirmed round ",
+                                    ctx.round_id,
+                                    " settled on-chain",
                                 )
-                            self.completed_rounds += 1
-                            self.start_round()
-                            return self.check_done()
+                                telemetry
+                                    .set_phase(
+                                        round_id: ctx.round_id,
+                                        phase: "settled".span(),
+                                        local_prices: ctx.local_prices,
+                                        group_medians: ctx.group_medians,
+                                        round_ts: ctx.round_ts,
+                                    )
+                                ctx.completed_rounds += 1
+                                settled_onchain = true
+                            }
+                        }
+                        if !settled_onchain {
+                            rpc_sleep = Option::Some(Sleep::after(owner: ctx.owner, delay_ms: 150))
                         }
                     }
-                    self.rpc_sleep = Option::Some(Sleep::after(owner: self.owner, delay_ms: 150))
                 }
-
-                if self.round_query_coro.is_none() && sleep_ready(mut self.rpc_sleep) {
-                    self.round_query_coro = Option::Some(
-                        QueryCurrentRound::start(
-                            rpc_addr: self.config.rpc_addr,
-                            rpc_path: self.config.rpc_path.span(),
-                            contract_0x: self.config.contract_0x.span(),
-                        ),
-                    )
-                }
-
-                let elapsed_ms = sched.now_ms() - self.phase_started_ms
-                if elapsed_ms >= self.config.round_timeout_secs * 1000
-                    && !self.submitted
-                    && !self.failover_started
-                    && self.config.node_id == self.backup_leader {
-                    self.failover_started = true
-                    eprintln!(
-                        "node ",
-                        self.config.node_id,
-                        " failover submitting round ",
-                        self.round_id,
-                    )
-                    telemetry
-                        .set_phase(
-                            round_id: self.round_id,
-                            phase: "failover_submitting".span(),
-                            local_prices: self.local_prices,
-                            group_medians: self.group_medians,
-                            round_ts: self.round_ts,
+                if settled_onchain {
+                    StepAction::Transition(ctx.next_round_state())
+                } else {
+                    if round_query.is_none() && opt_sleep_ready(mut rpc_sleep) {
+                        round_query = Option::Some(
+                            QueryCurrentRound::start(
+                                rpc_addr: ctx.config.rpc_addr,
+                                rpc_path: ctx.config.rpc_path.span(),
+                                contract_0x: ctx.config.contract_0x.span(),
+                            ),
                         )
-                    self.submit_started_ms = sched.now_ms()
-                    self.submit_coro = Option::Some(
-                        SubmitMediansCoro::start(
-                            rpc_addr: self.config.rpc_addr,
-                            rpc_path: self.config.rpc_path.span(),
-                            privkey32: self.config.privkey32.span(),
-                            from_0x: self.config.self_addr_0x.span(),
-                            chain_id: self.config.chain_id,
-                            contract20: self.config.contract20.span(),
-                            round_id: self.round_id,
-                            prices: self.group_medians,
-                            timestamp: self.round_ts,
-                            sigs: self.sorted_sigs,
-                        ),
-                    )
-                }
-
-                if sleep_ready(mut self.phase_sleep)
-                    || elapsed_ms >= self.config.round_timeout_secs * 2000 {
-                    self.cancel_children()
-                    eprintln!(
-                        "node ",
-                        self.config.node_id,
-                        " round ",
-                        self.round_id,
-                        " did not confirm within timeout",
-                    )
-                    telemetry
-                        .set_phase(
-                            round_id: self.round_id,
-                            phase: "timeout_settle".span(),
-                            local_prices: self.local_prices,
-                            group_medians: self.group_medians,
-                            round_ts: self.round_ts,
+                    }
+                    let elapsed_ms = sched.now_ms() - started_ms
+                    if elapsed_ms >= ctx.config.round_timeout_secs * 1000
+                        && !ctx.submitted
+                        && !failover_started
+                        && ctx.config.node_id == backup_leader {
+                        failover_started = true
+                        eprintln!(
+                            "node ",
+                            ctx.config.node_id,
+                            " failover submitting round ",
+                            ctx.round_id,
                         )
-                    self.completed_rounds += 1
-                    self.start_round()
+                        telemetry
+                            .set_phase(
+                                round_id: ctx.round_id,
+                                phase: "failover_submitting".span(),
+                                local_prices: ctx.local_prices,
+                                group_medians: ctx.group_medians,
+                                round_ts: ctx.round_ts,
+                            )
+                        submit_started_ms = sched.now_ms()
+                        failover_submit = Option::Some(
+                            SubmitMediansCoro::start(
+                                rpc_addr: ctx.config.rpc_addr,
+                                rpc_path: ctx.config.rpc_path.span(),
+                                privkey32: ctx.config.privkey32.span(),
+                                from_0x: ctx.config.self_addr_0x.span(),
+                                chain_id: ctx.config.chain_id,
+                                contract20: ctx.config.contract20.span(),
+                                round_id: ctx.round_id,
+                                prices: ctx.group_medians,
+                                timestamp: ctx.round_ts,
+                                sigs: ctx.sorted_sigs,
+                            ),
+                        )
+                    }
+                    let timed_out = match deadline.poll() {
+                        Poll::Ready(_) => true,
+                        Poll::Pending => elapsed_ms >= ctx.config.round_timeout_secs * 2000,
+                    }
+                    if timed_out {
+                        eprintln!(
+                            "node ",
+                            ctx.config.node_id,
+                            " round ",
+                            ctx.round_id,
+                            " did not confirm within timeout",
+                        )
+                        telemetry
+                            .set_phase(
+                                round_id: ctx.round_id,
+                                phase: "timeout_settle".span(),
+                                local_prices: ctx.local_prices,
+                                group_medians: ctx.group_medians,
+                                round_ts: ctx.round_ts,
+                            )
+                        ctx.completed_rounds += 1
+                        StepAction::Transition(ctx.next_round_state())
+                    } else {
+                        StepAction::Stay
+                    }
                 }
             },
         }
-        self.check_done()
-    }
 
-    fn check_done(self) -> Poll<i32> {
-        match self.state {
-            ConsensusState::Done(code) => Poll::Ready(code),
-            _ => Poll::Pending,
+        match action {
+            StepAction::Stay => Poll::Pending,
+            StepAction::Finish(code) => Poll::Ready(code),
+            StepAction::Transition(next) => {
+                self.transition(next)
+                match self.state {
+                    ConsensusState::Done(code) => Poll::Ready(code),
+                    _ => Poll::Pending,
+                }
+            },
         }
     }
 }

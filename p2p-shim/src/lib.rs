@@ -987,12 +987,12 @@ mod tests {
     #[test]
     fn test_crypto_keccak_and_sign_parity_with_evm_vectors() {
         // Exact test vector verified against ingots/evm/src/test.fe and cast!
-        let contract = hex::decode("3244d0de654b2d7e00fedb548d3f5a6c6175dcf0").unwrap();
+        let contract = hex::decode("12b7796311880f2adce95dd9da0265425fed32b0").unwrap();
         let contract20: [u8; 20] = contract.try_into().unwrap();
         let digest = build_oracle_digest(1, &contract20, 1, &TEST_PRICES, 1);
         assert_eq!(
             hex::encode(digest),
-            "836dfc6d33a5e73cf42cdb4ac57aebc8a95b35bbe6efe7afd365ed45e04e82d9"
+            "abaa019c372782c3b99f19a716dc0e73d5a653ebefb898e4af0584b04c985f8a"
         );
 
         let prices_be = prices_to_be160(&TEST_PRICES);
