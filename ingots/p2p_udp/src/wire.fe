@@ -1,6 +1,6 @@
 //! UDP SWIM wire codecs and `Pollable` socket wrapper.
 
-use std::net::{IpAddr, Ipv4Addr, Pollable, SocketAddr, UdpSocket}
+use std::net::{IpAddr, Ipv4Addr, SocketAddr}
 use p2p::{
     Header,
     PeerEntry,
@@ -17,14 +17,6 @@ pub const KIND_PING: u8 = 0x12
 pub const KIND_ACK: u8 = 0x13
 pub const KIND_PING_REQ: u8 = 0x14
 pub const KIND_INDIRECT_ACK: u8 = 0x15
-
-pub struct UdpSlot { pub sock: UdpSocket }
-
-impl Pollable for UdpSlot {
-    fn raw_fd(self) -> i32 {
-        self.sock.as_raw_fd()
-    }
-}
 
 pub fn encode_join(origin: u64, seq: u64, listen_port: u16, _ out: mut MemBuffer) {
     encode_u16_frame(kind: KIND_JOIN, origin, seq, listen_port, mut out)

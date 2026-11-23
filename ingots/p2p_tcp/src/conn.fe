@@ -1,7 +1,6 @@
-//! `TcpSlot` poller wrapper and non-blocking buffered stream framing.
-
 use std::io::{Read, Write}
-use std::net::{Pollable, SocketAddr, TcpListener, TcpStream}
+use std::net::{SocketAddr, Token}
+use net_reactor::SocketIo
 use p2p::{decode_header, frame_len, is_would_block}
 
 const MAX_INBUF: usize = 16384
@@ -58,7 +57,7 @@ pub enum FrameStep {
 impl Copy for FrameStep {}
 
 pub struct PeerConn {
-    pub stream: TcpStream,
+    pub token: Token,
     pub state: ConnState,
     pub outbound: bool,
     pub remote_addr: SocketAddr,
@@ -71,23 +70,9 @@ pub struct PeerConn {
     pub want_writable: bool,
 }
 
-pub enum TcpSlot {
-    Listener(TcpListener),
-    Peer(PeerConn),
-}
-
-impl Pollable for TcpSlot {
-    fn raw_fd(self) -> i32 {
-        match self {
-            TcpSlot::Listener(ref l) => l.as_raw_fd(),
-            TcpSlot::Peer(ref p) => p.stream.as_raw_fd(),
-        }
-    }
-}
-
 impl PeerConn {
     pub fn new(
-        stream: own TcpStream,
+        token: Token,
         state: ConnState,
         outbound: bool,
         remote_addr: SocketAddr,
@@ -95,7 +80,7 @@ impl PeerConn {
         want_writable: bool,
     ) -> Self {
         PeerConn {
-            stream,
+            token,
             state,
             outbound,
             remote_addr,
@@ -137,25 +122,28 @@ impl PeerConn {
         true
     }
 
-    pub fn flush(mut self) -> IoOutcome {
+    pub fn flush(mut self) -> IoOutcome uses (io: mut SocketIo) {
         while self.out_offset < self.outbuf.len() {
             let rem = self.outbuf.len() - self.out_offset
             let send_len = if rem > READ_CHUNK { READ_CHUNK } else { rem }
             let chunk = MemBuffer::from_span(
                 self.outbuf.slice(offset: self.out_offset, len: send_len),
             )
-            match self.stream.write(chunk.span()) {
-                Result::Ok(n) => {
+            match io.stream_write(self.token, chunk.span()) {
+                Option::Some(Result::Ok(n)) => {
                     if n == 0 {
                         return IoOutcome::Closed
                     }
                     self.out_offset += n
                 },
-                Result::Err(err) => {
+                Option::Some(Result::Err(err)) => {
                     if is_would_block(err) {
                         return IoOutcome::Ok
                     }
                     return IoOutcome::Err
+                },
+                Option::None => {
+                    return IoOutcome::Closed
                 },
             }
         }
@@ -164,24 +152,28 @@ impl PeerConn {
         IoOutcome::Ok
     }
 
-    pub fn read_into(mut self, now_ms: u64) -> IoOutcome {
+    pub fn read_into(mut self, now_ms: u64) -> IoOutcome uses (io: mut SocketIo) {
         var tmp = MemBuffer::new(READ_CHUNK)
         while self.inbuf.len() < MAX_INBUF {
             let room = MAX_INBUF - self.inbuf.len()
             let max_read = if room < READ_CHUNK { room } else { READ_CHUNK }
-            match self.stream.read(tmp.span().head(max_read)) {
-                Result::Ok(n) => {
+            let slice = mut tmp.span().head(max_read)
+            match io.stream_read(self.token, mut slice) {
+                Option::Some(Result::Ok(n)) => {
                     if n == 0 {
                         return IoOutcome::Closed
                     }
                     self.inbuf.extend_from(tmp.span().head(n))
                     self.last_activity_ms = now_ms
                 },
-                Result::Err(err) => {
+                Option::Some(Result::Err(err)) => {
                     if is_would_block(err) {
                         return IoOutcome::Ok
                     }
                     return IoOutcome::Err
+                },
+                Option::None => {
+                    return IoOutcome::Closed
                 },
             }
         }

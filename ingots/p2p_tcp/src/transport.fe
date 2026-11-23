@@ -1,13 +1,13 @@
-//! Pure-Fe non-blocking TCP mesh + PEX implementation of `p2p::Transport`.
-
 use std::io::Error
-use std::net::{Event, Events, Interest, Net, Poller, SocketAddr, Token}
+use std::net::{Interest, Net, SocketAddr, Token}
 use std::time::Clock
-use p2p::{GossipConfig, GossipCore, MonoClock, Ticker, is_would_block}
-use super::conn::{ConnState, FrameStep, PeerConn, TcpSlot}
+use coro::{LocalScheduler, Scheduler, TaskId, TimerId}
+use net_reactor::{IoEvent, NetDriver, NetPoller, SocketIo}
+use p2p::{GossipConfig, GossipCore, Ticker}
+use super::conn::{ConnState, FrameStep, PeerConn}
 use super::dialer::DialBook
 use super::dispatch::handle_frame
-use super::mesh::{TcpMeshState, close_peer, queue_to_peer, sync_interest}
+use super::mesh::{TcpMeshState, close_peer, find_peer_index, queue_to_peer, sync_interest}
 use super::wire::encode_hello
 
 pub struct TcpConfig {
@@ -17,30 +17,27 @@ pub struct TcpConfig {
     pub gossip: GossipConfig,
 }
 
-pub struct TcpTransport {
-    pub(ingot) poller: Poller<TcpSlot>,
-    pub(ingot) events: Events,
+pub struct TcpEngine {
+    pub(ingot) owner: TaskId,
     pub(ingot) listener_token: Token,
-    pub(ingot) peer_tokens: MemVec<Token>,
+    pub(ingot) peers: MemVec<PeerConn>,
     pub(ingot) local_addr: SocketAddr,
-    pub(ingot) clock: MonoClock,
     pub(ingot) pex_ticker: Ticker,
     pub(ingot) ping_ticker: Ticker,
     pub(ingot) nonce: u64,
     pub(ingot) state: TcpMeshState,
+    pub(ingot) timer_id: Option<TimerId>,
 }
 
-impl TcpTransport {
-    pub fn bind(_ config: own TcpConfig) -> Result<Error, Self>
-    uses (net: mut Net, clock: Clock)
+impl TcpEngine {
+    pub fn bind(_ config: own TcpConfig, owner: TaskId) -> Result<Error, Self>
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
     {
         var listener = net.listen(config.bind_addr)?
         listener.set_nonblocking(true)?
         let local_addr = listener.local_addr()?
-        var poller = Poller<TcpSlot>::new()?
-        let listener_token = poller.add(TcpSlot::Listener(listener), Interest::READABLE)?
-        let mono = MonoClock::start()
-        let now_ms = mono.now_ms()
+        let listener_token = io.register_tcp_listener(owner, tag: 0, listener)?
+        let now_ms = sched.now_ms()
 
         var dialer = DialBook::new(
             base_ms: config.gossip.reconnect_base_ms,
@@ -64,23 +61,23 @@ impl TcpTransport {
             dialer,
         }
 
-        var transport = TcpTransport {
-            poller,
-            events: Events::with_capacity(64),
+        var engine = TcpEngine {
+            owner,
             listener_token,
-            peer_tokens: MemVec::new(),
+            peers: MemVec::new(),
             local_addr,
-            clock: mono,
             pex_ticker: Ticker::new(period_ms: config.gossip.heartbeat_ms, now_ms),
             ping_ticker: Ticker::new(period_ms: config.gossip.heartbeat_ms, now_ms),
             nonce: 0,
             state,
+            timer_id: Option::None,
         }
-        transport.dial_due(now_ms)
-        Result::Ok(transport)
+        engine.dial_due(now_ms)
+        engine.reschedule_timer(now_ms)
+        Result::Ok(engine)
     }
 
-    pub(ingot) fn dial_due(mut self, _ now_ms: u64) uses (net: mut Net) {
+    pub(ingot) fn dial_due(mut self, _ now_ms: u64) uses (net: mut Net, io: mut SocketIo) {
         var attempts: usize = 0
         while attempts < 8 {
             let Option::Some(addr) = self
@@ -97,17 +94,24 @@ impl TcpTransport {
             match net.connect_nonblocking(addr) {
                 Result::Ok(var stream) => {
                     let _ = stream.set_nodelay(true)
-                    let conn = PeerConn::new(
+                    match io.register_tcp_stream(
+                        owner: self.owner,
+                        tag: 1,
                         stream,
-                        state: ConnState::Connecting,
-                        outbound: true,
-                        remote_addr: addr,
-                        now_ms,
-                        want_writable: true,
-                    )
-                    match self.poller.add(TcpSlot::Peer(conn), Interest::BOTH) {
+                        Interest::BOTH,
+                    ) {
                         Result::Ok(tok) => {
-                            self.peer_tokens.push(tok)
+                            self.peers
+                                .push(
+                                    PeerConn::new(
+                                        token: tok,
+                                        state: ConnState::Connecting,
+                                        outbound: true,
+                                        remote_addr: addr,
+                                        now_ms,
+                                        want_writable: true,
+                                    ),
+                                )
                             self.state.dialer.mark_active(addr, tok)
                         },
                         Result::Err(_) => self.state.dialer.mark_fail(addr, now_ms),
@@ -118,25 +122,11 @@ impl TcpTransport {
         }
     }
 
-    pub(ingot) fn accept_all(mut self, _ now_ms: u64) {
+    pub(ingot) fn accept_all(mut self, _ now_ms: u64) uses (io: mut SocketIo) {
         while true {
-            let accepted = match self.poller.get(self.listener_token) {
-                Option::Some(mut slot) => match slot {
-                    TcpSlot::Listener(mut listener) => listener.accept(),
-                    TcpSlot::Peer(_) => {
-                        return
-                    },
-                },
-                Option::None => {
-                    return
-                },
-            }
-            let pair = match accepted {
-                Result::Ok(p) => p,
-                Result::Err(err) => {
-                    if is_would_block(err) {
-                        return
-                    }
+            let pair = match io.listener_accept(self.listener_token) {
+                Option::Some(Result::Ok(p)) => p,
+                _ => {
                     return
                 },
             }
@@ -145,14 +135,26 @@ impl TcpTransport {
             if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
                 continue
             }
-            var conn = PeerConn::new(
-                stream,
-                state: ConnState::Handshaking,
-                outbound: false,
-                remote_addr: peer_addr,
-                now_ms,
-                want_writable: false,
-            )
+            let Ok(tok) = io
+                .register_tcp_stream(
+                    owner: self.owner,
+                    tag: 1,
+                    stream,
+                    Interest::READABLE,
+                ) else {
+                continue
+            }
+            self.peers
+                .push(
+                    PeerConn::new(
+                        token: tok,
+                        state: ConnState::Handshaking,
+                        outbound: false,
+                        remote_addr: peer_addr,
+                        now_ms,
+                        want_writable: false,
+                    ),
+                )
             var hello = MemBuffer::empty()
             let seq = self.state.base.next_seq()
             encode_hello(
@@ -161,56 +163,39 @@ impl TcpTransport {
                 listen_port: self.state.base.listen_port,
                 mut hello,
             )
-            if conn.queue_bytes(hello.span()) && conn.flush().is_ok() {
-                self.state.base.stats.frames_tx += 1
-                let writable = conn.has_pending_write()
-                conn.want_writable = writable
-                let interest = if writable {
-                    Interest::BOTH
-                } else {
-                    Interest::READABLE
-                }
-                if let Result::Ok(tok) = self.poller.add(TcpSlot::Peer(conn), interest) {
-                    self.peer_tokens.push(tok)
-                }
-            }
+            let _ = queue_to_peer(mut self.peers, tok, hello.span(), now_ms, mut self.state)
         }
     }
 
-    fn handle_writable(mut self, _ token: Token, _ now_ms: u64) -> bool {
+    fn handle_writable(mut self, _ token: Token, _ now_ms: u64) -> bool
+    uses (io: mut SocketIo)
+    {
+        let Option::Some(idx) = find_peer_index(self.peers, token) else {
+            return false
+        }
         var connecting = false
         var failed = false
-        match self.poller.get(token) {
-            Option::Some(mut slot) => {
-                if let TcpSlot::Peer(mut conn) = slot {
-                    if conn.state.is_connecting() {
-                        connecting = true
-                        match conn.stream.take_error() {
-                            Result::Ok(Option::None) => {
-                                conn.state = ConnState::Handshaking
-                                conn.last_activity_ms = now_ms
-                            },
-                            _ => failed = true,
-                        }
-                    } else if conn.has_pending_write() {
-                        if !conn.flush().is_ok() {
-                            failed = true
-                        }
+        if self.peers[idx].state.is_connecting() {
+            connecting = true
+            match io.stream_take_error(token) {
+                Option::Some(Result::Ok(Option::None)) => {
+                    if let Option::Some(mut conn) = self.peers.get(idx) {
+                        conn.state = ConnState::Handshaking
+                        conn.last_activity_ms = now_ms
                     }
+                },
+                _ => failed = true,
+            }
+        } else if self.peers[idx].has_pending_write() {
+            if let Option::Some(mut conn) = self.peers.get(idx) {
+                if !conn.flush().is_ok() {
+                    failed = true
                 }
-            },
-            Option::None => {
-                return false
-            },
+            }
         }
+
         if failed {
-            close_peer(
-                mut self.poller,
-                mut self.peer_tokens,
-                token,
-                now_ms,
-                mut self.state,
-            )
+            close_peer(mut self.peers, token, now_ms, mut self.state)
             return false
         }
         if connecting {
@@ -223,50 +208,47 @@ impl TcpTransport {
                 mut hello,
             )
             return queue_to_peer(
-                mut self.poller,
-                mut self.peer_tokens,
+                mut self.peers,
                 token,
                 hello.span(),
                 now_ms,
                 mut self.state,
             )
         }
-        sync_interest(mut self.poller, token)
+        sync_interest(mut self.peers, token)
         true
     }
 
-    pub(ingot) fn handle_peer_event(mut self, _ ev: Event, _ now_ms: u64) {
-        let tok = ev.token()
-        if ev.is_writable() && !self.handle_writable(tok, now_ms) {
+    pub(ingot) fn handle_peer_event(mut self, _ ev: IoEvent, _ now_ms: u64)
+    uses (io: mut SocketIo)
+    {
+        let tok = ev.token
+        if ev.writable && !self.handle_writable(tok, now_ms) {
             return
         }
-        if ev.is_readable() {
+        if ev.readable {
+            let Option::Some(idx) = find_peer_index(self.peers, tok) else {
+                return
+            }
             var frames = MemVec<MemBuffer>::new()
             var dead = false
-            match self.poller.get(tok) {
-                Option::Some(mut slot) => {
-                    if let TcpSlot::Peer(mut conn) = slot {
-                        if !conn.read_into(now_ms).is_ok() {
+            if let Option::Some(mut conn) = self.peers.get(idx) {
+                if !conn.read_into(now_ms).is_ok() {
+                    dead = true
+                }
+                var one = MemBuffer::empty()
+                while true {
+                    match conn.next_frame(mut one) {
+                        FrameStep::Frame => frames.push(MemBuffer::from_span(one.span())),
+                        FrameStep::NeedMore => {
+                            break
+                        },
+                        FrameStep::Invalid => {
                             dead = true
-                        }
-                        var one = MemBuffer::empty()
-                        while true {
-                            match conn.next_frame(mut one) {
-                                FrameStep::Frame => frames.push(MemBuffer::from_span(one.span())),
-                                FrameStep::NeedMore => {
-                                    break
-                                },
-                                FrameStep::Invalid => {
-                                    dead = true
-                                    break
-                                },
-                            }
-                        }
+                            break
+                        },
                     }
-                },
-                Option::None => {
-                    return
-                },
+                }
             }
             var fi: usize = 0
             while fi < frames.len() {
@@ -274,31 +256,40 @@ impl TcpTransport {
                     token: tok,
                     raw: frames[fi].span(),
                     now_ms,
-                    mut self.poller,
-                    mut self.peer_tokens,
+                    mut self.peers,
                     mut self.state,
                 )
                 fi += 1
             }
             if dead {
-                close_peer(
-                    mut self.poller,
-                    mut self.peer_tokens,
-                    tok,
-                    now_ms,
-                    mut self.state,
-                )
+                close_peer(mut self.peers, tok, now_ms, mut self.state)
                 return
             }
         }
-        if ev.is_error() || ev.is_hangup() {
-            close_peer(
-                mut self.poller,
-                mut self.peer_tokens,
-                tok,
-                now_ms,
-                mut self.state,
-            )
+        if ev.error || ev.hangup {
+            close_peer(mut self.peers, tok, now_ms, mut self.state)
         }
+    }
+}
+
+pub struct TcpTransport {
+    pub(ingot) engine: TcpEngine,
+    pub(ingot) sched: LocalScheduler,
+    pub(ingot) io: NetPoller,
+    pub(ingot) driver: NetDriver,
+}
+
+impl TcpTransport {
+    pub fn bind(_ config: own TcpConfig) -> Result<Error, Self>
+    uses (net: mut Net, clock: Clock)
+    {
+        var sched = LocalScheduler::new(0)
+        var io = NetPoller::new()?
+        let driver = NetDriver::new(max_wait_ms: 20)
+        let engine = with (Scheduler = sched, SocketIo = io) {
+            let owner = sched.alloc_task()
+            TcpEngine::bind(config, owner)
+        }?
+        Result::Ok(TcpTransport { engine, sched, io, driver })
     }
 }

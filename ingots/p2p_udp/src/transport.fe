@@ -1,13 +1,12 @@
-//! Pure-Fe UDP gossip + SWIM implementation of `p2p::Transport`.
-
 use std::io::Error
-use std::net::{Events, Interest, IpAddr, Ipv4Addr, Net, Poller, SocketAddr, Token}
-use std::time::{Clock, Duration}
+use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr, Token}
+use std::time::Clock
+use coro::{Driver, LocalScheduler, Scheduler, TaskId, TimerId}
+use net_reactor::{NetDriver, NetPoller, SocketIo}
 use p2p::{
     Delivery,
     GossipConfig,
     GossipCore,
-    MonoClock,
     PeerEntry,
     Stats,
     Transport,
@@ -16,7 +15,7 @@ use p2p::{
 }
 use super::dispatch::{UdpState, handle_packet, send_datagram}
 use super::swim::SwimState
-use super::wire::{KIND_PING, UdpSlot, encode_join, encode_ping_or_ack, encode_ping_req}
+use super::wire::{KIND_PING, encode_join, encode_ping_or_ack, encode_ping_req}
 
 pub struct UdpConfig {
     pub bind_addr: SocketAddr,
@@ -26,20 +25,19 @@ pub struct UdpConfig {
     pub lan_broadcast_port: u16,
 }
 
-pub struct UdpTransport {
-    poller: Poller<UdpSlot>,
-    events: Events,
+pub struct UdpEngine {
+    owner: TaskId,
     udp_token: Token,
     local_addr: SocketAddr,
     lan_broadcast_port: u16,
     seeds: MemVec<SocketAddr>,
-    clock: MonoClock,
     state: UdpState,
+    timer_id: Option<TimerId>,
 }
 
-impl UdpTransport {
-    pub fn bind(_ config: own UdpConfig) -> Result<Error, Self>
-    uses (net: mut Net, clock: Clock)
+impl UdpEngine {
+    pub fn bind(_ config: own UdpConfig, owner: TaskId) -> Result<Error, Self>
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
     {
         var sock = net.bind_udp(config.bind_addr)?
         sock.set_nonblocking(true)?
@@ -47,12 +45,10 @@ impl UdpTransport {
             sock.set_broadcast(true)?
         }
         let local_addr = sock.local_addr()?
-        var poller = Poller<UdpSlot>::new()?
-        let udp_token = poller.add(UdpSlot { sock }, Interest::READABLE)?
-        let mono = MonoClock::start()
-        let now_ms = mono.now_ms()
+        let udp_token = io.register_udp_socket(owner, tag: 0, sock)?
+        let now_ms = sched.now_ms()
 
-        var state = UdpState {
+        let state = UdpState {
             base: GossipCore::new(
                 self_tag: config.self_tag,
                 listen_port: local_addr.port(),
@@ -62,21 +58,158 @@ impl UdpTransport {
             swim: SwimState::new(now_ms, cfg: config.gossip),
         }
 
-        var transport = UdpTransport {
-            poller,
-            events: Events::with_capacity(16),
+        var engine = UdpEngine {
+            owner,
             udp_token,
             local_addr,
             lan_broadcast_port: config.lan_broadcast_port,
             seeds: config.seeds,
-            clock: mono,
             state,
+            timer_id: Option::None,
         }
-        transport.send_join_to_seeds()
-        Result::Ok(transport)
+        engine.send_join_to_seeds()
+        engine.reschedule_timer(now_ms)
+        Result::Ok(engine)
     }
 
-    fn send_join_to_seeds(mut self) {
+    pub fn local_addr(self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn self_tag(self) -> u64 {
+        self.state.base.self_tag
+    }
+
+    pub fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
+        self.state.base.recv(mut out)
+    }
+
+    pub fn peer_count(self) -> usize {
+        self.state.base.peer_count()
+    }
+
+    pub fn peer_entries(self) -> MemVec<PeerEntry> {
+        self.state.base.peer_entries()
+    }
+
+    pub fn stats(self) -> Stats {
+        self.state.base.stats
+    }
+
+    pub fn add_seed(mut self, _ addr: SocketAddr) uses (io: mut SocketIo) {
+        self.seeds.push(addr)
+        let seq = self.state.base.next_seq()
+        var buf = MemBuffer::empty()
+        encode_join(
+            origin: self.state.base.self_tag,
+            seq,
+            listen_port: self.state.base.listen_port,
+            mut buf,
+        )
+        let _ = send_datagram(
+            self.udp_token,
+            mut self.state.base.stats,
+            buf.span(),
+            addr,
+        )
+    }
+
+    pub fn publish(mut self, _ payload: MemSpan) -> bool uses (io: mut SocketIo) {
+        var frame = MemBuffer::empty()
+        if !self.state.base.prepare_publish(payload, mut frame) {
+            return false
+        }
+
+        var targets = MemVec<usize>::new()
+        pick_fanout(
+            book: self.state.base.book,
+            exclude_tag: self.state.base.self_tag,
+            fanout: self.state.base.gossip.fanout,
+            rng: mut self.state.base.rng,
+            mut targets,
+        )
+        var sent = false
+        var i: usize = 0
+        while i < targets.len() {
+            let addr = self.state.base.book.get(targets[i]).addr
+            if send_datagram(
+                self.udp_token,
+                mut self.state.base.stats,
+                frame.span(),
+                addr,
+            ) {
+                sent = true
+            }
+            i += 1
+        }
+        if targets.is_empty() {
+            var si: usize = 0
+            while si < self.seeds.len() {
+                if send_datagram(
+                    self.udp_token,
+                    mut self.state.base.stats,
+                    frame.span(),
+                    self.seeds[si],
+                ) {
+                    sent = true
+                }
+                si += 1
+            }
+        }
+        sent
+    }
+
+    pub fn poll_io(mut self) -> usize uses (sched: mut Scheduler, io: mut SocketIo) {
+        if let Option::Some(tid) = self.timer_id {
+            if !sched.take_timer_fired(tid) {
+                sched.cancel_timer(tid)
+            }
+            self.timer_id = Option::None
+        }
+        self.step_timers(sched.now_ms())
+        var delivered: usize = 0
+        if let Option::Some(ev) = io.take_token_event(self.udp_token) {
+            if ev.readable || ev.error || ev.hangup {
+                delivered = self.drain_socket(sched.now_ms())
+            }
+        }
+        let end_ms = sched.now_ms()
+        self.step_timers(end_ms)
+        self.reschedule_timer(end_ms)
+        delivered
+    }
+
+    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+        if let Option::Some(tid) = self.timer_id {
+            sched.cancel_timer(tid)
+            self.timer_id = Option::None
+        }
+        sched.cancel_owner_timers(self.owner)
+        io.deregister_owner(self.owner)
+    }
+
+    fn reschedule_timer(mut self, _ now_ms: u64) uses (sched: mut Scheduler) {
+        if let Option::Some(tid) = self.timer_id {
+            sched.cancel_timer(tid)
+            self.timer_id = Option::None
+        }
+        let deadline = self
+            .state
+            .swim
+            .next_deadline_ms(
+                now_ms,
+                cfg: self.state.base.gossip,
+                book_empty: self.state.base.book.is_empty(),
+            )
+        let delay = if deadline > now_ms {
+            deadline - now_ms
+        } else {
+            1
+        }
+        self.timer_id = Option::Some(sched.schedule_after(self.owner, delay_ms: delay))
+    }
+
+    fn send_join_to_seeds(mut self) uses (io: mut SocketIo) {
         if self.seeds.is_empty() {
             return
         }
@@ -93,7 +226,6 @@ impl UdpTransport {
             let seed = self.seeds[i]
             if seed != self.local_addr {
                 let _ = send_datagram(
-                    mut self.poller,
                     self.udp_token,
                     mut self.state.base.stats,
                     buf.span(),
@@ -104,7 +236,7 @@ impl UdpTransport {
         }
     }
 
-    fn send_lan_join(mut self) {
+    fn send_lan_join(mut self) uses (io: mut SocketIo) {
         if self.lan_broadcast_port == 0 {
             return
         }
@@ -121,7 +253,6 @@ impl UdpTransport {
             self.lan_broadcast_port,
         )
         let _ = send_datagram(
-            mut self.poller,
             self.udp_token,
             mut self.state.base.stats,
             buf.span(),
@@ -129,7 +260,7 @@ impl UdpTransport {
         )
     }
 
-    fn step_timers(mut self, _ now_ms: u64) {
+    fn step_timers(mut self, _ now_ms: u64) uses (io: mut SocketIo) {
         let tick = self
             .state
             .swim
@@ -157,7 +288,6 @@ impl UdpTransport {
                 mut tx,
             )
             let _ = send_datagram(
-                mut self.poller,
                 self.udp_token,
                 mut self.state.base.stats,
                 tx.span(),
@@ -187,7 +317,6 @@ impl UdpTransport {
                     while i < helpers.len() {
                         let helper_addr = self.state.base.book.get(helpers[i]).addr
                         let _ = send_datagram(
-                            mut self.poller,
                             self.udp_token,
                             mut self.state.base.stats,
                             tx.span(),
@@ -200,12 +329,12 @@ impl UdpTransport {
         }
     }
 
-    fn drain_socket(mut self, _ now_ms: u64) -> usize {
+    fn drain_socket(mut self, _ now_ms: u64) -> usize uses (io: mut SocketIo) {
         var delivered: usize = 0
         var buf = MemBuffer::new(1500)
         while true {
-            let recv_res = match self.poller.get(self.udp_token) {
-                Option::Some(mut slot) => slot.sock.recv_from(buf.span()),
+            let recv_res = match io.udp_recv_from(self.udp_token, mut buf.span()) {
+                Option::Some(r) => r,
                 Option::None => {
                     break
                 },
@@ -218,7 +347,6 @@ impl UdpTransport {
                         from,
                         now_ms,
                         state: mut self.state,
-                        mut self.poller,
                         self.udp_token,
                     )
                     if self.state.base.inbox.len() > before {
@@ -237,111 +365,100 @@ impl UdpTransport {
     }
 }
 
+pub struct UdpTransport {
+    engine: UdpEngine,
+    sched: LocalScheduler,
+    io: NetPoller,
+    driver: NetDriver,
+}
+
+impl UdpTransport {
+    pub fn bind(_ config: own UdpConfig) -> Result<Error, Self>
+    uses (net: mut Net, clock: Clock)
+    {
+        var sched = LocalScheduler::new(0)
+        var io = NetPoller::new()?
+        let driver = NetDriver::new(max_wait_ms: 20)
+        let engine = with (Scheduler = sched, SocketIo = io) {
+            let owner = sched.alloc_task()
+            UdpEngine::bind(config, owner)
+        }?
+        Result::Ok(UdpTransport { engine, sched, io, driver })
+    }
+}
+
+fn udp_transport_publish(_ engine: mut UdpEngine, _ io: mut NetPoller, _ payload: MemSpan) -> bool {
+    with (SocketIo = io) {
+        engine.publish(payload)
+    }
+}
+
+fn udp_transport_poll(
+    _ engine: mut UdpEngine,
+    _ sched: mut LocalScheduler,
+    _ io: mut NetPoller,
+    _ driver: mut NetDriver,
+    timeout_ms: u64,
+) -> usize
+uses (clock: Clock)
+{
+    with (Scheduler = sched, SocketIo = io) {
+        driver.set_max_wait_ms(timeout_ms)
+        driver.begin_tick()
+        let pre = engine.poll_io()
+        driver.wait()
+        pre + engine.poll_io()
+    }
+}
+
+fn udp_transport_add_seed(_ engine: mut UdpEngine, _ io: mut NetPoller, _ addr: SocketAddr) {
+    with (SocketIo = io) {
+        engine.add_seed(addr)
+    }
+}
+
 impl Transport for UdpTransport {
     fn local_addr(self) -> SocketAddr {
-        self.local_addr
+        self.engine.local_addr()
     }
 
     fn self_tag(self) -> u64 {
-        self.state.base.self_tag
+        self.engine.self_tag()
     }
 
     fn publish(mut self, _ payload: MemSpan) -> bool
     uses (net: mut Net, clock: Clock)
     {
-        var frame = MemBuffer::empty()
-        if !self.state.base.prepare_publish(payload, mut frame) {
-            return false
-        }
-
-        var targets = MemVec<usize>::new()
-        pick_fanout(
-            book: self.state.base.book,
-            exclude_tag: self.state.base.self_tag,
-            fanout: self.state.base.gossip.fanout,
-            rng: mut self.state.base.rng,
-            mut targets,
-        )
-        var sent = false
-        var i: usize = 0
-        while i < targets.len() {
-            let addr = self.state.base.book.get(targets[i]).addr
-            if send_datagram(
-                mut self.poller,
-                self.udp_token,
-                mut self.state.base.stats,
-                frame.span(),
-                addr,
-            ) {
-                sent = true
-            }
-            i += 1
-        }
-        if targets.is_empty() {
-            var si: usize = 0
-            while si < self.seeds.len() {
-                if send_datagram(
-                    mut self.poller,
-                    self.udp_token,
-                    mut self.state.base.stats,
-                    frame.span(),
-                    self.seeds[si],
-                ) {
-                    sent = true
-                }
-                si += 1
-            }
-        }
-        sent
+        udp_transport_publish(mut self.engine, mut self.io, payload)
     }
 
     fn poll(mut self, timeout_ms: u64) -> usize uses (net: mut Net, clock: Clock) {
-        self.step_timers(self.clock.now_ms())
-        let wait_opt = Option::Some(Duration::from_millis(timeout_ms))
-        let n = match self.poller.wait(mut self.events, wait_opt) {
-            Result::Ok(count) => count,
-            Result::Err(_) => 0,
-        }
-        var delivered: usize = 0
-        if n > 0 {
-            delivered = self.drain_socket(self.clock.now_ms())
-        }
-        self.step_timers(self.clock.now_ms())
-        delivered
+        udp_transport_poll(
+            mut self.engine,
+            mut self.sched,
+            mut self.io,
+            mut self.driver,
+            timeout_ms,
+        )
     }
 
     fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
-        self.state.base.recv(mut out)
+        self.engine.recv(mut out)
     }
 
     fn peer_count(self) -> usize {
-        self.state.base.peer_count()
+        self.engine.peer_count()
     }
 
     fn peer_entries(self) -> MemVec<PeerEntry> {
-        self.state.base.peer_entries()
+        self.engine.peer_entries()
     }
 
     fn stats(self) -> Stats {
-        self.state.base.stats
+        self.engine.stats()
     }
 
     fn add_seed(mut self, _ addr: SocketAddr) {
-        self.seeds.push(addr)
-        let seq = self.state.base.next_seq()
-        var buf = MemBuffer::empty()
-        encode_join(
-            origin: self.state.base.self_tag,
-            seq,
-            listen_port: self.state.base.listen_port,
-            mut buf,
-        )
-        let _ = send_datagram(
-            mut self.poller,
-            self.udp_token,
-            mut self.state.base.stats,
-            buf.span(),
-            addr,
-        )
+        udp_transport_add_seed(mut self.engine, mut self.io, addr)
     }
 }

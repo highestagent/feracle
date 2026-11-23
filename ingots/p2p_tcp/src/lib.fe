@@ -2,4 +2,4 @@
 //!
 //! Uses only `p2p` shared facilities and `std::net::TcpListener`/`TcpStream` + `Poller`.
 
-pub use transport::{TcpConfig, TcpTransport}
+pub use transport::{TcpConfig, TcpEngine, TcpTransport}

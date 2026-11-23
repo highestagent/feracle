@@ -1,58 +1,50 @@
-//! TCP mesh state, interest synchronization, and peer cleanup helpers.
-
-use std::net::{Interest, Poller, SocketAddr, Token}
+use std::net::{Interest, SocketAddr, Token}
+use net_reactor::SocketIo
 use p2p::GossipCore
-use super::conn::TcpSlot
+use super::conn::PeerConn
 use super::dialer::DialBook
 
 pub struct TcpMeshState { pub base: GossipCore, pub dialer: DialBook }
 
-pub fn sync_interest(_ poller: mut Poller<TcpSlot>, _ token: Token) {
-    var changed = false
-    var next_writable = false
-    match poller.get(token) {
-        Option::Some(ref slot) => {
-            if let TcpSlot::Peer(ref conn) = slot {
-                next_writable = conn.state.is_connecting() || conn.has_pending_write()
-                changed = next_writable != conn.want_writable
-            }
-        },
-        Option::None => {
-            return
-        },
-    }
-    if !changed { return }
-    if let Option::Some(mut slot) = poller.get(token) {
-        if let TcpSlot::Peer(mut conn) = slot {
-            conn.want_writable = next_writable
+pub fn find_peer_index(_ peers: MemVec<PeerConn>, _ token: Token) -> Option<usize> {
+    var i: usize = 0
+    while i < peers.len() {
+        if peers[i].token == token {
+            return Option::Some(i)
         }
+        i += 1
+    }
+    Option::None
+}
+
+pub fn sync_interest(_ peers: mut MemVec<PeerConn>, _ token: Token)
+uses (io: mut SocketIo)
+{
+    let Option::Some(idx) = find_peer_index(peers, token) else {
+        return
+    }
+    let next_writable = peers[idx].state.is_connecting() || peers[idx].has_pending_write()
+    if next_writable == peers[idx].want_writable {
+        return
+    }
+    if let Option::Some(mut conn) = peers.get(idx) {
+        conn.want_writable = next_writable
     }
     let interest = if next_writable {
         Interest::BOTH
     } else {
         Interest::READABLE
     }
-    let _ = poller.set_interest(token, interest)
+    let _ = io.set_interest(token, interest)
 }
 
-fn has_other_established(
-    _ poller: Poller<TcpSlot>,
-    _ tokens: MemVec<Token>,
-    tag: u64,
-    skip: Token,
-) -> bool {
+fn has_other_established(_ peers: MemVec<PeerConn>, tag: u64, skip: Token) -> bool {
     var i: usize = 0
-    while i < tokens.len() {
-        let tok = tokens[i]
-        if tok != skip {
-            if let Option::Some(ref slot) = poller.get(tok) {
-                if let TcpSlot::Peer(ref conn) = slot {
-                    if conn.state.is_established() {
-                        if let Option::Some(rt) = conn.remote_tag {
-                            if rt == tag { return true }
-                        }
-                    }
-                }
+    while i < peers.len() {
+        let conn = ref peers[i]
+        if conn.token != skip && conn.state.is_established() {
+            if let Option::Some(rt) = conn.remote_tag {
+                if rt == tag { return true }
             }
         }
         i += 1
@@ -61,93 +53,67 @@ fn has_other_established(
 }
 
 pub fn close_peer(
-    _ poller: mut Poller<TcpSlot>,
-    _ peer_tokens: mut MemVec<Token>,
+    _ peers: mut MemVec<PeerConn>,
     _ token: Token,
     _ now_ms: u64,
     _ state: mut TcpMeshState,
-) {
-    var was_established = false
-    var tag_opt: Option<u64> = Option::None
-    match poller.get(token) {
-        Option::Some(ref slot) => {
-            if let TcpSlot::Peer(ref conn) = slot {
-                was_established = conn.state.is_established()
-                tag_opt = conn.remote_tag
-            }
-        },
-        Option::None => {
-            return
-        },
+)
+uses (io: mut SocketIo)
+{
+    let Option::Some(idx) = find_peer_index(peers, token) else {
+        return
     }
-    let _ = poller.remove(token)
-    var i: usize = 0
-    while i < peer_tokens.len() {
-        if peer_tokens[i] == token {
-            let _ = peer_tokens.swap_remove(i)
-            break
-        }
-        i += 1
-    }
+    let was_established = peers[idx].state.is_established()
+    let tag_opt = peers[idx].remote_tag
+    io.deregister(token)
+    let _ = peers.swap_remove(idx)
     state.dialer.mark_closed(token, now_ms, was_established)
     if let Option::Some(tag) = tag_opt {
-        if !has_other_established(poller, peer_tokens, tag, skip: token) {
-            if let Option::Some(idx) = state.base.book.find_tag(tag) {
-                let _ = state.base.book.remove(idx)
+        if !has_other_established(peers, tag, skip: token) {
+            if let Option::Some(b_idx) = state.base.book.find_tag(tag) {
+                let _ = state.base.book.remove(b_idx)
             }
         }
     }
 }
 
 pub fn queue_to_peer(
-    _ poller: mut Poller<TcpSlot>,
-    _ peer_tokens: mut MemVec<Token>,
+    _ peers: mut MemVec<PeerConn>,
     _ token: Token,
     _ bytes: MemSpan,
     _ now_ms: u64,
     _ state: mut TcpMeshState,
-) -> bool {
-    var ok = false
-    match poller.get(token) {
-        Option::Some(mut slot) => {
-            if let TcpSlot::Peer(mut conn) = slot {
-                if conn.queue_bytes(bytes) && conn.flush().is_ok() {
-                    state.base.stats.frames_tx += 1
-                    ok = true
-                }
-            }
-        },
-        Option::None => {
-            return false
-        },
-    }
-    if !ok {
-        close_peer(mut poller, mut peer_tokens, token, now_ms, mut state)
+) -> bool
+uses (io: mut SocketIo)
+{
+    let Option::Some(idx) = find_peer_index(peers, token) else {
         return false
     }
-    sync_interest(mut poller, token)
+    var ok = false
+    if let Option::Some(mut conn) = peers.get(idx) {
+        if conn.queue_bytes(bytes) && conn.flush().is_ok() {
+            state.base.stats.frames_tx += 1
+            ok = true
+        }
+    }
+    if !ok {
+        close_peer(mut peers, token, now_ms, mut state)
+        return false
+    }
+    sync_interest(mut peers, token)
     true
 }
 
-pub fn find_duplicate_established(
-    _ poller: Poller<TcpSlot>,
-    _ tokens: MemVec<Token>,
-    tag: u64,
-    skip: Token,
-) -> Option<(Token, bool)> {
+pub fn find_duplicate_established(_ peers: MemVec<PeerConn>, tag: u64, skip: Token) -> Option<
+    (Token, bool),
+> {
     var i: usize = 0
-    while i < tokens.len() {
-        let tok = tokens[i]
-        if tok != skip {
-            if let Option::Some(ref slot) = poller.get(tok) {
-                if let TcpSlot::Peer(ref conn) = slot {
-                    if conn.state.is_established() {
-                        if let Option::Some(rt) = conn.remote_tag {
-                            if rt == tag {
-                                return Option::Some((tok, conn.outbound))
-                            }
-                        }
-                    }
+    while i < peers.len() {
+        let conn = ref peers[i]
+        if conn.token != skip && conn.state.is_established() {
+            if let Option::Some(rt) = conn.remote_tag {
+                if rt == tag {
+                    return Option::Some((conn.token, conn.outbound))
                 }
             }
         }
@@ -156,24 +122,14 @@ pub fn find_duplicate_established(
     Option::None
 }
 
-pub fn peer_meta(_ poller: Poller<TcpSlot>, _ token: Token) -> Option<
+pub fn peer_meta(_ peers: MemVec<PeerConn>, _ token: Token) -> Option<
     (SocketAddr, SocketAddr, bool, Option<u64>, bool),
 > {
-    match poller.get(token) {
-        Option::Some(ref slot) => match slot {
-            TcpSlot::Peer(ref c) => {
-                Option::Some(
-                    (
-                        c.remote_addr,
-                        c.listen_addr,
-                        c.outbound,
-                        c.remote_tag,
-                        c.state.is_established(),
-                    ),
-                )
-            },
-            TcpSlot::Listener(_) => Option::None,
-        },
-        Option::None => Option::None,
+    let Option::Some(idx) = find_peer_index(peers, token) else {
+        return Option::None
     }
+    let c = ref peers[idx]
+    Option::Some(
+        (c.remote_addr, c.listen_addr, c.outbound, c.remote_tag, c.state.is_established()),
+    )
 }

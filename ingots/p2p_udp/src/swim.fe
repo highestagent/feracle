@@ -167,4 +167,35 @@ impl SwimState {
 
         out
     }
+
+    pub fn next_deadline_ms(self, now_ms: u64, cfg: GossipConfig, book_empty: bool) -> u64 {
+        var min_wait = self.lan_ticker.ms_until(now_ms)
+        if book_empty {
+            let join_wait = self.join_ticker.ms_until(now_ms)
+            if join_wait < min_wait {
+                min_wait = join_wait
+            }
+        }
+        if let Option::Some(p) = self.pending {
+            let target_at = if p.indirect_sent {
+                p.sent_ms + cfg.suspect_ms
+            } else {
+                p.sent_ms + cfg.suspect_ms / 2
+            }
+            let probe_wait = if target_at > now_ms {
+                target_at - now_ms
+            } else {
+                0
+            }
+            if probe_wait < min_wait {
+                min_wait = probe_wait
+            }
+        } else if !book_empty {
+            let swim_wait = self.swim_ticker.ms_until(now_ms)
+            if swim_wait < min_wait {
+                min_wait = swim_wait
+            }
+        }
+        now_ms + min_wait
+    }
 }

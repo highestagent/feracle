@@ -98,4 +98,27 @@ impl DialBook {
         }
         Option::None
     }
+
+    pub fn next_due_ms(self, now_ms: u64, book: PeerBook) -> Option<u64> {
+        var best: Option<u64> = Option::None
+        var i: usize = 0
+        while i < self.entries.len() {
+            let e = self.entries[i]
+            if e.active.is_none() {
+                let connected = match book.find_addr(e.addr) {
+                    Option::Some(p_idx) => book.get(p_idx).is_alive(),
+                    Option::None => false,
+                }
+                if !connected {
+                    let due = now_ms + e.backoff.ms_until(now_ms)
+                    best = match best {
+                        Option::Some(prev) => Option::Some(if due < prev { due } else { prev }),
+                        Option::None => Option::Some(due),
+                    }
+                }
+            }
+            i += 1
+        }
+        best
+    }
 }

@@ -1,7 +1,9 @@
 use std::net::{Net, SocketAddr}
 use std::time::Clock
+use coro::{Driver, LocalScheduler, Scheduler}
+use net_reactor::{NetDriver, NetPoller, SocketIo}
 use p2p::{GossipConfig, Transport}
-use super::{UdpConfig, UdpTransport}
+use super::{UdpConfig, UdpEngine, UdpTransport}
 
 fn pump_all(a: mut UdpTransport, b: mut UdpTransport, c: mut UdpTransport, steps: usize)
 uses (net: mut Net, clock: Clock)
@@ -189,4 +191,103 @@ fn test_udp_swim_suspect_and_expire() uses (net: mut Net, clock: Clock) {
         wait_steps += 1
     }
     assert!(a.peer_count() == 0)
+}
+
+#[test]
+fn test_udp_three_engines_shared_reactor() uses (net: mut Net, clock: Clock) {
+    let lo = SocketAddr::parse("127.0.0.1:0").unwrap()
+    let cfg = GossipConfig::default()
+    var sched = LocalScheduler::new(0)
+    var io = NetPoller::new().unwrap()
+    var driver = NetDriver::new(max_wait_ms: 20)
+
+    with (Scheduler = sched, SocketIo = io) {
+        let t_a = sched.alloc_task()
+        let t_b = sched.alloc_task()
+        let t_c = sched.alloc_task()
+
+        var a = UdpEngine::bind(
+            UdpConfig {
+                bind_addr: lo,
+                self_tag: 101,
+                seeds: MemVec::new(),
+                gossip: cfg,
+                lan_broadcast_port: 0,
+            },
+            owner: t_a,
+        )
+            .unwrap()
+
+        var seeds_b = MemVec<SocketAddr>::new()
+        seeds_b.push(a.local_addr())
+        var b = UdpEngine::bind(
+            UdpConfig {
+                bind_addr: lo,
+                self_tag: 102,
+                seeds: seeds_b,
+                gossip: cfg,
+                lan_broadcast_port: 0,
+            },
+            owner: t_b,
+        )
+            .unwrap()
+
+        var seeds_c = MemVec<SocketAddr>::new()
+        seeds_c.push(a.local_addr())
+        var c = UdpEngine::bind(
+            UdpConfig {
+                bind_addr: lo,
+                self_tag: 103,
+                seeds: seeds_c,
+                gossip: cfg,
+                lan_broadcast_port: 0,
+            },
+            owner: t_c,
+        )
+            .unwrap()
+
+        var step: usize = 0
+        while step < 50 && (a.peer_count() < 2 || b.peer_count() < 2 || c.peer_count() < 2) {
+            driver.begin_tick()
+            let _ = a.poll_io()
+            let _ = b.poll_io()
+            let _ = c.poll_io()
+            driver.wait()
+            step += 1
+        }
+        assert!(
+            a.peer_count() == 2 && b.peer_count() == 2 && c.peer_count() == 2,
+        )
+
+        assert!(a.publish("shared-udp".span()))
+        var got_b = false
+        var got_c = false
+        var buf = MemBuffer::empty()
+        var gstep: usize = 0
+        while gstep < 30 && (!got_b || !got_c) {
+            driver.begin_tick()
+            let _ = a.poll_io()
+            let _ = b.poll_io()
+            let _ = c.poll_io()
+            if !got_b {
+                if let Option::Some(d) = b.recv(mut buf) {
+                    assert!(d.origin == 101 && buf == "shared-udp")
+                    got_b = true
+                }
+            }
+            if !got_c {
+                if let Option::Some(d) = c.recv(mut buf) {
+                    assert!(d.origin == 101 && buf == "shared-udp")
+                    got_c = true
+                }
+            }
+            driver.wait()
+            gstep += 1
+        }
+        assert!(got_b && got_c)
+
+        a.stop()
+        b.stop()
+        c.stop()
+    }
 }

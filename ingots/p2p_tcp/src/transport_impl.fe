@@ -1,72 +1,55 @@
-//! Timer upkeep and `Transport` trait implementation for `TcpTransport`.
-
 use std::net::{Net, SocketAddr, Token}
-use std::time::{Clock, Duration}
+use std::time::Clock
+use coro::{Driver, LocalScheduler, Scheduler}
+use net_reactor::{IoEvent, NetDriver, NetPoller, SocketIo}
 use p2p::{Delivery, PeerEntry, Stats, Transport}
-use super::conn::TcpSlot
 use super::mesh::{close_peer, queue_to_peer}
-use super::transport::TcpTransport
+use super::transport::{TcpEngine, TcpTransport}
 use super::wire::{KIND_PING, encode_pex, encode_ping_or_pong}
 
-fn step_timers(_ t: mut TcpTransport, _ now_ms: u64) uses (net: mut Net) {
+fn step_timers(_ t: mut TcpEngine, _ now_ms: u64)
+uses (net: mut Net, io: mut SocketIo)
+{
     t.dial_due(now_ms)
     var stale = MemVec<Token>::new()
     var ti: usize = 0
-    while ti < t.peer_tokens.len() {
-        let tok = t.peer_tokens[ti]
-        if let Option::Some(ref slot) = t.poller.get(tok) {
-            if let TcpSlot::Peer(ref conn) = slot {
-                if now_ms >= conn.last_activity_ms + t.state.base.gossip.dead_ms {
-                    stale.push(tok)
-                }
-            }
+    while ti < t.peers.len() {
+        let conn = ref t.peers[ti]
+        if now_ms >= conn.last_activity_ms + t.state.base.gossip.dead_ms {
+            stale.push(conn.token)
         }
         ti += 1
     }
     var si: usize = 0
     while si < stale.len() {
-        close_peer(
-            mut t.poller,
-            mut t.peer_tokens,
-            stale[si],
-            now_ms,
-            mut t.state,
-        )
+        close_peer(mut t.peers, stale[si], now_ms, mut t.state)
         si += 1
     }
     if t.pex_ticker.due(now_ms) {
-        var snapshot = MemVec<Token>::new()
-        snapshot.extend_from_slice(t.peer_tokens.as_slice())
+        var targets = MemVec<(Token, u64)>::new()
         var i: usize = 0
-        while i < snapshot.len() {
-            let tok = snapshot[i]
-            var tag_opt: Option<u64> = Option::None
-            if let Option::Some(ref slot) = t.poller.get(tok) {
-                if let TcpSlot::Peer(ref conn) = slot {
-                    if conn.state.is_established() {
-                        tag_opt = conn.remote_tag
-                    }
+        while i < t.peers.len() {
+            let conn = ref t.peers[i]
+            if conn.state.is_established() {
+                if let Option::Some(tag) = conn.remote_tag {
+                    targets.push((conn.token, tag))
                 }
             }
-            if let Option::Some(tag) = tag_opt {
-                var pex_buf = MemBuffer::empty()
-                let seq = t.state.base.next_seq()
-                encode_pex(
-                    origin: t.state.base.self_tag,
-                    seq,
-                    peers: t.state.base.book.alive_entries(exclude_tag: tag),
-                    mut pex_buf,
-                )
-                let _ = queue_to_peer(
-                    mut t.poller,
-                    mut t.peer_tokens,
-                    tok,
-                    pex_buf.span(),
-                    now_ms,
-                    mut t.state,
-                )
-            }
             i += 1
+        }
+        var j: usize = 0
+        while j < targets.len() {
+            let (tok, tag) = targets[j]
+            var pex_buf = MemBuffer::empty()
+            let seq = t.state.base.next_seq()
+            encode_pex(
+                origin: t.state.base.self_tag,
+                seq,
+                peers: t.state.base.book.alive_entries(exclude_tag: tag),
+                mut pex_buf,
+            )
+            let _ = queue_to_peer(mut t.peers, tok, pex_buf.span(), now_ms, mut t.state)
+            j += 1
         }
     }
     if t.ping_ticker.due(now_ms) {
@@ -80,45 +63,63 @@ fn step_timers(_ t: mut TcpTransport, _ now_ms: u64) uses (net: mut Net) {
             nonce: t.nonce,
             mut ping_buf,
         )
-        var snapshot = MemVec<Token>::new()
-        snapshot.extend_from_slice(t.peer_tokens.as_slice())
+        var ping_toks = MemVec<Token>::new()
         var pi: usize = 0
-        while pi < snapshot.len() {
-            let tok = snapshot[pi]
-            var est = false
-            if let Option::Some(ref slot) = t.poller.get(tok) {
-                if let TcpSlot::Peer(ref conn) = slot {
-                    est = conn.state.is_established()
-                }
-            }
-            if est {
-                let _ = queue_to_peer(
-                    mut t.poller,
-                    mut t.peer_tokens,
-                    tok,
-                    ping_buf.span(),
-                    now_ms,
-                    mut t.state,
-                )
+        while pi < t.peers.len() {
+            if t.peers[pi].state.is_established() {
+                ping_toks.push(t.peers[pi].token)
             }
             pi += 1
+        }
+        var pj: usize = 0
+        while pj < ping_toks.len() {
+            let _ = queue_to_peer(
+                mut t.peers,
+                ping_toks[pj],
+                ping_buf.span(),
+                now_ms,
+                mut t.state,
+            )
+            pj += 1
         }
     }
 }
 
-impl Transport for TcpTransport {
-    fn local_addr(self) -> SocketAddr {
+impl TcpEngine {
+    pub fn local_addr(self) -> SocketAddr {
         self.local_addr
     }
 
-    fn self_tag(self) -> u64 {
+    pub fn self_tag(self) -> u64 {
         self.state.base.self_tag
     }
 
-    fn publish(mut self, _ payload: MemSpan) -> bool
-    uses (net: mut Net, clock: Clock)
+    pub fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
+        self.state.base.recv(mut out)
+    }
+
+    pub fn peer_count(self) -> usize {
+        self.state.base.peer_count()
+    }
+
+    pub fn peer_entries(self) -> MemVec<PeerEntry> {
+        self.state.base.peer_entries()
+    }
+
+    pub fn stats(self) -> Stats {
+        self.state.base.stats
+    }
+
+    pub fn add_seed(mut self, _ addr: SocketAddr) {
+        if addr != self.local_addr {
+            self.state.dialer.add_addr(addr)
+        }
+    }
+
+    pub fn publish(mut self, _ payload: MemSpan) -> bool
+    uses (sched: mut Scheduler, io: mut SocketIo)
     {
-        let now_ms = self.clock.now_ms()
+        let now_ms = sched.now_ms()
         var frame = MemBuffer::empty()
         if !self.state.base.prepare_publish(payload, mut frame) {
             return false
@@ -126,14 +127,10 @@ impl Transport for TcpTransport {
 
         var targets = MemVec<Token>::new()
         var i: usize = 0
-        while i < self.peer_tokens.len() {
-            let tok = self.peer_tokens[i]
-            if let Option::Some(ref slot) = self.poller.get(tok) {
-                if let TcpSlot::Peer(ref conn) = slot {
-                    if conn.state.is_established() {
-                        targets.push(tok)
-                    }
-                }
+        while i < self.peers.len() {
+            let conn = ref self.peers[i]
+            if conn.state.is_established() {
+                targets.push(conn.token)
             }
             i += 1
         }
@@ -150,8 +147,7 @@ impl Transport for TcpTransport {
                 targets.swap(chosen, pick)
             }
             if queue_to_peer(
-                mut self.poller,
-                mut self.peer_tokens,
+                mut self.peers,
                 targets[chosen],
                 frame.span(),
                 now_ms,
@@ -164,31 +160,34 @@ impl Transport for TcpTransport {
         sent
     }
 
-    fn poll(mut self, timeout_ms: u64) -> usize uses (net: mut Net, clock: Clock) {
-        let start_ms = self.clock.now_ms()
-        step_timers(mut self, start_ms)
-        let n = match self.poller
-            .wait(
-                mut self.events,
-                Option::Some(Duration::from_millis(timeout_ms)),
-            ) {
-            Result::Ok(count) => count,
-            Result::Err(_) => 0,
+    pub fn poll_io(mut self) -> usize
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        if let Option::Some(tid) = self.timer_id {
+            if !sched.take_timer_fired(tid) {
+                sched.cancel_timer(tid)
+            }
+            self.timer_id = Option::None
         }
+        let start_ms = sched.now_ms()
+        step_timers(mut self, start_ms)
         let before = self.state.base.inbox.len()
-        let now_ms = self.clock.now_ms()
+        var events = MemVec<IoEvent>::new()
+        io.take_events_for(self.owner, mut events)
+        let now_ms = sched.now_ms()
         var i: usize = 0
-        while i < n {
-            let ev = self.events.get(i)
-            if ev.token() == self.listener_token {
+        while i < events.len() {
+            let ev = events[i]
+            if ev.token == self.listener_token {
                 self.accept_all(now_ms)
             } else {
                 self.handle_peer_event(ev, now_ms)
             }
             i += 1
         }
-        let end_ms = self.clock.now_ms()
+        let end_ms = sched.now_ms()
         step_timers(mut self, end_ms)
+        self.reschedule_timer(end_ms)
         if self.state.base.inbox.len() >= before {
             self.state.base.inbox.len() - before
         } else {
@@ -196,25 +195,134 @@ impl Transport for TcpTransport {
         }
     }
 
+    pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+        if let Option::Some(tid) = self.timer_id {
+            sched.cancel_timer(tid)
+            self.timer_id = Option::None
+        }
+        sched.cancel_owner_timers(self.owner)
+        io.deregister_owner(self.owner)
+        self.peers.clear()
+    }
+
+    pub(ingot) fn reschedule_timer(mut self, _ now_ms: u64) uses (sched: mut Scheduler) {
+        if let Option::Some(tid) = self.timer_id {
+            sched.cancel_timer(tid)
+            self.timer_id = Option::None
+        }
+        var min_wait = self.pex_ticker.ms_until(now_ms)
+        let ping_wait = self.ping_ticker.ms_until(now_ms)
+        if ping_wait < min_wait {
+            min_wait = ping_wait
+        }
+        if let Option::Some(due) = self.state
+            .dialer
+            .next_due_ms(now_ms, book: self.state.base.book) {
+            let dw = if due > now_ms { due - now_ms } else { 0 }
+            if dw < min_wait {
+                min_wait = dw
+            }
+        }
+        var pi: usize = 0
+        while pi < self.peers.len() {
+            let expire_at = self.peers[pi].last_activity_ms + self.state.base.gossip.dead_ms
+            let pw = if expire_at > now_ms {
+                expire_at - now_ms
+            } else {
+                0
+            }
+            if pw < min_wait {
+                min_wait = pw
+            }
+            pi += 1
+        }
+        let delay = if min_wait > 0 { min_wait } else { 1 }
+        self.timer_id = Option::Some(sched.schedule_after(self.owner, delay_ms: delay))
+    }
+}
+
+fn transport_publish(
+    _ engine: mut TcpEngine,
+    _ sched: mut LocalScheduler,
+    _ io: mut NetPoller,
+    _ driver: mut NetDriver,
+    _ payload: MemSpan,
+) -> bool
+uses (clock: Clock)
+{
+    with (Scheduler = sched, SocketIo = io) {
+        let _ = driver.sync_clock()
+        engine.publish(payload)
+    }
+}
+
+fn transport_poll(
+    _ engine: mut TcpEngine,
+    _ sched: mut LocalScheduler,
+    _ io: mut NetPoller,
+    _ driver: mut NetDriver,
+    timeout_ms: u64,
+) -> usize
+uses (net: mut Net, clock: Clock)
+{
+    with (Scheduler = sched, SocketIo = io) {
+        driver.set_max_wait_ms(timeout_ms)
+        driver.begin_tick()
+        let pre = engine.poll_io()
+        if pre > 0 { return pre }
+        driver.wait()
+        engine.poll_io()
+    }
+}
+
+impl Transport for TcpTransport {
+    fn local_addr(self) -> SocketAddr {
+        self.engine.local_addr()
+    }
+
+    fn self_tag(self) -> u64 {
+        self.engine.self_tag()
+    }
+
+    fn publish(mut self, _ payload: MemSpan) -> bool
+    uses (net: mut Net, clock: Clock)
+    {
+        transport_publish(
+            mut self.engine,
+            mut self.sched,
+            mut self.io,
+            mut self.driver,
+            payload,
+        )
+    }
+
+    fn poll(mut self, timeout_ms: u64) -> usize uses (net: mut Net, clock: Clock) {
+        transport_poll(
+            mut self.engine,
+            mut self.sched,
+            mut self.io,
+            mut self.driver,
+            timeout_ms,
+        )
+    }
+
     fn recv(mut self, _ out: mut MemBuffer) -> Option<Delivery> {
-        self.state.base.recv(mut out)
+        self.engine.recv(mut out)
     }
 
     fn peer_count(self) -> usize {
-        self.state.base.peer_count()
+        self.engine.peer_count()
     }
 
     fn peer_entries(self) -> MemVec<PeerEntry> {
-        self.state.base.peer_entries()
+        self.engine.peer_entries()
     }
 
     fn stats(self) -> Stats {
-        self.state.base.stats
+        self.engine.stats()
     }
 
     fn add_seed(mut self, _ addr: SocketAddr) {
-        if addr != self.local_addr {
-            self.state.dialer.add_addr(addr)
-        }
+        self.engine.add_seed(addr)
     }
 }
