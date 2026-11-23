@@ -1,0 +1,313 @@
+use super::task::{Coroutine, Either, Poll}
+
+pub struct Ready<T> { val: Option<T> }
+
+impl<T> Ready<T> {
+    pub fn new(_ val: own T) -> Self {
+        Ready { val: Option::Some(val) }
+    }
+}
+
+impl<T> Coroutine for Ready<T> {
+    type Output = Option<T>
+    uses E = ()
+
+    fn poll(mut self) -> Poll<Option<T>> uses E {
+        Poll::Ready(self.val.take())
+    }
+
+    fn cancel(mut self) uses E {
+        self.val = Option::None
+    }
+}
+
+pub struct YieldOnce { yielded: bool }
+
+impl Copy for YieldOnce {}
+
+impl YieldOnce {
+    pub fn new() -> Self {
+        YieldOnce { yielded: false }
+    }
+}
+
+impl Coroutine for YieldOnce {
+    type Output = ()
+    uses E = ()
+
+    fn poll(mut self) -> Poll<()> uses E {
+        if !self.yielded {
+            self.yielded = true
+            return Poll::Pending
+        }
+        Poll::Ready(())
+    }
+}
+
+pub struct Map<C, F> { inner: C, func: F }
+
+impl<C, F> Map<C, F> {
+    pub fn new(_ inner: own C, _ func: own F) -> Self {
+        Map { inner, func }
+    }
+}
+
+impl<C: Coroutine, F: FnMut(C::Output) -> _> Coroutine for Map<C, F> {
+    type Output = F::Out
+    uses E = (C::E, F::E)
+
+    fn poll(mut self) -> Poll<F::Out> uses E {
+        match self.inner.poll() {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(v) => {
+                let f = mut self.func
+                Poll::Ready(f(v))
+            },
+        }
+    }
+
+    fn cancel(mut self) uses E {
+        self.inner.cancel()
+    }
+}
+
+pub struct Join2<A: Coroutine, B: Coroutine> {
+    a: A,
+    b: B,
+    a_out: Option<A::Output>,
+    b_out: Option<B::Output>,
+    done: bool,
+}
+
+impl<A: Coroutine, B: Coroutine> Join2<A, B> {
+    pub fn new(_ a: own A, _ b: own B) -> Self {
+        Join2 { a, b, a_out: Option::None, b_out: Option::None, done: false }
+    }
+}
+
+impl<A: Coroutine, B: Coroutine> Coroutine for Join2<A, B> {
+    type Output = (A::Output, B::Output)
+    uses E = (A::E, B::E)
+
+    fn poll(mut self) -> Poll<(A::Output, B::Output)> uses E {
+        if self.a_out.is_none() {
+            if let Poll::Ready(v) = self.a.poll() {
+                self.a_out = Option::Some(v)
+            }
+        }
+        if self.b_out.is_none() {
+            if let Poll::Ready(v) = self.b.poll() {
+                self.b_out = Option::Some(v)
+            }
+        }
+        if self.a_out.is_some() && self.b_out.is_some() {
+            self.done = true
+            let a = self.a_out.take().unwrap()
+            let b = self.b_out.take().unwrap()
+            return Poll::Ready((a, b))
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if !self.done {
+            self.done = true
+            if self.a_out.is_none() {
+                self.a.cancel()
+            }
+            if self.b_out.is_none() {
+                self.b.cancel()
+            }
+            self.a_out = Option::None
+            self.b_out = Option::None
+        }
+    }
+}
+
+pub struct Select2<A, B> { a: A, b: B, done: bool }
+
+impl<A, B> Select2<A, B> {
+    pub fn new(_ a: own A, _ b: own B) -> Self {
+        Select2 { a, b, done: false }
+    }
+}
+
+impl<A: Coroutine, B: Coroutine> Coroutine for Select2<A, B> {
+    type Output = Either<A::Output, B::Output>
+    uses E = (A::E, B::E)
+
+    fn poll(mut self) -> Poll<Either<A::Output, B::Output>> uses E {
+        if let Poll::Ready(va) = self.a.poll() {
+            self.done = true
+            self.b.cancel()
+            return Poll::Ready(Either::Left(va))
+        }
+        if let Poll::Ready(vb) = self.b.poll() {
+            self.done = true
+            self.a.cancel()
+            return Poll::Ready(Either::Right(vb))
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if !self.done {
+            self.done = true
+            self.a.cancel()
+            self.b.cancel()
+        }
+    }
+}
+
+pub struct JoinAll<C: Coroutine> {
+    tasks: MemVec<Option<C>>,
+    outputs: MemVec<Option<C::Output>>,
+    remaining: usize,
+}
+
+impl<C: Coroutine> JoinAll<C> {
+    pub fn new(_ tasks: own MemVec<C>) -> Self {
+        let len = tasks.len()
+        var opt_tasks = MemVec<Option<C>>::with_capacity(len)
+        var outputs = MemVec<Option<C::Output>>::with_capacity(len)
+        // Pop from reversed tail would swap order; instead move out via Option slots in reverse then flip.
+        var rev = MemVec<C>::with_capacity(len)
+        var t = tasks
+        while let Option::Some(c) = t.pop() {
+            rev.push(c)
+        }
+        while let Option::Some(c) = rev.pop() {
+            opt_tasks.push(Option::Some(c))
+            outputs.push(Option::None)
+        }
+        JoinAll { tasks: opt_tasks, outputs, remaining: len }
+    }
+}
+
+impl<C: Coroutine> Coroutine for JoinAll<C> {
+    type Output = MemVec<C::Output>
+    uses E = C::E
+
+    fn poll(mut self) -> Poll<MemVec<C::Output>> uses E {
+        var i: usize = 0
+        while i < self.tasks.len() {
+            if let Option::Some(var task) = self.tasks.replace(i, Option::None) {
+                match task.poll() {
+                    Poll::Ready(val) => {
+                        let _ = self.outputs.replace(i, Option::Some(val))
+                        self.remaining -= 1
+                    },
+                    Poll::Pending => {
+                        let _ = self.tasks.replace(i, Option::Some(task))
+                    },
+                }
+            }
+            i += 1
+        }
+        if self.remaining == 0 {
+            var out = MemVec<C::Output>::with_capacity(self.outputs.len())
+            var oi: usize = 0
+            while oi < self.outputs.len() {
+                if let Option::Some(v) = self.outputs.replace(oi, Option::None) {
+                    out.push(v)
+                }
+                oi += 1
+            }
+            return Poll::Ready(out)
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        var i: usize = 0
+        while i < self.tasks.len() {
+            if let Option::Some(var task) = self.tasks.replace(i, Option::None) {
+                task.cancel()
+            }
+            i += 1
+        }
+        self.outputs.clear()
+        self.remaining = 0
+    }
+}
+
+pub struct PoolDone<K, T> { pub key: K, pub value: T }
+
+pub struct BoundedPool<K, C> {
+    max_inflight: usize,
+    inbox: MemVec<K>,
+    outbox: MemVec<K>,
+    active: MemVec<(K, C)>,
+}
+
+impl<K, C: Coroutine> BoundedPool<K, C> {
+    pub fn new(max_inflight: usize) -> Self {
+        BoundedPool {
+            max_inflight: if max_inflight == 0 { 1 } else { max_inflight },
+            inbox: MemVec::new(),
+            outbox: MemVec::new(),
+            active: MemVec::new(),
+        }
+    }
+
+    pub fn enqueue(mut self, _ key: own K) {
+        self.inbox.push(key)
+    }
+
+    pub fn active_len(self) -> usize {
+        self.active.len()
+    }
+
+    pub fn is_done(self) -> bool {
+        self.active.is_empty() && self.inbox.is_empty() && self.outbox.is_empty()
+    }
+
+    fn pop_next(mut self) -> Option<K> {
+        if self.outbox.is_empty() {
+            while let Option::Some(k) = self.inbox.pop() {
+                self.outbox.push(k)
+            }
+        }
+        self.outbox.pop()
+    }
+
+    pub fn refill<F: FnMut(ref K) -> C>(mut self, _ spawn: mut F) uses F::E {
+        while self.active.len() < self.max_inflight {
+            let Option::Some(key) = self.pop_next() else {
+                return
+            }
+            let coro = spawn(key)
+            self.active.push((key, coro))
+        }
+    }
+
+    pub fn poll_ready(mut self, _ out: mut MemVec<PoolDone<K, C::Output>>)
+    uses C::E
+    {
+        out.clear()
+        var i: usize = 0
+        while i < self.active.len() {
+            let ready = match self.active.get(i) {
+                Option::Some(mut slot) => match slot.1.poll() {
+                    Poll::Ready(val) => Option::Some(val),
+                    Poll::Pending => Option::None,
+                },
+                Option::None => Option::None,
+            }
+            if let Option::Some(val) = ready {
+                let (key, _) = self.active.swap_remove(i)
+                out.push(PoolDone { key, value: val })
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    pub fn cancel_all(mut self) uses C::E {
+        while let Option::Some(var entry) = self.active.pop() {
+            entry.1.cancel()
+        }
+        self.inbox.clear()
+        self.outbox.clear()
+    }
+}

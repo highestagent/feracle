@@ -1,0 +1,86 @@
+use super::scheduler::Scheduler
+use super::task::{Coroutine, Poll, TaskId, TimerId}
+
+pub struct Sleep { timer: Option<TimerId>, done: bool }
+
+impl Copy for Sleep {}
+
+impl Sleep {
+    pub fn after(owner: TaskId, delay_ms: u64) -> Self uses (sched: mut Scheduler) {
+        let id = sched.schedule_after(owner, delay_ms)
+        Sleep { timer: Option::Some(id), done: false }
+    }
+
+    pub fn until(owner: TaskId, deadline_ms: u64) -> Self uses (sched: mut Scheduler) {
+        let id = sched.schedule_at(owner, deadline_ms)
+        Sleep { timer: Option::Some(id), done: false }
+    }
+}
+
+impl Coroutine for Sleep {
+    type Output = ()
+    uses E = (sched: mut Scheduler)
+
+    fn poll(mut self) -> Poll<()> uses E {
+        if self.done {
+            return Poll::Ready(())
+        }
+        if let Option::Some(id) = self.timer {
+            if sched.take_timer_fired(id) {
+                self.timer = Option::None
+                self.done = true
+                return Poll::Ready(())
+            }
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if let Option::Some(id) = self.timer {
+            sched.cancel_timer(id)
+            self.timer = Option::None
+        }
+        self.done = true
+    }
+}
+
+pub struct Timeout<C> { inner: C, sleep: Sleep, done: bool }
+
+impl<C: Coroutine> Timeout<C> {
+    pub fn new(owner: TaskId, delay_ms: u64, _ inner: own C) -> Self
+    uses (sched: mut Scheduler)
+    {
+        let sleep = Sleep::after(owner, delay_ms)
+        Timeout { inner, sleep, done: false }
+    }
+}
+
+impl<C: Coroutine> Coroutine for Timeout<C> {
+    type Output = Option<C::Output>
+    uses E = (C::E, sched: mut Scheduler)
+
+    fn poll(mut self) -> Poll<Option<C::Output>> uses E {
+        if self.done {
+            return Poll::Ready(Option::None)
+        }
+        if let Poll::Ready(v) = self.inner.poll() {
+            self.sleep.cancel()
+            self.done = true
+            return Poll::Ready(Option::Some(v))
+        }
+        if let Poll::Ready(_) = self.sleep.poll() {
+            self.inner.cancel()
+            self.done = true
+            return Poll::Ready(Option::None)
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if !self.done {
+            self.done = true
+            self.inner.cancel()
+            self.sleep.cancel()
+        }
+    }
+}

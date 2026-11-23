@@ -1,0 +1,217 @@
+use super::task::{Driver, TaskId, TimerId}
+
+pub trait Scheduler {
+    fn now_ms(self) -> u64
+    fn alloc_task(mut self) -> TaskId
+    fn schedule_at(mut self, _ owner: TaskId, deadline_ms: u64) -> TimerId
+    fn schedule_after(mut self, _ owner: TaskId, delay_ms: u64) -> TimerId
+    fn cancel_timer(mut self, _ id: TimerId)
+    fn take_timer_fired(mut self, _ id: TimerId) -> bool
+    fn wake(mut self, _ task: TaskId)
+    fn take_woken(mut self, _ task: TaskId) -> bool
+    fn clear_woken(mut self)
+    fn cancel_owner_timers(mut self, _ owner: TaskId)
+    fn next_timeout_ms(self, max_ms: u64) -> u64
+    fn advance_to(mut self, now_ms: u64) -> usize
+    fn advance_by(mut self, delta_ms: u64) -> usize
+}
+
+struct TimerEntry { id: TimerId, owner: TaskId, deadline_ms: u64, fired: bool }
+
+impl Copy for TimerEntry {}
+
+pub struct LocalScheduler {
+    now: u64,
+    timers: MemVec<TimerEntry>,
+    woken: MemVec<TaskId>,
+    next_task_id: u32,
+    next_timer_id: u32,
+}
+
+impl LocalScheduler {
+    pub fn new(_ now_ms: u64) -> Self {
+        LocalScheduler {
+            now: now_ms,
+            timers: MemVec::new(),
+            woken: MemVec::new(),
+            next_task_id: 1,
+            next_timer_id: 1,
+        }
+    }
+}
+
+impl Scheduler for LocalScheduler {
+    fn now_ms(self) -> u64 {
+        self.now
+    }
+
+    fn alloc_task(mut self) -> TaskId {
+        let id = self.next_task_id
+        self.next_task_id += 1
+        TaskId { id }
+    }
+
+    fn schedule_at(mut self, _ owner: TaskId, deadline_ms: u64) -> TimerId {
+        let id = TimerId { id: self.next_timer_id }
+        self.next_timer_id += 1
+        let due_now = deadline_ms <= self.now
+        self.timers.push(TimerEntry { id, owner, deadline_ms, fired: due_now })
+        if due_now {
+            self.wake(owner)
+        }
+        id
+    }
+
+    fn schedule_after(mut self, _ owner: TaskId, delay_ms: u64) -> TimerId {
+        let id = TimerId { id: self.next_timer_id }
+        self.next_timer_id += 1
+        if delay_ms == 0 {
+            self.timers.push(
+                    TimerEntry { id, owner, deadline_ms: self.now, fired: true },
+                )
+            self.wake(owner)
+            return id
+        }
+        self.timers.push(
+                TimerEntry { id, owner, deadline_ms: self.now + delay_ms, fired: false },
+            )
+        id
+    }
+
+    fn cancel_timer(mut self, _ id: TimerId) {
+        var i: usize = 0
+        while i < self.timers.len() {
+            if self.timers[i].id == id {
+                let _ = self.timers.swap_remove(i)
+                return
+            }
+            i += 1
+        }
+    }
+
+    fn take_timer_fired(mut self, _ id: TimerId) -> bool {
+        var i: usize = 0
+        while i < self.timers.len() {
+            if self.timers[i].id == id {
+                if self.timers[i].fired {
+                    let _ = self.timers.swap_remove(i)
+                    return true
+                }
+                return false
+            }
+            i += 1
+        }
+        false
+    }
+
+    fn wake(mut self, _ task: TaskId) {
+        var i: usize = 0
+        while i < self.woken.len() {
+            if self.woken[i] == task {
+                return
+            }
+            i += 1
+        }
+        self.woken.push(task)
+    }
+
+    fn take_woken(mut self, _ task: TaskId) -> bool {
+        var i: usize = 0
+        while i < self.woken.len() {
+            if self.woken[i] == task {
+                let _ = self.woken.swap_remove(i)
+                return true
+            }
+            i += 1
+        }
+        false
+    }
+
+    fn clear_woken(mut self) {
+        self.woken.clear()
+    }
+
+    fn cancel_owner_timers(mut self, _ owner: TaskId) {
+        var ti: usize = 0
+        while ti < self.timers.len() {
+            if self.timers[ti].owner == owner {
+                let _ = self.timers.swap_remove(ti)
+            } else {
+                ti += 1
+            }
+        }
+        var wi: usize = 0
+        while wi < self.woken.len() {
+            if self.woken[wi] == owner {
+                let _ = self.woken.swap_remove(wi)
+            } else {
+                wi += 1
+            }
+        }
+    }
+
+    fn next_timeout_ms(self, max_ms: u64) -> u64 {
+        if !self.woken.is_empty() {
+            return 0
+        }
+        var best = max_ms
+        var i: usize = 0
+        while i < self.timers.len() {
+            let t = self.timers[i]
+            if t.fired || t.deadline_ms <= self.now {
+                return 0
+            }
+            let rem = t.deadline_ms - self.now
+            if rem < best { best = rem }
+            i += 1
+        }
+        best
+    }
+
+    fn advance_to(mut self, now_ms: u64) -> usize {
+        if now_ms > self.now {
+            self.now = now_ms
+        }
+        var fired_count: usize = 0
+        var i: usize = 0
+        while i < self.timers.len() {
+            let entry = self.timers[i]
+            if !entry.fired && entry.deadline_ms <= self.now {
+                if let Option::Some(mut slot) = self.timers.get(i) {
+                    slot.fired = true
+                }
+                self.wake(entry.owner)
+                fired_count += 1
+            }
+            i += 1
+        }
+        fired_count
+    }
+
+    fn advance_by(mut self, delta_ms: u64) -> usize {
+        self.advance_to(now_ms: self.now + delta_ms)
+    }
+}
+
+pub struct VirtualClockDriver { pub step_ms: u64 }
+
+impl Copy for VirtualClockDriver {}
+
+impl VirtualClockDriver {
+    pub fn new(step_ms: u64) -> Self {
+        VirtualClockDriver { step_ms }
+    }
+}
+
+impl Driver for VirtualClockDriver {
+    uses E = (sched: mut Scheduler)
+
+    fn begin_tick(mut self) uses E {
+        sched.clear_woken()
+    }
+
+    fn wait(mut self) uses E {
+        let wait_ms = sched.next_timeout_ms(max_ms: self.step_ms)
+        let _ = sched.advance_by(delta_ms: wait_ms)
+    }
+}

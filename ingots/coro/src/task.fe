@@ -1,0 +1,82 @@
+use core::ops::Eq
+
+pub struct TaskId { pub id: u32 }
+
+impl Copy for TaskId {}
+
+impl Eq for TaskId {
+    fn eq(self, _ other: Self) -> bool {
+        self.id == other.id
+    }
+}
+
+pub struct TimerId { pub id: u32 }
+
+impl Copy for TimerId {}
+
+impl Eq for TimerId {
+    fn eq(self, _ other: Self) -> bool {
+        self.id == other.id
+    }
+}
+
+pub enum Poll<T> {
+    Pending,
+    Ready(T),
+}
+
+impl<T> Poll<T> {
+    pub fn is_ready(self) -> bool {
+        match self {
+            Poll::Pending => false,
+            Poll::Ready(_) => true,
+        }
+    }
+
+    pub fn is_pending(self) -> bool {
+        !self.is_ready()
+    }
+
+    pub fn map<U, F: FnMut(own T) -> U>(own self, _ f: mut F) -> Poll<U>
+    uses F::E
+    {
+        match self {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(v) => Poll::Ready(f(v)),
+        }
+    }
+}
+
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+pub trait Coroutine {
+    type Output
+    uses E
+
+    fn poll(mut self) -> Poll<Self::Output> uses E
+    fn cancel(mut self) uses E {}
+}
+
+pub trait Driver {
+    uses E
+
+    fn begin_tick(mut self) uses E {}
+    fn wait(mut self) uses E
+}
+
+pub fn block_on<C: Coroutine, D: Driver>(_ coro: mut C, _ driver: mut D) -> C::Output
+uses (C::E, D::E)
+{
+    loop {
+        driver.begin_tick()
+        match coro.poll() {
+            Poll::Ready(out) => {
+                return out
+            },
+            Poll::Pending => driver.wait(),
+        }
+    }
+}

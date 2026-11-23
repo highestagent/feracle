@@ -1,0 +1,309 @@
+use core::num::IntDowncast
+use super::{
+    BoundedPool,
+    Coroutine,
+    Either,
+    Join2,
+    JoinAll,
+    LocalScheduler,
+    Map,
+    Poll,
+    PoolDone,
+    Ready,
+    Scheduler,
+    Select2,
+    Sleep,
+    TaskId,
+    Timeout,
+    VirtualClockDriver,
+    YieldOnce,
+    block_on,
+}
+
+#[test]
+fn test_local_scheduler_timers_wake_and_cleanup() {
+    var sched = LocalScheduler::new(100)
+    let t1 = sched.alloc_task()
+    let t2 = sched.alloc_task()
+
+    let zero_tid = sched.schedule_after(t1, delay_ms: 0)
+    assert!(sched.next_timeout_ms(max_ms: 5000) == 0)
+    assert!(sched.take_woken(t1))
+    assert!(sched.take_timer_fired(zero_tid))
+    assert!(!sched.take_timer_fired(zero_tid))
+
+    let cancel_tid = sched.schedule_after(t1, delay_ms: 10)
+    sched.cancel_timer(cancel_tid)
+    let live_tid = sched.schedule_after(t2, delay_ms: 15)
+
+    assert!(sched.advance_by(delta_ms: 14) == 0)
+    assert!(!sched.take_timer_fired(live_tid))
+    assert!(sched.advance_by(delta_ms: 1) == 1)
+    assert!(sched.now_ms() == 115)
+    assert!(sched.take_woken(t2))
+    assert!(sched.take_timer_fired(live_tid))
+    assert!(!sched.take_timer_fired(cancel_tid))
+
+    let _ = sched.schedule_after(t1, delay_ms: 1000)
+    sched.wake(t1)
+    sched.cancel_owner_timers(t1)
+    assert!(!sched.take_woken(t1))
+    assert!(sched.next_timeout_ms(max_ms: 5000) == 5000)
+}
+
+#[test]
+fn test_ready_yield_map_and_sleep() {
+    var sched = LocalScheduler::new(0)
+    let owner = sched.alloc_task()
+
+    with (Scheduler = sched) {
+        var r: Ready<u64> = Ready::new(41)
+        let pr = r.poll()
+        assert!(pr.is_ready())
+
+        var mapped = Map::new(YieldOnce::new(), |_ v: ()| -> u64 { 7 })
+        var drv = VirtualClockDriver::new(step_ms: 5)
+        let out = block_on(mut mapped, mut drv)
+        assert!(out == 7)
+
+        var nap = Sleep::after(owner, delay_ms: 25)
+        block_on(mut nap, mut drv)
+    }
+    assert!(sched.now_ms() == 30)
+}
+
+#[test]
+fn test_join2_select2_and_timeout_cancellation() {
+    var sched = LocalScheduler::new(0)
+    let t_a = sched.alloc_task()
+    let t_b = sched.alloc_task()
+
+    with (Scheduler = sched) {
+        var drv = VirtualClockDriver::new(step_ms: 100)
+
+        var joined = Join2::new(
+            Map::new(
+                Sleep::after(owner: t_a, delay_ms: 10),
+                |_ v: ()| -> u64 {
+                    11
+                },
+            ),
+            Map::new(
+                Sleep::after(owner: t_b, delay_ms: 35),
+                |_ v: ()| -> u64 {
+                    22
+                },
+            ),
+        )
+        let (a_res, b_res) = block_on(mut joined, mut drv)
+        assert!(a_res == 11 && b_res == 22)
+        assert!(sched.now_ms() == 35)
+
+        var selected = Select2::new(
+            Sleep::after(owner: t_a, delay_ms: 12),
+            Sleep::after(owner: t_b, delay_ms: 500),
+        )
+        let win = block_on(mut selected, mut drv)
+        let won_left = match win {
+            Either::Left(_) => true,
+            Either::Right(_) => false,
+        }
+        assert!(won_left)
+        assert!(sched.next_timeout_ms(max_ms: 1000) == 1000)
+
+        var timed_out = Timeout::new(
+            owner: t_a,
+            delay_ms: 20,
+            Sleep::after(owner: t_b, delay_ms: 400),
+        )
+        assert!(block_on(mut timed_out, mut drv).is_none())
+        assert!(sched.next_timeout_ms(max_ms: 1000) == 1000)
+
+        var completed_in_time = Timeout::new(
+            owner: t_a,
+            delay_ms: 200,
+            Map::new(
+                Sleep::after(owner: t_b, delay_ms: 15),
+                |_ v: ()| -> u64 {
+                    99
+                },
+            ),
+        )
+        let ok = block_on(mut completed_in_time, mut drv)
+        assert!(ok.unwrap() == 99)
+        assert!(sched.next_timeout_ms(max_ms: 1000) == 1000)
+    }
+}
+
+struct TaggedSleep { inner: Sleep, tag: u64 }
+
+impl Coroutine for TaggedSleep {
+    type Output = u64
+    uses E = (sched: mut Scheduler)
+
+    fn poll(mut self) -> Poll<u64> uses E {
+        match self.inner.poll() {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => Poll::Ready(self.tag),
+        }
+    }
+
+    fn cancel(mut self) uses E {
+        self.inner.cancel()
+    }
+}
+
+#[test]
+fn test_join_all_preserves_input_order() {
+    var sched = LocalScheduler::new(0)
+    let owner = sched.alloc_task()
+
+    with (Scheduler = sched) {
+        var tasks = MemVec<TaggedSleep>::new()
+        let delays: [u64; 4] = [40, 10, 30, 20]
+        var i: usize = 0
+        while i < 4 {
+            let base: u64 = i.downcast_unchecked()
+            tasks
+                .push(
+                    TaggedSleep {
+                        inner: Sleep::after(owner, delay_ms: delays[i]),
+                        tag: base + 100,
+                    },
+                )
+            i += 1
+        }
+        var all = JoinAll::new(tasks)
+        var drv = VirtualClockDriver::new(step_ms: 100)
+        let res = block_on(mut all, mut drv)
+        assert!(res.len() == 4)
+        assert!(
+            res[0] == 100 && res[1] == 101 && res[2] == 102 && res[3] == 103,
+        )
+        assert!(sched.now_ms() == 40)
+    }
+}
+
+struct PoolItem { owner: TaskId, idx: usize, delay_ms: u64, retry: bool }
+
+impl Copy for PoolItem {}
+
+struct PoolJob { item: PoolItem, sleep: Sleep }
+
+impl Coroutine for PoolJob {
+    type Output = Option<usize>
+    uses E = (sched: mut Scheduler)
+
+    fn poll(mut self) -> Poll<Option<usize>> uses E {
+        match self.sleep.poll() {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => if self.item.retry {
+                Poll::Ready(Option::None)
+            } else {
+                Poll::Ready(Option::Some(self.item.idx * 10))
+            },
+        }
+    }
+
+    fn cancel(mut self) uses E {
+        self.sleep.cancel()
+    }
+}
+
+#[test]
+fn test_bounded_pool_sliding_window_and_retry() {
+    var sched = LocalScheduler::new(0)
+    let owner = sched.alloc_task()
+
+    with (Scheduler = sched) {
+        var pool = BoundedPool<PoolItem, PoolJob>::new(max_inflight: 3)
+        let delays: [u64; 7] = [10, 30, 5, 20, 15, 25, 10]
+        var i: usize = 0
+        while i < 7 {
+            pool.enqueue(
+                PoolItem { owner, idx: i, delay_ms: delays[i], retry: i == 2 },
+            )
+            i += 1
+        }
+
+        pool.refill(
+            |item: ref PoolItem| -> PoolJob {
+                PoolJob {
+                    item: PoolItem {
+                        owner: item.owner,
+                        idx: item.idx,
+                        delay_ms: item.delay_ms,
+                        retry: item.retry,
+                    },
+                    sleep: Sleep::after(owner: item.owner, delay_ms: item.delay_ms),
+                }
+            },
+        )
+        assert!(pool.active_len() == 3)
+
+        var done_vals: [usize; 7] = [0; 7]
+        var completed = MemVec<PoolDone<PoolItem, Option<usize>>>::new()
+        var steps: usize = 0
+
+        while !pool.is_done() && steps < 30 {
+            sched.clear_woken()
+            pool.poll_ready(mut completed)
+            var ci: usize = 0
+            while ci < completed.len() {
+                let item = completed[ci].key
+                match completed[ci].value {
+                    Option::Some(v) => done_vals[item.idx] = v + 1,
+                    Option::None => pool.enqueue(
+                        PoolItem { owner, idx: item.idx, delay_ms: 5, retry: false },
+                    ),
+                }
+                ci += 1
+            }
+            pool.refill(
+                |item: ref PoolItem| -> PoolJob {
+                    PoolJob {
+                        item: PoolItem {
+                            owner: item.owner,
+                            idx: item.idx,
+                            delay_ms: item.delay_ms,
+                            retry: item.retry,
+                        },
+                        sleep: Sleep::after(owner: item.owner, delay_ms: item.delay_ms),
+                    }
+                },
+            )
+            assert!(pool.active_len() <= 3)
+            if !pool.is_done() {
+                let w = sched.next_timeout_ms(max_ms: 100)
+                let _ = sched.advance_by(delta_ms: w)
+            }
+            steps += 1
+        }
+
+        assert!(pool.is_done())
+        var k: usize = 0
+        while k < 7 {
+            assert!(done_vals[k] == k * 10 + 1)
+            k += 1
+        }
+
+        pool.enqueue(PoolItem { owner, idx: 9, delay_ms: 100, retry: false })
+        pool.refill(
+            |item: ref PoolItem| -> PoolJob {
+                PoolJob {
+                    item: PoolItem {
+                        owner: item.owner,
+                        idx: item.idx,
+                        delay_ms: item.delay_ms,
+                        retry: item.retry,
+                    },
+                    sleep: Sleep::after(owner: item.owner, delay_ms: item.delay_ms),
+                }
+            },
+        )
+        assert!(pool.active_len() == 1)
+        pool.cancel_all()
+        assert!(pool.is_done())
+        assert!(sched.next_timeout_ms(max_ms: 500) == 500)
+    }
+}
