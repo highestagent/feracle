@@ -7,13 +7,7 @@ use std::time::Clock
 use p2p::{Delivery, PeerEntry, Stats, Transport}
 use super::ffi
 
-pub struct Libp2pConfig {
-    pub listen_port: u16,
-    pub self_tag: u64,
-    pub bootstrap: MemBuffer,
-    pub telemetry_port: u16,
-    pub telemetry_node_id: u64,
-}
+pub struct Libp2pConfig { pub listen_port: u16, pub self_tag: u64, pub bootstrap: MemBuffer }
 
 pub struct Libp2pTransport {
     local_addr: SocketAddr,
@@ -25,11 +19,9 @@ pub struct Libp2pTransport {
 
 impl Libp2pTransport {
     pub fn bind(_ config: own Libp2pConfig) -> Result<i32, Self> {
-        let rc = ffi::start_with_telemetry(
+        let rc = ffi::start(
             listen_port: config.listen_port,
             bootstrap: config.bootstrap.span(),
-            telemetry_port: config.telemetry_port,
-            node_id: config.telemetry_node_id,
         )
         if rc != 0 {
             return Result::Err(rc)
@@ -44,6 +36,14 @@ impl Libp2pTransport {
                 rx_seq: 0,
             },
         )
+    }
+
+    pub fn local_peer_id(self) -> MemBuffer {
+        ffi::local_peer_id()
+    }
+
+    pub fn peers_snapshot(self) -> (u64, MemBuffer) {
+        ffi::peers_csv()
     }
 
     pub fn stop(mut self) {

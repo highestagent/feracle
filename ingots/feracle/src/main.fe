@@ -5,7 +5,6 @@ use std::time::Clock
 use cli::{Cli, Matches}
 use coro::{Coroutine, LocalScheduler, Poll, Scheduler, Sleep, TaskId, block_on}
 use net_reactor::{NetDriver, NetPoller, SocketIo}
-use super::args::PeerBackend
 use super::config::{build_cli, load_config}
 use super::consensus::ConsensusCoro
 use super::network::PeerSession
@@ -127,22 +126,17 @@ uses (args: Args, env: Env, out: mut Stdout, err: mut Stderr, net: mut Net, cloc
                     var telemetry = if config.telemetry_port == 0 {
                         TelemetrySink::Disabled
                     } else {
-                        match config.p2p_backend {
-                            PeerBackend::Libp2p => TelemetrySink::Libp2pFfi,
-                            _ => {
-                                match TelemetryServer::start(
-                                    node_id: config.node_id,
-                                    peer_id: peer.self_peer_id(),
-                                    p2p_port: config.p2p_port,
-                                    telemetry_port: config.telemetry_port,
-                                ) {
-                                    Result::Ok(srv) => TelemetrySink::Local(srv),
-                                    Result::Err(err_msg) => {
-                                        eprintln!(err_msg)
-                                        peer.stop()
-                                        return 1
-                                    },
-                                }
+                        match TelemetryServer::start(
+                            node_id: config.node_id,
+                            peer_id: peer.self_peer_id(),
+                            p2p_port: config.p2p_port,
+                            telemetry_port: config.telemetry_port,
+                        ) {
+                            Result::Ok(srv) => TelemetrySink::Local(srv),
+                            Result::Err(err_msg) => {
+                                eprintln!(err_msg)
+                                peer.stop()
+                                return 1
                             },
                         }
                     }

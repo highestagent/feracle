@@ -1,10 +1,9 @@
 use std::collections::{HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use futures::StreamExt;
 use k256::ecdsa::{SigningKey, VerifyingKey};
@@ -13,19 +12,13 @@ use libp2p::mdns;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm};
 use tiny_keccak::{Hasher, Keccak};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 pub const TOPIC_NAME: &str = "fe-oracle/top20-usd/v1";
 pub const ASSET_COUNT: usize = 20;
 const MAX_INBOX_LEN: usize = 1024;
-const MAX_RECENT_FRAMES: usize = 128;
-const MAX_FEED_SLOTS: usize = 8;
 const MSG_TYPE_QUOTE: u8 = 0;
-const MSG_TYPE_SIG: u8 = 1;
 const QUOTE_FRAME_LEN: usize = 177;
-const SIG_FRAME_LEN: usize = 262;
 
 #[derive(NetworkBehaviour)]
 struct OracleBehaviour {
@@ -38,361 +31,13 @@ enum ControlMsg {
     Shutdown,
 }
 
-#[derive(Clone)]
-struct FeedTelemetry {
-    provider: String,
-    addr: String,
-    price: u64,
-    assets_ok: u32,
-    ok: bool,
-    latency_ms: u64,
-}
-
-#[derive(Clone)]
-struct TelemetryFrame {
-    seq: u64,
-    ts_ms: u64,
-    dir: &'static str,
-    peer: String,
-    hex: String,
-}
-
-#[derive(Default)]
-struct NodeTelemetryState {
-    round_id: u64,
-    phase: String,
-    local_prices: [u64; ASSET_COUNT],
-    group_medians: [u64; ASSET_COUNT],
-    round_ts: u64,
-    peers: Vec<String>,
-    feeds: [Option<FeedTelemetry>; MAX_FEED_SLOTS],
-    quotes_tx: u64,
-    quotes_rx: u64,
-    sigs_tx: u64,
-    sigs_rx: u64,
-    tolerance_breaches: u64,
-    submissions_ok: u64,
-    submissions_err: u64,
-    last_submit_ms: u64,
-    frame_seq: u64,
-    recent_frames: VecDeque<TelemetryFrame>,
-}
-
-pub struct TelemetryHub {
-    node_id: u64,
-    p2p_port: u16,
-    local_peer_id: Mutex<String>,
-    peer_count: Arc<AtomicUsize>,
-    state: Mutex<NodeTelemetryState>,
-    events_tx: broadcast::Sender<String>,
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn push_json_escaped(out: &mut String, s: &str) {
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-fn push_u64_array_json(out: &mut String, vals: &[u64; ASSET_COUNT]) {
-    out.push('[');
-    for (i, v) in vals.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let _ = write!(out, "{v}");
-    }
-    out.push(']');
-}
-
-impl TelemetryHub {
-    fn new(node_id: u64, p2p_port: u16, peer_count: Arc<AtomicUsize>) -> Self {
-        let (events_tx, _) = broadcast::channel(256);
-        let mut st = NodeTelemetryState::default();
-        st.phase = "starting".to_string();
-        Self {
-            node_id,
-            p2p_port,
-            local_peer_id: Mutex::new(String::new()),
-            peer_count,
-            state: Mutex::new(st),
-            events_tx,
-        }
-    }
-
-    fn set_local_peer_id(&self, peer_id: &PeerId) {
-        self.set_local_peer_id_str(&peer_id.to_string());
-    }
-
-    fn set_local_peer_id_str(&self, id: &str) {
-        if let Ok(mut guard) = self.local_peer_id.lock() {
-            *guard = id.to_string();
-        }
-    }
-
-    fn append_status_fields(&self, out: &mut String, st: &NodeTelemetryState) {
-        let peer_id = self
-            .local_peer_id
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        let peer_count = self.peer_count.load(Ordering::Acquire);
-
-        let _ = write!(out, "\"node_id\":{},\"peer_id\":", self.node_id);
-        push_json_escaped(out, &peer_id);
-        let _ = write!(
-            out,
-            ",\"p2p_port\":{},\"peer_count\":{},\"peers\":[",
-            self.p2p_port, peer_count
-        );
-        for (i, p) in st.peers.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            push_json_escaped(out, p);
-        }
-        let _ = write!(out, "],\"round_id\":{},\"phase\":", st.round_id);
-        push_json_escaped(out, &st.phase);
-        let _ = write!(
-            out,
-            ",\"local_price\":{},\"group_median\":{},\"local_prices\":",
-            st.local_prices[0], st.group_medians[0]
-        );
-        push_u64_array_json(out, &st.local_prices);
-        out.push_str(",\"group_medians\":");
-        push_u64_array_json(out, &st.group_medians);
-        let _ = write!(out, ",\"round_ts\":{},", st.round_ts);
-        let _ = write!(
-            out,
-            "\"counters\":{{\"quotes_tx\":{},\"quotes_rx\":{},\"sigs_tx\":{},\"sigs_rx\":{},\"tolerance_breaches\":{},\"submissions_ok\":{},\"submissions_err\":{},\"last_submit_ms\":{}}},",
-            st.quotes_tx,
-            st.quotes_rx,
-            st.sigs_tx,
-            st.sigs_rx,
-            st.tolerance_breaches,
-            st.submissions_ok,
-            st.submissions_err,
-            st.last_submit_ms
-        );
-        out.push_str("\"feeds\":[");
-        let mut first_feed = true;
-        for slot in &st.feeds {
-            if let Some(feed) = slot {
-                if !first_feed {
-                    out.push(',');
-                }
-                first_feed = false;
-                out.push_str("{\"provider\":");
-                push_json_escaped(out, &feed.provider);
-                out.push_str(",\"addr\":");
-                push_json_escaped(out, &feed.addr);
-                let _ = write!(
-                    out,
-                    ",\"price\":{},\"assets_ok\":{},\"ok\":{},\"latency_ms\":{}}}",
-                    feed.price, feed.assets_ok, feed.ok, feed.latency_ms
-                );
-            }
-        }
-        out.push_str("],\"recent_frames\":[");
-        for (i, frame) in st.recent_frames.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            let _ = write!(
-                out,
-                "{{\"seq\":{},\"ts_ms\":{},\"dir\":",
-                frame.seq, frame.ts_ms
-            );
-            push_json_escaped(out, frame.dir);
-            out.push_str(",\"peer\":");
-            push_json_escaped(out, &frame.peer);
-            out.push_str(",\"hex\":");
-            push_json_escaped(out, &frame.hex);
-            out.push('}');
-        }
-        out.push(']');
-    }
-
-    pub fn status_json(&self) -> String {
-        let mut out = String::with_capacity(1024);
-        out.push('{');
-        if let Ok(st) = self.state.lock() {
-            self.append_status_fields(&mut out, &st);
-        }
-        out.push('}');
-        out
-    }
-
-    pub fn status_event_json(&self) -> String {
-        let mut out = String::with_capacity(1024);
-        out.push_str("{\"event\":\"status\",");
-        if let Ok(st) = self.state.lock() {
-            self.append_status_fields(&mut out, &st);
-        }
-        out.push('}');
-        out
-    }
-
-    fn emit_status_event(&self) {
-        if self.events_tx.receiver_count() > 0 {
-            let _ = self.events_tx.send(self.status_event_json());
-        }
-    }
-
-    fn update_peers(&self, peers: &HashSet<PeerId>) {
-        if let Ok(mut st) = self.state.lock() {
-            let mut list: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
-            list.sort();
-            st.peers = list;
-        }
-        self.emit_status_event();
-    }
-
-    fn record_frame(&self, dir: &'static str, peer: &str, bytes: &[u8]) {
-        let ts_ms = now_unix_ms();
-        let hex_str = hex::encode(bytes);
-        let frame_seq = {
-            let Ok(mut st) = self.state.lock() else {
-                return;
-            };
-            if bytes.len() == QUOTE_FRAME_LEN && bytes[0] == MSG_TYPE_QUOTE {
-                if dir == "tx" {
-                    st.quotes_tx += 1;
-                } else {
-                    st.quotes_rx += 1;
-                }
-            } else if bytes.len() == SIG_FRAME_LEN && bytes[0] == MSG_TYPE_SIG {
-                if dir == "tx" {
-                    st.sigs_tx += 1;
-                } else {
-                    st.sigs_rx += 1;
-                }
-            }
-            st.frame_seq += 1;
-            let seq = st.frame_seq;
-            if st.recent_frames.len() >= MAX_RECENT_FRAMES {
-                st.recent_frames.pop_front();
-            }
-            st.recent_frames.push_back(TelemetryFrame {
-                seq,
-                ts_ms,
-                dir,
-                peer: peer.to_string(),
-                hex: hex_str.clone(),
-            });
-            seq
-        };
-
-        if self.events_tx.receiver_count() > 0 {
-            let mut ev = String::with_capacity(320);
-            let _ = write!(
-                ev,
-                "{{\"event\":\"frame\",\"node_id\":{},\"seq\":{},\"ts_ms\":{},\"dir\":",
-                self.node_id, frame_seq, ts_ms
-            );
-            push_json_escaped(&mut ev, dir);
-            ev.push_str(",\"peer\":");
-            push_json_escaped(&mut ev, peer);
-            ev.push_str(",\"hex\":");
-            push_json_escaped(&mut ev, &hex_str);
-            ev.push('}');
-            let _ = self.events_tx.send(ev);
-        }
-    }
-
-    pub fn set_phase(
-        &self,
-        round_id: u64,
-        phase: &str,
-        local_prices: [u64; ASSET_COUNT],
-        group_medians: [u64; ASSET_COUNT],
-        round_ts: u64,
-    ) {
-        if let Ok(mut st) = self.state.lock() {
-            st.round_id = round_id;
-            st.phase = phase.to_string();
-            st.local_prices = local_prices;
-            st.group_medians = group_medians;
-            st.round_ts = round_ts;
-        }
-        self.emit_status_event();
-    }
-
-    pub fn set_feed(
-        &self,
-        slot: usize,
-        provider: &str,
-        addr: &str,
-        price: u64,
-        assets_ok: u32,
-        ok: bool,
-        latency_ms: u64,
-    ) -> Result<(), ()> {
-        if slot >= MAX_FEED_SLOTS {
-            return Err(());
-        }
-        if let Ok(mut st) = self.state.lock() {
-            st.feeds[slot] = Some(FeedTelemetry {
-                provider: provider.to_string(),
-                addr: addr.to_string(),
-                price,
-                assets_ok,
-                ok,
-                latency_ms,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn record_event(&self, kind: u32, value: u64) -> Result<(), ()> {
-        let should_broadcast = {
-            let Ok(mut st) = self.state.lock() else {
-                return Err(());
-            };
-            match kind {
-                1 => {
-                    st.tolerance_breaches += 1;
-                    true
-                }
-                2 => {
-                    st.submissions_ok += 1;
-                    st.last_submit_ms = value;
-                    true
-                }
-                3 => {
-                    st.submissions_err += 1;
-                    st.last_submit_ms = value;
-                    true
-                }
-                4 => {
-                    st.feeds = Default::default();
-                    false
-                }
-                _ => return Err(()),
-            }
-        };
-        if should_broadcast {
-            self.emit_status_event();
-        }
-        Ok(())
+fn update_peers_snapshot(snapshot: &Mutex<(u64, String)>, peers: &HashSet<PeerId>) {
+    let mut list: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
+    list.sort();
+    let csv = list.join(",");
+    if let Ok(mut guard) = snapshot.lock() {
+        guard.0 = guard.0.saturating_add(1);
+        guard.1 = csv;
     }
 }
 
@@ -400,7 +45,7 @@ pub struct P2pNode {
     local_peer_id: PeerId,
     inbox: Arc<Mutex<VecDeque<(u64, String, Vec<u8>)>>>,
     peer_count: Arc<AtomicUsize>,
-    telemetry: Arc<TelemetryHub>,
+    peers_snapshot: Arc<Mutex<(u64, String)>>,
     tx: mpsc::Sender<ControlMsg>,
     shutdown_rx: Option<oneshot::Receiver<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -408,150 +53,18 @@ pub struct P2pNode {
 
 static GLOBAL_NODE: Mutex<Option<P2pNode>> = Mutex::new(None);
 
-async fn write_http_response(
-    stream: &mut TcpStream,
-    status_line: &str,
-    content_type: &str,
-    body: &[u8],
-) {
-    let header = format!(
-        "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes()).await;
-    if !body.is_empty() {
-        let _ = stream.write_all(body).await;
-    }
-    let _ = stream.flush().await;
-}
-
-async fn handle_telemetry_conn(
-    mut stream: TcpStream,
-    hub: Arc<TelemetryHub>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
-    let mut req_buf = [0u8; 4096];
-    let mut read_len = 0usize;
-    let read_res = tokio::time::timeout(Duration::from_secs(2), async {
-        while read_len < req_buf.len() {
-            let n = stream.read(&mut req_buf[read_len..]).await?;
-            if n == 0 {
-                break;
-            }
-            read_len += n;
-            if req_buf[..read_len].windows(4).any(|w| w == b"\r\n\r\n")
-                || req_buf[..read_len].windows(2).any(|w| w == b"\n\n")
-            {
-                break;
-            }
-        }
-        Ok::<(), std::io::Error>(())
-    })
-    .await;
-
-    if read_res.is_err() || read_len == 0 {
-        return;
-    }
-
-    let req_str = String::from_utf8_lossy(&req_buf[..read_len]);
-    let first_line = req_str.lines().next().unwrap_or("");
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let raw_target = parts.next().unwrap_or("/");
-    let path = raw_target.split('?').next().unwrap_or(raw_target);
-
-    if method == "OPTIONS" {
-        let hdr = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nConnection: close\r\n\r\n";
-        let _ = stream.write_all(hdr.as_bytes()).await;
-        let _ = stream.flush().await;
-        return;
-    }
-
-    if method == "GET" && path == "/status" {
-        let body = hub.status_json();
-        write_http_response(&mut stream, "200 OK", "application/json", body.as_bytes()).await;
-        return;
-    }
-
-    if method == "GET" && path == "/events" {
-        let mut rx = hub.events_tx.subscribe();
-        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
-        if stream.write_all(hdr.as_bytes()).await.is_err() {
-            return;
-        }
-        let init_event = format!("data: {}\n\n", hub.status_event_json());
-        if stream.write_all(init_event.as_bytes()).await.is_err() {
-            return;
-        }
-        let _ = stream.flush().await;
-
-        let mut keepalive = tokio::time::interval(Duration::from_secs(10));
-        keepalive.tick().await;
-        loop {
-            tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-                ev = rx.recv() => {
-                    match ev {
-                        Ok(json_line) => {
-                            let frame = format!("data: {json_line}\n\n");
-                            if stream.write_all(frame.as_bytes()).await.is_err() {
-                                break;
-                            }
-                            let _ = stream.flush().await;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let catchup = format!("data: {}\n\n", hub.status_event_json());
-                            if stream.write_all(catchup.as_bytes()).await.is_err() {
-                                break;
-                            }
-                            let _ = stream.flush().await;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                _ = keepalive.tick() => {
-                    if stream.write_all(b": keepalive\n\n").await.is_err() {
-                        break;
-                    }
-                    let _ = stream.flush().await;
-                }
-            }
-        }
-        return;
-    }
-
-    write_http_response(&mut stream, "404 Not Found", "text/plain", b"Not Found").await;
-}
-
 impl P2pNode {
     pub fn start(listen_port: u16, bootstrap_addrs: Vec<Multiaddr>) -> Result<Self, String> {
-        Self::start_with_telemetry(listen_port, bootstrap_addrs, 0, 0)
-    }
-
-    pub fn start_with_telemetry(
-        listen_port: u16,
-        bootstrap_addrs: Vec<Multiaddr>,
-        telemetry_port: u16,
-        node_id: u64,
-    ) -> Result<Self, String> {
         let inbox = Arc::new(Mutex::new(VecDeque::with_capacity(64)));
         let peer_count = Arc::new(AtomicUsize::new(0));
-        let telemetry = Arc::new(TelemetryHub::new(
-            node_id,
-            listen_port,
-            Arc::clone(&peer_count),
-        ));
+        let peers_snapshot = Arc::new(Mutex::new((0u64, String::new())));
         let (tx, mut rx) = mpsc::channel::<ControlMsg>(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<PeerId, String>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let inbox_bg = Arc::clone(&inbox);
         let peer_count_bg = Arc::clone(&peer_count);
-        let telemetry_bg = Arc::clone(&telemetry);
+        let peers_snapshot_bg = Arc::clone(&peers_snapshot);
 
         let thread = std::thread::Builder::new()
             .name("fe-oracle-p2p".to_string())
@@ -578,53 +91,9 @@ impl P2pNode {
                         }
                     };
 
-                    let (watch_tx, watch_rx) = watch::channel(false);
-                    let mut accept_handle = None;
-                    if telemetry_port != 0 {
-                        let listener = match TcpListener::bind(("127.0.0.1", telemetry_port)).await {
-                            Ok(l) => l,
-                            Err(e) => {
-                                let _ = ready_tx.send(Err(format!(
-                                    "telemetry bind on 127.0.0.1:{telemetry_port} failed: {e}"
-                                )));
-                                return;
-                            }
-                        };
-                        let hub_srv = Arc::clone(&telemetry_bg);
-                        let mut accept_watch = watch_rx.clone();
-                        accept_handle = Some(tokio::spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    changed = accept_watch.changed() => {
-                                        if changed.is_err() || *accept_watch.borrow() {
-                                            break;
-                                        }
-                                    }
-                                    accepted = listener.accept() => {
-                                        match accepted {
-                                            Ok((stream, _)) => {
-                                                let hub_conn = Arc::clone(&hub_srv);
-                                                let conn_watch = accept_watch.clone();
-                                                tokio::spawn(async move {
-                                                    handle_telemetry_conn(stream, hub_conn, conn_watch).await;
-                                                });
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                            }
-                        }));
-                    }
-
                     let local_peer_id = *swarm.local_peer_id();
-                    telemetry_bg.set_local_peer_id(&local_peer_id);
                     let topic = IdentTopic::new(TOPIC_NAME);
                     if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&topic) {
-                        let _ = watch_tx.send(true);
-                        if let Some(h) = accept_handle.take() {
-                            h.abort();
-                        }
                         let _ = ready_tx.send(Err(format!("subscribe error: {e:?}")));
                         return;
                     }
@@ -644,11 +113,10 @@ impl P2pNode {
                             cmd = rx.recv() => {
                                 match cmd {
                                     Some(ControlMsg::Publish(bytes)) => {
-                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes.clone()) {
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes) {
                                             // Transient InsufficientPeers before mesh forms is expected; Fe rebroadcasts.
                                             let _ = e;
                                         }
-                                        telemetry_bg.record_frame("tx", "local", &bytes);
                                     }
                                     Some(ControlMsg::Shutdown) | None => {
                                         break;
@@ -682,23 +150,22 @@ impl P2pNode {
                                     }
                                     SwarmEvent::Behaviour(OracleBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic: sub_topic })) => {
                                         if sub_topic == topic.hash() && peer_id != local_peer_id {
-                                            subscribed_peers.insert(peer_id);
-                                            peer_count_bg.store(subscribed_peers.len(), Ordering::Release);
-                                            telemetry_bg.update_peers(&subscribed_peers);
+                                            if subscribed_peers.insert(peer_id) {
+                                                peer_count_bg.store(subscribed_peers.len(), Ordering::Release);
+                                                update_peers_snapshot(&peers_snapshot_bg, &subscribed_peers);
+                                            }
                                         }
                                     }
                                     SwarmEvent::Behaviour(OracleBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic: sub_topic })) => {
-                                        if sub_topic == topic.hash() {
-                                            subscribed_peers.remove(&peer_id);
+                                        if sub_topic == topic.hash() && subscribed_peers.remove(&peer_id) {
                                             peer_count_bg.store(subscribed_peers.len(), Ordering::Release);
-                                            telemetry_bg.update_peers(&subscribed_peers);
+                                            update_peers_snapshot(&peers_snapshot_bg, &subscribed_peers);
                                         }
                                     }
                                     SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
-                                        if num_established == 0 {
-                                            subscribed_peers.remove(&peer_id);
+                                        if num_established == 0 && subscribed_peers.remove(&peer_id) {
                                             peer_count_bg.store(subscribed_peers.len(), Ordering::Release);
-                                            telemetry_bg.update_peers(&subscribed_peers);
+                                            update_peers_snapshot(&peers_snapshot_bg, &subscribed_peers);
                                         }
                                     }
                                     SwarmEvent::Behaviour(OracleBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -722,7 +189,6 @@ impl P2pNode {
                                         }
                                         let origin_tag = peer_id_tag(&source_peer);
                                         let peer_str = source_peer.to_string();
-                                        telemetry_bg.record_frame("rx", &peer_str, &data);
                                         if let Ok(mut guard) = inbox_bg.lock() {
                                             if guard.len() >= MAX_INBOX_LEN {
                                                 guard.pop_front();
@@ -736,11 +202,6 @@ impl P2pNode {
                         }
                     }
 
-                    let _ = watch_tx.send(true);
-                    if let Some(h) = accept_handle.take() {
-                        h.abort();
-                        let _ = h.await;
-                    }
                     let _ = shutdown_tx.send(());
                 });
             })
@@ -754,15 +215,11 @@ impl P2pNode {
             local_peer_id,
             inbox,
             peer_count,
-            telemetry,
+            peers_snapshot,
             tx,
             shutdown_rx: Some(shutdown_rx),
             thread: Some(thread),
         })
-    }
-
-    pub fn telemetry(&self) -> &Arc<TelemetryHub> {
-        &self.telemetry
     }
 
     pub fn local_peer_id(&self) -> PeerId {
@@ -771,6 +228,13 @@ impl P2pNode {
 
     pub fn peer_count(&self) -> usize {
         self.peer_count.load(Ordering::Acquire)
+    }
+
+    pub fn peers_snapshot(&self) -> (u64, String) {
+        self.peers_snapshot
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or((0, String::new()))
     }
 
     pub fn publish(&self, data: Vec<u8>) -> Result<(), String> {
@@ -1075,19 +539,7 @@ fn read_utf8_arg<'a>(ptr: *const u8, len: usize) -> Result<&'a str, i32> {
     std::str::from_utf8(bytes).map_err(|_| -3)
 }
 
-fn current_telemetry_hub() -> Result<Arc<TelemetryHub>, i32> {
-    let guard = GLOBAL_NODE.lock().map_err(|_| -5)?;
-    let node = guard.as_ref().ok_or(-7)?;
-    Ok(Arc::clone(node.telemetry()))
-}
-
-fn start_global_node(
-    listen_port: u16,
-    bootstrap_ptr: *const u8,
-    bootstrap_len: usize,
-    telemetry_port: u16,
-    node_id: u64,
-) -> i32 {
+fn start_global_node(listen_port: u16, bootstrap_ptr: *const u8, bootstrap_len: usize) -> i32 {
     let bootstrap_str = match read_utf8_arg(bootstrap_ptr, bootstrap_len) {
         Ok(s) => s,
         Err(code) => return code,
@@ -1106,7 +558,7 @@ fn start_global_node(
         *guard = None;
     }
 
-    match P2pNode::start_with_telemetry(listen_port, bootstrap_addrs, telemetry_port, node_id) {
+    match P2pNode::start(listen_port, bootstrap_addrs) {
         Ok(node) => {
             *guard = Some(node);
             0
@@ -1117,120 +569,70 @@ fn start_global_node(
 
 #[no_mangle]
 pub extern "C" fn p2p_start(
-    listen_port: u16,
-    bootstrap_ptr: *const u8,
-    bootstrap_len: usize,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        start_global_node(listen_port, bootstrap_ptr, bootstrap_len, 0, 0)
-    }))
-    .unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn p2p_start_with_telemetry(
     listen_port: u32,
     bootstrap_ptr: *const u8,
     bootstrap_len: usize,
-    telemetry_port: u32,
-    node_id: u64,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         let Ok(listen_port_u16) = u16::try_from(listen_port) else {
             return -2;
         };
-        let Ok(telemetry_port_u16) = u16::try_from(telemetry_port) else {
+        start_global_node(listen_port_u16, bootstrap_ptr, bootstrap_len)
+    }))
+    .unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn p2p_local_peer_id(out_buf: *mut u8, max_len: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let guard = match GLOBAL_NODE.lock() {
+            Ok(g) => g,
+            Err(_) => return -5,
+        };
+        let Some(node) = guard.as_ref() else {
+            return -7;
+        };
+        let peer_str = node.local_peer_id().to_string();
+        let bytes = peer_str.as_bytes();
+        if bytes.len() > max_len || (!bytes.is_empty() && out_buf.is_null()) {
             return -2;
-        };
-        start_global_node(
-            listen_port_u16,
-            bootstrap_ptr,
-            bootstrap_len,
-            telemetry_port_u16,
-            node_id,
-        )
-    }))
-    .unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn p2p_telemetry_set_phase(
-    round_id: u64,
-    phase_ptr: *const u8,
-    phase_len: usize,
-    local_prices_be160_ptr: *const u8,
-    group_medians_be160_ptr: *const u8,
-    round_ts: u64,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let phase = match read_utf8_arg(phase_ptr, phase_len) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
-        let hub = match current_telemetry_hub() {
-            Ok(h) => h,
-            Err(code) => return code,
-        };
-        let local_prices = read_prices_be160(local_prices_be160_ptr);
-        let group_medians = read_prices_be160(group_medians_be160_ptr);
-        hub.set_phase(round_id, phase, local_prices, group_medians, round_ts);
-        0
-    }))
-    .unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn p2p_telemetry_set_feed(
-    slot: u32,
-    provider_ptr: *const u8,
-    provider_len: usize,
-    addr_ptr: *const u8,
-    addr_len: usize,
-    price: u64,
-    assets_ok: u32,
-    ok: u32,
-    latency_ms: u64,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        let provider = match read_utf8_arg(provider_ptr, provider_len) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
-        let addr = match read_utf8_arg(addr_ptr, addr_len) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
-        let hub = match current_telemetry_hub() {
-            Ok(h) => h,
-            Err(code) => return code,
-        };
-        match hub.set_feed(
-            slot as usize,
-            provider,
-            addr,
-            price,
-            assets_ok,
-            ok != 0,
-            latency_ms,
-        ) {
-            Ok(()) => 0,
-            Err(()) => -2,
         }
+        if !bytes.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+            }
+        }
+        i32::try_from(bytes.len()).unwrap_or(-2)
     }))
     .unwrap_or(-99)
 }
 
 #[no_mangle]
-pub extern "C" fn p2p_telemetry_record_event(kind: u32, value: u64) -> i32 {
+pub extern "C" fn p2p_peers_csv(out_ver8_ptr: *mut u8, out_buf: *mut u8, max_len: usize) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let hub = match current_telemetry_hub() {
-            Ok(h) => h,
-            Err(code) => return code,
-        };
-        match hub.record_event(kind, value) {
-            Ok(()) => 0,
-            Err(()) => -2,
+        if out_ver8_ptr.is_null() {
+            return -2;
         }
+        let guard = match GLOBAL_NODE.lock() {
+            Ok(g) => g,
+            Err(_) => return -5,
+        };
+        let Some(node) = guard.as_ref() else {
+            return -7;
+        };
+        let (ver, csv) = node.peers_snapshot();
+        let bytes = csv.as_bytes();
+        if bytes.len() > max_len || (!bytes.is_empty() && out_buf.is_null()) {
+            return -2;
+        }
+        let ver_be = ver.to_be_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(ver_be.as_ptr(), out_ver8_ptr, 8);
+            if !bytes.is_empty() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+            }
+        }
+        i32::try_from(bytes.len()).unwrap_or(-2)
     }))
     .unwrap_or(-99)
 }
@@ -1688,6 +1090,22 @@ mod tests {
             "node_c peer_count={}",
             node_c.peer_count()
         );
+        let (ver_a, csv_a) = node_a.peers_snapshot();
+        assert!(ver_a >= 2, "ver_a={ver_a}");
+        assert!(
+            csv_a.contains(&node_b.local_peer_id().to_string()),
+            "csv_a={csv_a}"
+        );
+        assert!(
+            csv_a.contains(&node_c.local_peer_id().to_string()),
+            "csv_a={csv_a}"
+        );
+        let (ver_b, csv_b) = node_b.peers_snapshot();
+        assert!(ver_b >= 1, "ver_b={ver_b}");
+        assert!(
+            csv_b.contains(&node_a.local_peer_id().to_string()),
+            "csv_b={csv_b}"
+        );
 
         // Publish a 177-byte quote from A twice; B and C must each receive it once (deduped)
         let mut quote = vec![0u8; QUOTE_FRAME_LEN];
@@ -1724,6 +1142,8 @@ mod tests {
         assert_eq!(node_c.poll(), None);
 
         // Publish 262-byte sig from B -> A and C receive via relay/mesh
+        const MSG_TYPE_SIG: u8 = 1;
+        const SIG_FRAME_LEN: usize = 262;
         let mut sig_msg = vec![0xab; SIG_FRAME_LEN];
         sig_msg[0] = MSG_TYPE_SIG;
         node_b.publish(sig_msg.clone()).unwrap();
@@ -1749,127 +1169,6 @@ mod tests {
         node_c.stop();
         node_b.stop();
         node_a.stop();
-    }
-
-    #[test]
-    fn test_telemetry_http_status_and_sse_events() {
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::net::TcpStream;
-
-        let p2p_port = 17201;
-        let telemetry_port = 19201;
-        let node = P2pNode::start_with_telemetry(p2p_port, vec![], telemetry_port, 2)
-            .expect("start with telemetry");
-
-        node.telemetry().set_phase(
-            5,
-            "phase_a_quotes",
-            TEST_PRICES,
-            [0; ASSET_COUNT],
-            1_795_255_400,
-        );
-        node.telemetry()
-            .set_feed(
-                0,
-                "binance",
-                "127.0.0.1:9002",
-                9_245_150_000_000,
-                20,
-                true,
-                3,
-            )
-            .unwrap();
-
-        let mut quote = vec![0u8; QUOTE_FRAME_LEN];
-        quote[0] = MSG_TYPE_QUOTE;
-        quote[1..9].copy_from_slice(&5u64.to_be_bytes());
-        quote[9..17].copy_from_slice(&1_795_255_400u64.to_be_bytes());
-        quote[17..177].copy_from_slice(&prices_to_be160(&TEST_PRICES));
-        let expected_hex = hex::encode(&quote);
-
-        node.publish(quote.clone()).unwrap();
-        // Give the runtime loop a moment to process ControlMsg::Publish
-        std::thread::sleep(Duration::from_millis(80));
-
-        // 1. Check GET /status
-        let mut status_stream =
-            TcpStream::connect(("127.0.0.1", telemetry_port)).expect("connect /status");
-        status_stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        status_stream
-            .write_all(b"GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-            .unwrap();
-        let mut status_resp = String::new();
-        status_stream.read_to_string(&mut status_resp).unwrap();
-        assert!(
-            status_resp.starts_with("HTTP/1.1 200 OK"),
-            "resp={status_resp}"
-        );
-        assert!(status_resp.contains("\"node_id\":2"), "resp={status_resp}");
-        assert!(
-            status_resp.contains("\"phase\":\"phase_a_quotes\""),
-            "resp={status_resp}"
-        );
-        assert!(
-            status_resp.contains("\"provider\":\"binance\""),
-            "resp={status_resp}"
-        );
-        assert!(
-            status_resp.contains("\"assets_ok\":20"),
-            "resp={status_resp}"
-        );
-        assert!(status_resp.contains(&expected_hex), "resp={status_resp}");
-
-        // 2. Check GET /events SSE stream
-        let mut sse_stream =
-            TcpStream::connect(("127.0.0.1", telemetry_port)).expect("connect /events");
-        sse_stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        sse_stream
-            .write_all(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            .unwrap();
-        let mut reader = BufReader::new(sse_stream);
-        let mut header_ok = false;
-        let mut init_data_seen = false;
-        let mut line = String::new();
-        for _ in 0..20 {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap();
-            assert!(n > 0);
-            if line.starts_with("HTTP/1.1 200 OK") {
-                header_ok = true;
-            }
-            if line.starts_with("data: {\"event\":\"status\"") {
-                init_data_seen = true;
-                break;
-            }
-        }
-        assert!(header_ok);
-        assert!(init_data_seen);
-
-        // Publish another frame and confirm a live frame SSE line arrives
-        let mut quote2 = quote;
-        quote2[8] = 6;
-        let expected_hex2 = hex::encode(&quote2);
-        node.publish(quote2).unwrap();
-
-        let mut saw_live_frame = false;
-        for _ in 0..20 {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap();
-            if n == 0 {
-                break;
-            }
-            if line.starts_with("data: {\"event\":\"frame\"") && line.contains(&expected_hex2) {
-                saw_live_frame = true;
-                break;
-            }
-        }
-        assert!(saw_live_frame, "did not observe live SSE frame event");
-
-        node.stop();
     }
 
     #[test]

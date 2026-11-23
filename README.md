@@ -72,7 +72,7 @@ let config = with (Cli = matches) { load_config() }
 10. **`p2p-shim/`** (`[Rust staticlib]`) — Panic-safe C ABI (`libp2p_shim.a`):
     - `libp2p` GossipSub (`"fe-oracle/top20-usd/v1"`) over TCP + Noise + Yamux + mDNS
     - `crypto_keccak_and_sign` and `crypto_keccak_and_sign_bytes` (`tiny-keccak` + `k256`) for quorum batch signatures and raw EIP-155 transaction signing
-    - Read-only HTTP/SSE telemetry tap (`/status` JSON snapshot + `/events` SSE frame and phase stream) integrated with `libp2p` mode when `--telemetry-port` is enabled
+    - Exposes local peer ID and connected-peer CSV snapshots to Fe's unified HTTP/SSE `TelemetryServer` (`http::HttpServer`, serving `/status` and `/events` across `libp2p`, `tcp`, and `udp`)
 
 ### Shared Core & On-Chain Settlement (`[Native / EVM / WASM]`, `[EVM]`)
 

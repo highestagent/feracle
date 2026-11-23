@@ -13,4 +13,4 @@ hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
 libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "gossipsub", "mdns", "tokio", "macros"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

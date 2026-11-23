@@ -1,24 +1,4 @@
 extern {
-    fn p2p_telemetry_set_phase(
-        _ round_id: u64,
-        _ phase_ptr: *u8,
-        _ phase_len: usize,
-        _ local_prices_be160_ptr: *u8,
-        _ group_medians_be160_ptr: *u8,
-        _ round_ts: u64,
-    ) -> i32
-    fn p2p_telemetry_set_feed(
-        _ slot: u32,
-        _ provider_ptr: *u8,
-        _ provider_len: usize,
-        _ addr_ptr: *u8,
-        _ addr_len: usize,
-        _ price: u64,
-        _ assets_ok: u32,
-        _ ok: u32,
-        _ latency_ms: u64,
-    ) -> i32
-    fn p2p_telemetry_record_event(_ kind: u32, _ value: u64) -> i32
     fn crypto_keccak_and_sign(
         _ privkey32_ptr: *u8,
         _ chain_id: u64,
@@ -52,58 +32,6 @@ extern {
         _ r32_ptr: *u8,
         _ s32_ptr: *u8,
     ) -> i32
-}
-
-pub fn telemetry_set_phase(
-    round_id: u64,
-    phase: MemSpan,
-    local_prices: [u64; 20],
-    group_medians: [u64; 20],
-    round_ts: u64,
-) {
-    let local_buf = feracle_core::encode_prices_be160(local_prices)
-    let med_buf = feracle_core::encode_prices_be160(group_medians)
-    let _ = unsafe {
-        p2p_telemetry_set_phase(
-            round_id,
-            phase.ptr(),
-            phase.len(),
-            local_buf.ptr(),
-            med_buf.ptr(),
-            round_ts,
-        )
-    }
-}
-
-pub fn telemetry_set_feed(
-    slot: u32,
-    provider: MemSpan,
-    addr: MemSpan,
-    price: u64,
-    assets_ok: u32,
-    ok: bool,
-    latency_ms: u64,
-) {
-    let ok_flag: u32 = if ok { 1 } else { 0 }
-    let _ = unsafe {
-        p2p_telemetry_set_feed(
-            slot,
-            provider.ptr(),
-            provider.len(),
-            addr.ptr(),
-            addr.len(),
-            price,
-            assets_ok,
-            ok_flag,
-            latency_ms,
-        )
-    }
-}
-
-pub fn telemetry_record_event(kind: u32, value: u64) {
-    let _ = unsafe {
-        p2p_telemetry_record_event(kind, value)
-    }
 }
 
 pub fn sign_digest(

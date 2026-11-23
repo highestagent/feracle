@@ -2,17 +2,29 @@ use core::num::IntDowncast
 use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr}
 use std::time::Clock
 use coro::Scheduler
-use feracle_core::{ASSET_COUNT, hex_char, push_hex_bytes}
+use feracle_core::{
+    ASSET_COUNT,
+    MSG_TYPE_QUOTE,
+    MSG_TYPE_SIG,
+    QUOTE_FRAME_LEN,
+    SIG_FRAME_LEN,
+    hex_char,
+    push_hex_bytes,
+}
 use http::{HttpEvent, HttpServer}
 use net_reactor::SocketIo
-use super::ffi
 
 const MAX_RECENT_FRAMES: usize = 128
 const MAX_FEED_SLOTS: usize = 8
-const MSG_TYPE_QUOTE: u8 = 0
-const MSG_TYPE_SIG: u8 = 1
-const QUOTE_FRAME_LEN: usize = 177
-const SIG_FRAME_LEN: usize = 262
+
+pub enum TelemetryEvent {
+    ToleranceBreach,
+    SubmitOk { pub duration_ms: u64 },
+    SubmitErr { pub duration_ms: u64 },
+    RoundStarted,
+}
+
+impl Copy for TelemetryEvent {}
 
 struct FeedSlot {
     present: bool,
@@ -83,8 +95,7 @@ fn push_u64_array_json(_ out: mut MemBuffer, _ vals: [u64; 20]) {
     var i: usize = 0
     while i < ASSET_COUNT {
         if i > 0 { out.push(b',') }
-        let s = format!(vals[i])
-        out.extend_from(s.span())
+        write!(mut out, vals[i])
         i += 1
     }
     out.push(b']')
@@ -116,7 +127,7 @@ impl TelemetryState {
             peer_count: 0,
             peers_csv: MemBuffer::empty(),
             round_id: 0,
-            phase: format!("starting"),
+            phase: MemBuffer::from_span("starting".span()),
             local_prices: [0; 20],
             group_medians: [0; 20],
             round_ts: 0,
@@ -188,32 +199,33 @@ impl TelemetryState {
         }
     }
 
-    pub fn record_event(mut self, kind: u32, value: u64) -> bool {
-        if kind == 1 {
-            self.tolerance_breaches += 1
-            return true
-        }
-        if kind == 2 {
-            self.submissions_ok += 1
-            self.last_submit_ms = value
-            return true
-        }
-        if kind == 3 {
-            self.submissions_err += 1
-            self.last_submit_ms = value
-            return true
-        }
-        if kind == 4 {
-            var i: usize = 0
-            while i < MAX_FEED_SLOTS {
-                if let Option::Some(mut entry) = self.feeds.get(i) {
-                    entry.present = false
+    pub fn record_event(mut self, _ ev: TelemetryEvent) -> bool {
+        match ev {
+            TelemetryEvent::ToleranceBreach => {
+                self.tolerance_breaches += 1
+                true
+            },
+            TelemetryEvent::SubmitOk { duration_ms } => {
+                self.submissions_ok += 1
+                self.last_submit_ms = duration_ms
+                true
+            },
+            TelemetryEvent::SubmitErr { duration_ms } => {
+                self.submissions_err += 1
+                self.last_submit_ms = duration_ms
+                true
+            },
+            TelemetryEvent::RoundStarted => {
+                var i: usize = 0
+                while i < MAX_FEED_SLOTS {
+                    if let Option::Some(mut entry) = self.feeds.get(i) {
+                        entry.present = false
+                    }
+                    i += 1
                 }
-                i += 1
-            }
-            return false
+                false
+            },
         }
-        false
     }
 
     pub fn record_frame(
@@ -245,7 +257,8 @@ impl TelemetryState {
         var sse_ev = MemBuffer::empty()
         if format_sse {
             sse_ev = MemBuffer::with_capacity(320)
-            let prefix = format!(
+            write!(
+                mut sse_ev,
                 "{\"event\":\"frame\",\"node_id\":",
                 self.node_id,
                 ",\"seq\":",
@@ -254,7 +267,6 @@ impl TelemetryState {
                 ts_ms,
                 ",\"dir\":",
             )
-            sse_ev.extend_from(prefix.span())
             if is_tx {
                 sse_ev.extend_from("\"tx\"".span())
             } else {
@@ -293,18 +305,17 @@ impl TelemetryState {
         sse_ev
     }
 
-    fn append_status_fields(self, _ out: mut MemBuffer) {
-        let head_part = format!("\"node_id\":", self.node_id, ",\"peer_id\":")
-        out.extend_from(head_part.span())
+    fn append_status_fields(self, _ out: mut MemBuffer, include_frames: bool) {
+        write!(mut out, "\"node_id\":", self.node_id, ",\"peer_id\":")
         push_json_escaped(mut out, self.peer_id.span())
-        let mid_part = format!(
+        write!(
+            mut out,
             ",\"p2p_port\":",
             self.p2p_port,
             ",\"peer_count\":",
             self.peer_count,
             ",\"peers\":[",
         )
-        out.extend_from(mid_part.span())
         var first_peer = true
         for part in self.peers_csv.span().split(b',') {
             let p = part.trim()
@@ -315,21 +326,21 @@ impl TelemetryState {
             first_peer = false
             push_json_escaped(mut out, p)
         }
-        let round_part = format!("],\"round_id\":", self.round_id, ",\"phase\":")
-        out.extend_from(round_part.span())
+        write!(mut out, "],\"round_id\":", self.round_id, ",\"phase\":")
         push_json_escaped(mut out, self.phase.span())
-        let scalar_part = format!(
+        write!(
+            mut out,
             ",\"local_price\":",
             self.local_prices[0],
             ",\"group_median\":",
             self.group_medians[0],
             ",\"local_prices\":",
         )
-        out.extend_from(scalar_part.span())
         push_u64_array_json(mut out, self.local_prices)
         out.extend_from(",\"group_medians\":".span())
         push_u64_array_json(mut out, self.group_medians)
-        let counters_part = format!(
+        write!(
+            mut out,
             ",\"round_ts\":",
             self.round_ts,
             ",\"counters\":{\"quotes_tx\":",
@@ -350,7 +361,6 @@ impl TelemetryState {
             self.last_submit_ms,
             "},\"feeds\":[",
         )
-        out.extend_from(counters_part.span())
 
         var first_feed = true
         var fi: usize = 0
@@ -365,7 +375,8 @@ impl TelemetryState {
                 push_json_escaped(mut out, f.provider.span())
                 out.extend_from(",\"addr\":".span())
                 push_json_escaped(mut out, f.addr.span())
-                let feed_tail = format!(
+                write!(
+                    mut out,
                     ",\"price\":",
                     f.price,
                     ",\"assets_ok\":",
@@ -376,11 +387,12 @@ impl TelemetryState {
                     f.latency_ms,
                     "}",
                 )
-                out.extend_from(feed_tail.span())
             }
             fi += 1
         }
-        out.extend_from("],\"recent_frames\":[".span())
+        out.push(b']')
+        if !include_frames { return }
+        out.extend_from(",\"recent_frames\":[".span())
 
         let n_frames = self.recent_frames.len()
         let start = if n_frames == MAX_RECENT_FRAMES {
@@ -393,8 +405,14 @@ impl TelemetryState {
             if k > 0 { out.push(b',') }
             let idx = (start + k) % MAX_RECENT_FRAMES
             let fr = ref self.recent_frames[idx]
-            let fr_head = format!("{\"seq\":", fr.seq, ",\"ts_ms\":", fr.ts_ms, ",\"dir\":")
-            out.extend_from(fr_head.span())
+            write!(
+                mut out,
+                "{\"seq\":",
+                fr.seq,
+                ",\"ts_ms\":",
+                fr.ts_ms,
+                ",\"dir\":",
+            )
             if fr.is_tx {
                 out.extend_from("\"tx\"".span())
             } else {
@@ -413,15 +431,15 @@ impl TelemetryState {
     pub fn encode_status_json(self) -> MemBuffer {
         var out = MemBuffer::with_capacity(1024)
         out.push(b'{')
-        self.append_status_fields(mut out)
+        self.append_status_fields(mut out, include_frames: true)
         out.push(b'}')
         out
     }
 
-    pub fn encode_status_event_json(self) -> MemBuffer {
+    pub fn encode_status_event_json(self, include_frames: bool) -> MemBuffer {
         var out = MemBuffer::with_capacity(1040)
         out.extend_from("{\"event\":\"status\",".span())
-        self.append_status_fields(mut out)
+        self.append_status_fields(mut out, include_frames)
         out.push(b'}')
         out
     }
@@ -485,7 +503,7 @@ impl TelemetryServer {
                                 body: body.span(),
                             )
                     } else if req.method == "GET" && req.path == "/events" {
-                        let ev = self.state.encode_status_event_json()
+                        let ev = self.state.encode_status_event_json(include_frames: true)
                         self.server
                             .upgrade_sse(
                                 req.token,
@@ -505,7 +523,7 @@ impl TelemetryServer {
                     }
                 },
                 HttpEvent::SseWritableAfterLag(token) => {
-                    let ev = self.state.encode_status_event_json()
+                    let ev = self.state.encode_status_event_json(include_frames: true)
                     self.server.send_sse_data(token, data: ev.span())
                 },
             }
@@ -517,7 +535,7 @@ impl TelemetryServer {
     uses (sched: mut Scheduler, io: mut SocketIo)
     {
         if self.server.has_sse_clients() {
-            let ev = self.state.encode_status_event_json()
+            let ev = self.state.encode_status_event_json(include_frames: false)
             self.server.broadcast_sse_data(ev.span())
         }
     }
@@ -557,10 +575,10 @@ impl TelemetryServer {
         self.state.set_feed(slot, provider, addr, price, assets_ok, ok, latency_ms)
     }
 
-    pub fn record_event(mut self, kind: u32, value: u64)
+    pub fn record_event(mut self, _ ev: TelemetryEvent)
     uses (sched: mut Scheduler, io: mut SocketIo)
     {
-        if self.state.record_event(kind, value) {
+        if self.state.record_event(ev) {
             self.broadcast_status_if_watched()
         }
     }
@@ -584,21 +602,27 @@ impl TelemetryServer {
 pub enum TelemetrySink {
     Disabled,
     Local(TelemetryServer),
-    Libp2pFfi,
 }
 
 impl TelemetrySink {
+    pub fn is_enabled(self) -> bool {
+        match self {
+            TelemetrySink::Local(_) => true,
+            TelemetrySink::Disabled => false,
+        }
+    }
+
     pub fn has_pending_writes(self) -> bool {
         match self {
             TelemetrySink::Local(ref s) => s.has_pending_writes(),
-            _ => false,
+            TelemetrySink::Disabled => false,
         }
     }
 
     pub fn poll(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
         match self {
             TelemetrySink::Local(mut s) => s.poll(),
-            _ => {},
+            TelemetrySink::Disabled => {},
         }
     }
 
@@ -607,7 +631,7 @@ impl TelemetrySink {
     {
         match self {
             TelemetrySink::Local(mut s) => s.update_peers(peer_count, peers_csv),
-            _ => {},
+            TelemetrySink::Disabled => {},
         }
     }
 
@@ -629,9 +653,6 @@ impl TelemetrySink {
                 group_medians,
                 round_ts,
             ),
-            TelemetrySink::Libp2pFfi => {
-                ffi::telemetry_set_phase(round_id, phase, local_prices, group_medians, round_ts)
-            },
             TelemetrySink::Disabled => {},
         }
     }
@@ -650,19 +671,15 @@ impl TelemetrySink {
             TelemetrySink::Local(mut s) => {
                 s.set_feed(slot, provider, addr, price, assets_ok, ok, latency_ms)
             },
-            TelemetrySink::Libp2pFfi => {
-                ffi::telemetry_set_feed(slot, provider, addr, price, assets_ok, ok, latency_ms)
-            },
             TelemetrySink::Disabled => {},
         }
     }
 
-    pub fn record_event(mut self, kind: u32, value: u64)
+    pub fn record_event(mut self, _ ev: TelemetryEvent)
     uses (sched: mut Scheduler, io: mut SocketIo)
     {
         match self {
-            TelemetrySink::Local(mut s) => s.record_event(kind, value),
-            TelemetrySink::Libp2pFfi => ffi::telemetry_record_event(kind, value),
+            TelemetrySink::Local(mut s) => s.record_event(ev),
             TelemetrySink::Disabled => {},
         }
     }
@@ -672,14 +689,14 @@ impl TelemetrySink {
     {
         match self {
             TelemetrySink::Local(mut s) => s.record_frame(is_tx, peer, data),
-            _ => {},
+            TelemetrySink::Disabled => {},
         }
     }
 
     pub fn stop(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
         match self {
             TelemetrySink::Local(mut s) => s.stop(),
-            _ => {},
+            TelemetrySink::Disabled => {},
         }
     }
 }

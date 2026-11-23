@@ -27,7 +27,7 @@ use super::network::PeerSession
 use super::round_io::{QuoteRouting, SourcedQuote, add_quote_dedup, poll_all_messages}
 use super::rpc::{QueryCurrentRound, QueryRoundState}
 use super::submit::{SubmitMediansCoro, SubmitOutcome}
-use super::telemetry::TelemetrySink
+use super::telemetry::{TelemetryEvent, TelemetrySink}
 
 enum ConsensusState {
     MeshWarmup,
@@ -297,7 +297,7 @@ impl ConsensusCoro {
             " starting round ",
             self.round_id,
         )
-        telemetry.record_event(kind: 4, value: 0)
+        telemetry.record_event(TelemetryEvent::RoundStarted)
         telemetry
             .set_phase(
                 round_id: self.round_id,
@@ -433,7 +433,7 @@ impl ConsensusCoro {
                 " proposed=",
                 self.group_medians[bad_idx],
             )
-            telemetry.record_event(kind: 1, value: bad_idx.downcast_unchecked())
+            telemetry.record_event(TelemetryEvent::ToleranceBreach)
             telemetry
                 .set_phase(
                     round_id: self.round_id,
@@ -626,12 +626,12 @@ impl ConsensusCoro {
                     " ts=",
                     ok.timestamp,
                 )
-                telemetry.record_event(kind: 2, value: sub_ms)
+                telemetry.record_event(TelemetryEvent::SubmitOk { duration_ms: sub_ms })
                 true
             },
             SubmitOutcome::Failed(ref msg_buf) => {
                 eprintln!(msg_buf)
-                telemetry.record_event(kind: 3, value: sub_ms)
+                telemetry.record_event(TelemetryEvent::SubmitErr { duration_ms: sub_ms })
                 false
             },
         }

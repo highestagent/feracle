@@ -4,13 +4,6 @@ use core::num::IntDowncast
 
 extern {
     fn p2p_start(_ listen_port: u32, _ bootstrap_ptr: *u8, _ bootstrap_len: usize) -> i32
-    fn p2p_start_with_telemetry(
-        _ listen_port: u32,
-        _ bootstrap_ptr: *u8,
-        _ bootstrap_len: usize,
-        _ telemetry_port: u32,
-        _ node_id: u64,
-    ) -> i32
     fn p2p_publish(_ data_ptr: *u8, _ data_len: usize) -> i32
     fn p2p_poll(_ out_ptr: *u8, _ out_cap: usize) -> i32
     fn p2p_poll_with_peer(
@@ -20,6 +13,8 @@ extern {
         _ out_peer_ptr: *u8,
         _ out_peer_cap: usize,
     ) -> i32
+    fn p2p_local_peer_id(_ out_ptr: *u8, _ out_cap: usize) -> i32
+    fn p2p_peers_csv(_ out_ver8_ptr: *u8, _ out_ptr: *u8, _ out_cap: usize) -> i32
     fn p2p_peer_count() -> i32
     fn p2p_stop() -> i32
     fn p2p_sleep_ms(_ ms: u32)
@@ -31,21 +26,48 @@ pub(ingot) fn start(listen_port: u16, bootstrap: MemSpan) -> i32 {
     }
 }
 
-pub(ingot) fn start_with_telemetry(
-    listen_port: u16,
-    bootstrap: MemSpan,
-    telemetry_port: u16,
-    node_id: u64,
-) -> i32 {
-    unsafe {
-        p2p_start_with_telemetry(
-            listen_port as u32,
-            bootstrap.ptr(),
-            bootstrap.len(),
-            telemetry_port as u32,
-            node_id,
-        )
+pub(ingot) fn local_peer_id() -> MemBuffer {
+    var out = MemBuffer::new(128)
+    let rc = unsafe {
+        p2p_local_peer_id(out.ptr(), out.capacity())
     }
+    if rc > 0 {
+        let len: usize = rc.downcast_unchecked()
+        let bounded = if len <= out.capacity() {
+            len
+        } else {
+            out.capacity()
+        }
+        unsafe {
+            out.set_len(bounded)
+        }
+    } else {
+        out.clear()
+    }
+    out
+}
+
+pub(ingot) fn peers_csv() -> (u64, MemBuffer) {
+    var ver_buf = MemBuffer::new(8)
+    var out = MemBuffer::new(8192)
+    let rc = unsafe {
+        p2p_peers_csv(ver_buf.ptr(), out.ptr(), out.capacity())
+    }
+    if rc >= 0 {
+        let ver = ver_buf.span().read_be<u64>(0)
+        let len: usize = rc.downcast_unchecked()
+        let bounded = if len <= out.capacity() {
+            len
+        } else {
+            out.capacity()
+        }
+        unsafe {
+            out.set_len(bounded)
+        }
+        return (ver, out)
+    }
+    out.clear()
+    (0, out)
 }
 
 pub(ingot) fn publish(_ data: MemSpan) -> i32 {
