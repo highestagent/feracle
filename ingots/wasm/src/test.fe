@@ -565,3 +565,16 @@ fn test_node_status_ingest_and_renderers() {
         TelemetryEngine::free_ptr(p)
     }
 }
+
+#[test]
+fn test_handle_resolution_and_null_guard() {
+    assert!(super::resolve_engine(0).is_none())
+    super::telemetry_free(0)
+    let _ = super::telemetry_mark_node_offline(0, 0)
+
+    let h = super::telemetry_new()
+    assert!(h != 0)
+    assert!(super::resolve_engine(h).is_some())
+    let _ = super::telemetry_mark_node_offline(h, 0)
+    super::telemetry_free(h)
+}

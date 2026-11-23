@@ -14,6 +14,13 @@ fn emit_stdout(_ buf: MemSpan) -> Reply uses (out: mut Stdout) {
     Reply::ok(len_u32)
 }
 
+pub(ingot) fn resolve_engine(_ handle: u32) -> Option<*TelemetryEngine> {
+    if handle == 0 {
+        return Option::None
+    }
+    Option::Some((handle as usize) as *TelemetryEngine)
+}
+
 #[unsafe(export)]
 pub fn telemetry_new() -> u32 {
     let p = TelemetryEngine::alloc_new()
@@ -22,8 +29,9 @@ pub fn telemetry_new() -> u32 {
 
 #[unsafe(export)]
 pub fn telemetry_free(_ handle: u32) {
-    if handle == 0 { return }
-    let p = (handle as usize) as *TelemetryEngine
+    let Option::Some(p) = resolve_engine(handle) else {
+        return
+    }
     unsafe {
         TelemetryEngine::free_ptr(p)
     }
@@ -35,12 +43,11 @@ pub fn telemetry_configure(
     _ contract_hex: HostText,
     _ oracles_csv: HostText,
 ) -> Reply {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     let target_contract = contract_hex.copy()
     let oracles = oracles_csv.copy()
-    let p = (handle as usize) as *TelemetryEngine
     unsafe {
         (*p).configure(
                 contract_hex: target_contract.span(),
@@ -52,11 +59,10 @@ pub fn telemetry_configure(
 
 #[unsafe(export)]
 pub fn telemetry_build_rpc_batch(_ handle: u32) -> Reply uses (out: mut Stdout) {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     var buf = MemBuffer::with_capacity(1024)
-    let p = (handle as usize) as *TelemetryEngine
     unsafe {
         (*p).build_rpc_batch(mut buf)
     }
@@ -67,12 +73,11 @@ pub fn telemetry_build_rpc_batch(_ handle: u32) -> Reply uses (out: mut Stdout) 
 pub fn telemetry_ingest_rpc(_ handle: u32, _ payload: HostText, _ latency_ms: u64) -> Reply
 uses (clock: mut Clock)
 {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     let json = payload.copy()
     let now_ms = clock.now_ms()
-    let p = (handle as usize) as *TelemetryEngine
     let ok = unsafe {
         (*p).ingest_rpc_batch(payload: json.span(), latency_ms, now_ms)
     }
@@ -88,11 +93,10 @@ pub fn telemetry_ingest_tx(
     _ tx_count: u32,
     _ submitter_hex: HostText,
 ) -> Reply {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     let submitter = submitter_hex.copy()
-    let p = (handle as usize) as *TelemetryEngine
     unsafe {
         (*p).ingest_tx(
                 round_id,
@@ -114,13 +118,12 @@ pub fn telemetry_ingest_wire_frame(
 ) -> Reply
 uses (clock: mut Clock)
 {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     let hex_str = frame_hex.copy()
     let peer = peer_tag.copy()
     let now_ms = clock.now_ms()
-    let p = (handle as usize) as *TelemetryEngine
     let ok = unsafe {
         (*p)
             .ingest_wire_frame(
@@ -137,12 +140,11 @@ uses (clock: mut Clock)
 pub fn telemetry_ingest_node_status(_ handle: u32, _ node_id: u32, _ payload: HostText) -> Reply
 uses (clock: mut Clock)
 {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     let json = payload.copy()
     let now_ms = clock.now_ms()
-    let p = (handle as usize) as *TelemetryEngine
     let ok = unsafe {
         (*p).ingest_node_status(node_id: node_id as usize, payload: json.span(), now_ms)
     }
@@ -151,10 +153,9 @@ uses (clock: mut Clock)
 
 #[unsafe(export)]
 pub fn telemetry_mark_node_offline(_ handle: u32, _ node_id: u32) -> Reply {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
-    let p = (handle as usize) as *TelemetryEngine
     let ok = unsafe {
         (*p).mark_node_offline(node_id: node_id as usize)
     }
@@ -165,12 +166,11 @@ pub fn telemetry_mark_node_offline(_ handle: u32, _ node_id: u32) -> Reply {
 pub fn telemetry_render_tui(_ handle: u32, _ ansi: u32) -> Reply
 uses (clock: mut Clock, out: mut Stdout)
 {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     var buf = MemBuffer::with_capacity(8192)
     let now_ms = clock.now_ms()
-    let p = (handle as usize) as *TelemetryEngine
     unsafe {
         render_tui_into(*p, now_ms, ansi: ansi != 0, mut buf)
     }
@@ -181,12 +181,11 @@ uses (clock: mut Clock, out: mut Stdout)
 pub fn telemetry_render_json(_ handle: u32) -> Reply
 uses (clock: mut Clock, out: mut Stdout)
 {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     var buf = MemBuffer::with_capacity(16384)
     let now_ms = clock.now_ms()
-    let p = (handle as usize) as *TelemetryEngine
     unsafe {
         render_json_into(*p, now_ms, mut buf)
     }
@@ -197,12 +196,11 @@ uses (clock: mut Clock, out: mut Stdout)
 pub fn telemetry_render_prometheus(_ handle: u32) -> Reply
 uses (clock: mut Clock, out: mut Stdout)
 {
-    if handle == 0 {
+    let Option::Some(p) = resolve_engine(handle) else {
         return Reply::error(1)
     }
     var buf = MemBuffer::with_capacity(4096)
     let now_ms = clock.now_ms()
-    let p = (handle as usize) as *TelemetryEngine
     unsafe {
         render_prometheus_into(*p, now_ms, mut buf)
     }
