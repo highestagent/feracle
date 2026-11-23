@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/ensure-deps.sh"
+ensure_fe
+ensure_cargo
+ensure_foundry
+ensure_python3
+
 RPC_URL="http://127.0.0.1:8545"
 CHAIN_ID="31337"
 P2P_BACKEND="${P2P_BACKEND:-libp2p}"
