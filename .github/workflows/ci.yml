@@ -40,6 +40,14 @@ jobs:
       - name: Test cli ingot
         run: fe test --backend native ingots/cli
 
+      - name: Test coro ingot
+        run: fe test --backend native ingots/coro
+
+      - name: Test net_reactor and http ingots
+        run: |
+          fe test --backend native ingots/net_reactor
+          fe test --backend native ingots/http
+
       - name: Test feracle_core across Native, EVM, and WASM
         run: |
           fe test --backend native ingots/core
