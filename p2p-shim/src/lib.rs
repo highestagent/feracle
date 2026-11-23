@@ -27,8 +27,6 @@ use tokio::sync::{mpsc, oneshot};
 pub const TOPIC_NAME: &str = "fe-oracle/top20-usd/v1";
 pub const ASSET_COUNT: usize = 20;
 const MAX_INBOX_LEN: usize = 1024;
-const MSG_TYPE_QUOTE: u8 = 0;
-const QUOTE_FRAME_LEN: usize = 262;
 
 #[derive(NetworkBehaviour)]
 struct OracleBehaviour {
@@ -214,7 +212,6 @@ impl P2pNode {
                     let _ = ready_tx.send(Ok(local_peer_id));
 
                     let mut subscribed_peers: HashSet<PeerId> = HashSet::new();
-                    let mut seen_quotes: HashSet<(PeerId, u64)> = HashSet::new();
                     let mut redial_tick = tokio::time::interval(Duration::from_secs(1));
 
                     loop {
@@ -290,15 +287,6 @@ impl P2pNode {
                                             continue;
                                         }
                                         let data = message.data;
-                                        if data.len() == QUOTE_FRAME_LEN && data[0] == MSG_TYPE_QUOTE {
-                                            let round_id = u64::from_be_bytes([
-                                                data[1], data[2], data[3], data[4],
-                                                data[5], data[6], data[7], data[8],
-                                            ]);
-                                            if !seen_quotes.insert((source_peer, round_id)) {
-                                                continue;
-                                            }
-                                        }
                                         let origin_tag = peer_id_tag(&source_peer);
                                         let peer_str = source_peer.to_string();
                                         let mut pushed = false;
@@ -1353,7 +1341,10 @@ mod tests {
             "csv_b={csv_b}"
         );
 
-        // Publish a signed-length 262-byte quote from A twice; B and C must each receive it once (deduped)
+        // Single quote publish delivers once per peer (no GossipSub relay duplication);
+        // explicit rebroadcast delivers again so late-joining/out-of-phase peers recover.
+        const MSG_TYPE_QUOTE: u8 = 0;
+        const QUOTE_FRAME_LEN: usize = 262;
         let mut quote = vec![0u8; QUOTE_FRAME_LEN];
         quote[0] = MSG_TYPE_QUOTE;
         quote[1..9].copy_from_slice(&1u64.to_be_bytes());
@@ -1362,8 +1353,6 @@ mod tests {
         quote[177..197].copy_from_slice(&[0x11; 20]);
         quote[197] = 27;
 
-        node_a.publish(quote.clone()).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
         node_a.publish(quote.clone()).unwrap();
 
         let mut got_b = None;
@@ -1384,10 +1373,29 @@ mod tests {
         assert_eq!(got_b.as_ref(), Some(&quote));
         assert_eq!(got_c.as_ref(), Some(&quote));
 
-        // Give time for any second quote broadcast to arrive and verify dedup dropped it
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(node_b.poll(), None);
         assert_eq!(node_c.poll(), None);
+
+        // Explicit rebroadcast (e.g. step_rebroadcast) must still be delivered to peers.
+        node_a.publish(quote.clone()).unwrap();
+        let mut rebroadcast_b = None;
+        let mut rebroadcast_c = None;
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < retry_deadline {
+            if rebroadcast_b.is_none() {
+                rebroadcast_b = node_b.poll();
+            }
+            if rebroadcast_c.is_none() {
+                rebroadcast_c = node_c.poll();
+            }
+            if rebroadcast_b.is_some() && rebroadcast_c.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(rebroadcast_b.as_ref(), Some(&quote));
+        assert_eq!(rebroadcast_c.as_ref(), Some(&quote));
 
         // Publish 262-byte sig from B -> A and C receive via relay/mesh
         const MSG_TYPE_SIG: u8 = 1;

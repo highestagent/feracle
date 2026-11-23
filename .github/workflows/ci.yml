@@ -34,6 +34,7 @@ jobs:
       - name: Syntax checks (JS, Python, Shell)
         run: |
           node --check telemetry/host.mjs
+          node --test telemetry/host.test.mjs
           python3 -m py_compile infra/mock_feeds.py
           bash -n scripts/*.sh
 
@@ -74,8 +75,9 @@ jobs:
       - name: Test Rust p2p-shim
         run: cargo test --manifest-path p2p-shim/Cargo.toml
 
-      - name: Build feracle binary and smoke test CLI
+      - name: Test and build feracle binary and smoke test CLI
         run: |
+          fe test --backend native ingots/feracle
           ./scripts/build-feracle.sh
           ./out/feracle >/dev/null
           ./out/feracle --version

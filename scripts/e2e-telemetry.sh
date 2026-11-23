@@ -28,6 +28,7 @@ PK3="0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
 LOG_DIR="$(mktemp -d)"
 ANVIL_PID=""
 FEEDS_PID=""
+EXTRA_FEEDS_PID=""
 HOST_PID=""
 NODE_PIDS=()
 
@@ -39,7 +40,7 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
-  for pid in "$HOST_PID" "$FEEDS_PID" "$ANVIL_PID"; do
+  for pid in "$HOST_PID" "$EXTRA_FEEDS_PID" "$FEEDS_PID" "$ANVIL_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -60,12 +61,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[1/8] Building evm, feracle, and telemetry wasm..."
+echo "[1/9] Building evm, feracle, and telemetry wasm..."
 fe build --emit abi,bytecode --out-dir "$ROOT_DIR/ingots/evm/out" "$ROOT_DIR/ingots/evm"
 "$ROOT_DIR/scripts/build-feracle.sh"
 "$ROOT_DIR/scripts/build-wasm.sh"
 
-echo "[2/8] Starting Anvil on port 8545 (chainId=$CHAIN_ID)..."
+echo "[2/9] Starting Anvil on port 8545 (chainId=$CHAIN_ID)..."
 anvil --port 8545 --chain-id "$CHAIN_ID" >"$LOG_DIR/anvil.log" 2>&1 &
 ANVIL_PID=$!
 for _ in $(seq 1 50); do
@@ -76,7 +77,7 @@ for _ in $(seq 1 50); do
 done
 cast block-number --rpc-url "$RPC_URL" >/dev/null
 
-echo "[3/8] Deploying OffchainMedianOracle and registering 4 oracles..."
+echo "[3/9] Deploying OffchainMedianOracle and registering 4 oracles..."
 BYTECODE="0x$(tr -d '\r\n' < "$ROOT_DIR/ingots/evm/out/OffchainMedianOracle.bin")"
 DEPLOY_JSON="$(cast send --rpc-url "$RPC_URL" --private-key "$PK0" --json --create "$BYTECODE")"
 CONTRACT_ADDR="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["contractAddress"])' <<<"$DEPLOY_JSON")"
@@ -87,7 +88,7 @@ cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR1" --rpc-url "$RPC_URL" --
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR2" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR3" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 
-echo "[4/8] Starting mock feeds and live Node.js WASM telemetry collector (:9200)..."
+echo "[4/9] Starting mock feeds and live Node.js WASM telemetry collector (:9200)..."
 python3 "$ROOT_DIR/infra/mock_feeds.py" >"$LOG_DIR/feeds.log" 2>&1 &
 FEEDS_PID=$!
 for _ in $(seq 1 30); do
@@ -117,7 +118,7 @@ for _ in $(seq 1 30); do
 done
 curl -sf http://127.0.0.1:9200/status >/dev/null
 
-echo "[5/8] Running Rounds 1 & 2 across 4 nodes with --telemetry-port 9101..9104 (Top-20 basket, backend=$P2P_BACKEND)..."
+echo "[5/9] Running Rounds 1 & 2 across 4 nodes with --telemetry-port 9101..9104 (Top-20 basket, backend=$P2P_BACKEND)..."
 "$ROOT_DIR/out/feracle" \
   --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7001 --telemetry-port 9101 \
   --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
@@ -162,7 +163,7 @@ wait "$PID2"
 wait "$PID3"
 NODE_PIDS=()
 
-echo "[6/8] Asserting deep 20-asset WASM telemetry (JSON /status, Prometheus /metrics, TUI --once)..."
+echo "[6/9] Asserting deep 20-asset WASM telemetry (JSON /status, Prometheus /metrics, TUI --once)..."
 python3 - <<'PY'
 import json
 import time
@@ -261,7 +262,7 @@ JSON_ONCE="$(node "$ROOT_DIR/telemetry/host.mjs" \
   --mode json --once)"
 python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); assert d["protocol"]["asset_count"]==20 and len(d["onchain"]["prices"])==20 and d["onchain"]["latest_price"]==9245100000000' <<<"$JSON_ONCE"
 
-echo "[7/8] Verifying Round 3 (3-of-4 liveness + leader failover telemetry)..."
+echo "[7/9] Verifying Round 3 (3-of-4 liveness + leader failover telemetry)..."
 "$ROOT_DIR/out/feracle" \
   --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7051 --telemetry-port 9101 \
   --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
@@ -322,7 +323,7 @@ assert snap["nodes"][3]["online"] is False
 print("Verified Round 3 telemetry: current_round=4, btc=9245150000000, failover=True, node3_online=False")
 PY
 
-echo "[8/8] Verifying Round 4A ETH outlier breach telemetry..."
+echo "[8/9] Verifying Round 4A ETH outlier breach telemetry..."
 kill "$FEEDS_PID"
 wait "$FEEDS_PID" 2>/dev/null || true
 FEEDS_PID=""
@@ -414,5 +415,170 @@ wait "$PID1"
 wait "$PID2"
 wait "$PID3"
 NODE_PIDS=()
+
+echo "[9/9] Verifying mid-round restart/rejoin and unauthorized rogue rejection telemetry (Rounds 4 & 5)..."
+kill "$FEEDS_PID"
+wait "$FEEDS_PID" 2>/dev/null || true
+FEEDS_PID=""
+
+python3 "$ROOT_DIR/infra/mock_feeds.py" >"$LOG_DIR/feeds_clean2.log" 2>&1 &
+FEEDS_PID=$!
+python3 "$ROOT_DIR/infra/mock_feeds.py" \
+  --port-hl 9004 --port-binance 9005 --port-coinbase 9006 \
+  --price-hl 123456.00 --price-binance 123456.00 --price-coinbase 123456.00 \
+  >"$LOG_DIR/feeds_rogue.log" 2>&1 &
+EXTRA_FEEDS_PID=$!
+for _ in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:9003/products/BTC-USD/ticker >/dev/null 2>&1 \
+    && curl -sf http://127.0.0.1:9005/api/v3/ticker/price?symbol=BTCUSDT >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+
+PK4="0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a"
+"$ROOT_DIR/out/feracle" \
+  --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7201 --telemetry-port 9101 \
+  --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
+  --privkey-hex "$PK0" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 2 --round-timeout-secs 10 \
+  >"$LOG_DIR/node0_r45.log" 2>&1 &
+PID0=$!
+
+sleep 0.3
+"$ROOT_DIR/out/feracle" \
+  --node-id 2 --p2p-backend "$P2P_BACKEND" --p2p-port 7203 --telemetry-port 9103 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7201" \
+  --sources "hyperliquid=127.0.0.1:9001,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK2" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 2 --round-timeout-secs 10 \
+  >"$LOG_DIR/node2_r45.log" 2>&1 &
+PID2=$!
+NODE_PIDS=("$PID0" "$PID2")
+
+# Start only {Node 0, Node 2} first so peer_count=1 holds MeshWarmup at 6000ms.
+# Wait for Node 2's telemetry listener plus 600ms so signal handlers are armed and
+# host.mjs observes Node 2 before SIGTERM, without racing ahead of Node 1 & Node 3.
+python3 - "$LOG_DIR/node2_r45.log" "$PID2" <<'PY'
+import os, signal, sys, time
+log_path, pid = sys.argv[1], int(sys.argv[2])
+deadline = time.time() + 12.0
+while time.time() < deadline:
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            if "telemetry HTTP/SSE listening" in f.read():
+                time.sleep(0.6)
+                os.kill(pid, signal.SIGTERM)
+                sys.exit(0)
+    except FileNotFoundError:
+        pass
+    time.sleep(0.01)
+raise SystemExit("timed out waiting for Node 2 telemetry listener in telemetry E2E")
+PY
+wait "$PID2"
+grep -q "received shutdown signal" "$LOG_DIR/node2_r45.log"
+NODE_PIDS=("$PID0")
+
+"$ROOT_DIR/out/feracle" \
+  --node-id 1 --p2p-backend "$P2P_BACKEND" --p2p-port 7202 --telemetry-port 9102 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7201" \
+  --sources "binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK1" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 2 --round-timeout-secs 10 \
+  >"$LOG_DIR/node1_r45.log" 2>&1 &
+PID1=$!
+
+sleep 0.2
+"$ROOT_DIR/out/feracle" \
+  --node-id 3 --p2p-backend "$P2P_BACKEND" --p2p-port 7204 --telemetry-port 9104 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7201,/ip4/127.0.0.1/tcp/7202" \
+  --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK3" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 2 --round-timeout-secs 10 \
+  >"$LOG_DIR/node3_r45.log" 2>&1 &
+PID3=$!
+NODE_PIDS=("$PID0" "$PID1" "$PID3")
+
+python3 - "$RPC_URL" "$CONTRACT_ADDR" <<'PY'
+import json, sys, time, urllib.request
+rpc_url, contract = sys.argv[1], sys.argv[2]
+deadline = time.time() + 25.0
+while time.time() < deadline:
+    req = urllib.request.Request(
+        rpc_url,
+        data=json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":contract,"data":"0x8a19c8bc"},"latest"]}).encode(),
+        headers={"Content-Type":"application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=2) as resp:
+        res = json.loads(resp.read().decode()).get("result", "0x0")
+    if int(res, 16) >= 5:
+        sys.exit(0)
+    time.sleep(0.05)
+raise SystemExit("timed out waiting for Round 4 to settle 3-of-4 in telemetry E2E")
+PY
+
+"$ROOT_DIR/out/feracle" \
+  --node-id 2 --p2p-backend "$P2P_BACKEND" --p2p-port 7203 --telemetry-port 9103 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7201,/ip4/127.0.0.1/tcp/7202,/ip4/127.0.0.1/tcp/7204" \
+  --sources "hyperliquid=127.0.0.1:9001,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK2" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 12 \
+  >"$LOG_DIR/node2_r5_rejoin.log" 2>&1 &
+PID2_REJOIN=$!
+
+"$ROOT_DIR/out/feracle" \
+  --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7205 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7201,/ip4/127.0.0.1/tcp/7202,/ip4/127.0.0.1/tcp/7204" \
+  --sources "hyperliquid=127.0.0.1:9004,binance=127.0.0.1:9005" \
+  --privkey-hex "$PK4" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 15 \
+  >"$LOG_DIR/rogue_r45.log" 2>&1 &
+PID_ROGUE=$!
+NODE_PIDS=("$PID0" "$PID1" "$PID2_REJOIN" "$PID3" "$PID_ROGUE")
+
+python3 - <<'PY'
+import json
+import time
+import urllib.request
+
+deadline = time.time() + 25.0
+snap = None
+data = None
+saw_node2_online = False
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:9200/status") as resp:
+            data = json.loads(resp.read().decode())
+        if data["nodes"][2]["online"] is True:
+            saw_node2_online = True
+        if (
+            data["onchain"]["current_round"] == 6
+            and data["onchain"]["latest_price"] in (9245100000000, 9245150000000)
+            and (saw_node2_online or (data["nodes"][2]["round_id"] >= 5 and data["nodes"][2]["phase"] == "settled"))
+        ):
+            snap = data
+            break
+    except Exception:
+        pass
+    time.sleep(0.1)
+
+assert snap is not None, f"timed out waiting for rejoin + rogue rejection telemetry; last={data}"
+assert snap["onchain"]["tx_invariant_ok"] is True
+print(
+    f"Verified Round 5 rejoin + rogue rejection telemetry: current_round=6, "
+    f"btc={snap['onchain']['latest_price']}, node2_round={snap['nodes'][2]['round_id']}, saw_node2_online={saw_node2_online}"
+)
+PY
+
+wait "$PID0"
+wait "$PID1"
+wait "$PID2_REJOIN"
+wait "$PID3"
+kill "$PID_ROGUE" 2>/dev/null || true
+wait "$PID_ROGUE" 2>/dev/null || true
+NODE_PIDS=()
+kill "$EXTRA_FEEDS_PID" 2>/dev/null || true
+wait "$EXTRA_FEEDS_PID" 2>/dev/null || true
+EXTRA_FEEDS_PID=""
 
 echo "ALL TELEMETRY E2E CHECKS PASSED!"
