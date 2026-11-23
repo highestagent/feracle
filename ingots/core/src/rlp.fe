@@ -1,0 +1,150 @@
+use core::num::IntDowncast
+
+fn push_minimal_usize_be(_ value: usize, _ out: mut MemBuffer) {
+    if value == 0 { return }
+    var tmp: [u8; 32] = [0; 32]
+    var count: usize = 0
+    var v = value
+    while v > 0 {
+        tmp[count] = (v & 0xff).downcast_truncate()
+        v = v >> 8
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        out.push(tmp[count])
+    }
+}
+
+fn push_minimal_uint_be(_ value: u128, _ out: mut MemBuffer) {
+    if value == 0 { return }
+    var tmp: [u8; 16] = [0; 16]
+    var count: usize = 0
+    var v = value
+    while v > 0 {
+        tmp[count] = (v & (0xff as u128)).downcast_truncate()
+        v = v >> 8
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        out.push(tmp[count])
+    }
+}
+
+pub fn rlp_encode_bytes(_ data: MemSpan, _ out: mut MemBuffer) {
+    let len = data.len()
+    if len == 1 && data.byte_at(0) < 0x80 {
+        out.push(data.byte_at(0))
+        return
+    }
+    if len <= 55 {
+        let tag: u8 = (0x80 + len).downcast_unchecked()
+        out.push(tag)
+        out.extend_from(data)
+        return
+    }
+    var len_bytes = MemBuffer::with_capacity(8)
+    push_minimal_usize_be(len, mut len_bytes)
+    let tag: u8 = (0xb7 + len_bytes.len()).downcast_unchecked()
+    out.push(tag)
+    out.extend_from(len_bytes.span())
+    out.extend_from(data)
+}
+
+pub fn rlp_encode_u64(_ v: u64, _ out: mut MemBuffer) {
+    rlp_encode_u128(v as u128, mut out)
+}
+
+// Canonical RLP integers strip leading zeros, so 0 encodes as the empty string (0x80).
+pub fn rlp_encode_u128(_ v: u128, _ out: mut MemBuffer) {
+    if v == 0 {
+        out.push(0x80)
+        return
+    }
+    var buf = MemBuffer::with_capacity(16)
+    push_minimal_uint_be(v, mut buf)
+    rlp_encode_bytes(buf.span(), mut out)
+}
+
+pub fn rlp_encode_be32_uint(_ arr: [u8; 32], _ out: mut MemBuffer) {
+    var first_nonzero: usize = 0
+    while first_nonzero < 32 && arr[first_nonzero] == 0 {
+        first_nonzero += 1
+    }
+    if first_nonzero == 32 {
+        out.push(0x80)
+        return
+    }
+    var trimmed = MemBuffer::with_capacity(32 - first_nonzero)
+    var i = first_nonzero
+    while i < 32 {
+        trimmed.push(arr[i])
+        i += 1
+    }
+    rlp_encode_bytes(trimmed.span(), mut out)
+}
+
+pub fn rlp_wrap_list(_ payload: MemSpan, _ out: mut MemBuffer) {
+    let len = payload.len()
+    if len <= 55 {
+        let tag: u8 = (0xc0 + len).downcast_unchecked()
+        out.push(tag)
+        out.extend_from(payload)
+        return
+    }
+    var len_bytes = MemBuffer::with_capacity(8)
+    push_minimal_usize_be(len, mut len_bytes)
+    let tag: u8 = (0xf7 + len_bytes.len()).downcast_unchecked()
+    out.push(tag)
+    out.extend_from(len_bytes.span())
+    out.extend_from(payload)
+}
+
+pub fn encode_eip155_unsigned_tx(
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+    to20: MemSpan,
+    calldata: MemSpan,
+    chain_id: u64,
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    var body = MemBuffer::with_capacity(64 + calldata.len())
+    rlp_encode_u64(nonce, mut body)
+    rlp_encode_u128(gas_price, mut body)
+    rlp_encode_u64(gas_limit, mut body)
+    rlp_encode_bytes(to20, mut body)
+    rlp_encode_u64(0, mut body)
+    rlp_encode_bytes(calldata, mut body)
+    rlp_encode_u64(chain_id, mut body)
+    rlp_encode_u64(0, mut body)
+    rlp_encode_u64(0, mut body)
+    rlp_wrap_list(body.span(), mut out)
+}
+
+pub fn encode_eip155_signed_tx(
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+    to20: MemSpan,
+    calldata: MemSpan,
+    v: u128,
+    r: [u8; 32],
+    s: [u8; 32],
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    var body = MemBuffer::with_capacity(140 + calldata.len())
+    rlp_encode_u64(nonce, mut body)
+    rlp_encode_u128(gas_price, mut body)
+    rlp_encode_u64(gas_limit, mut body)
+    rlp_encode_bytes(to20, mut body)
+    rlp_encode_u64(0, mut body)
+    rlp_encode_bytes(calldata, mut body)
+    rlp_encode_u128(v, mut body)
+    rlp_encode_be32_uint(r, mut body)
+    rlp_encode_be32_uint(s, mut body)
+    rlp_wrap_list(body.span(), mut out)
+}

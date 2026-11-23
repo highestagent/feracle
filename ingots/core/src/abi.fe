@@ -2,6 +2,7 @@
 
 use super::assets::ASSET_COUNT
 use super::hex::{hex_nibble, normalize_addr20_hex}
+use super::wire::SigMsg
 
 pub const SEL_SUBMIT_MEDIANS: String<10> = "0x6d2b8b3f"
 pub const SEL_LATEST_PRICES: String<10> = "0xda8fa900"
@@ -59,4 +60,41 @@ pub fn decode_latest_prices_abi_hex(_ hex_no_0x: MemSpan) -> Option<([u64; 20], 
     }
     let last_updated = parse_abi_word_u64(hex_no_0x, word_idx: ASSET_COUNT)?
     Option::Some((prices, last_updated))
+}
+
+pub fn encode_submit_medians_calldata(
+    round_id: u64,
+    prices: [u64; 20],
+    timestamp: u64,
+    sigs: [SigMsg; 3],
+    _ out: mut MemBuffer,
+) {
+    out.clear()
+    out.resize(996)
+    out[0] = 0x6d
+    out[1] = 0x2b
+    out[2] = 0x8b
+    out[3] = 0x3f
+
+    out.write_be<u64>(offset: 4 + 24, value: round_id)
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        out.write_be<u64>(offset: 4 + (1 + i) * 32 + 24, value: prices[i])
+        i += 1
+    }
+    out.write_be<u64>(offset: 4 + 21 * 32 + 24, value: timestamp)
+
+    var s_idx: usize = 0
+    while s_idx < 3 {
+        let base = 4 + (22 + s_idx * 3) * 32
+        let sig = sigs[s_idx]
+        out[base + 31] = sig.v
+        var b: usize = 0
+        while b < 32 {
+            out[base + 32 + b] = sig.r[b]
+            out[base + 64 + b] = sig.s[b]
+            b += 1
+        }
+        s_idx += 1
+    }
 }

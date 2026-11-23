@@ -9,6 +9,7 @@ pub use abi::{
     SEL_OWNER,
     SEL_SUBMIT_MEDIANS,
     decode_latest_prices_abi_hex,
+    encode_submit_medians_calldata,
     parse_abi_word_addr20,
     parse_abi_word_bool,
     parse_abi_word_u64,
@@ -31,6 +32,7 @@ pub use hex::{
     normalize_addr20_hex,
     parse_fixed_hex,
     parse_hex_addr20,
+    parse_hex_u128,
     parse_hex_u64,
     push_addr20_hex,
     push_hex_32,
@@ -54,6 +56,15 @@ pub use math::{
     within_tolerance_all_bps,
     within_tolerance_bps,
     worst_quote_deviation,
+}
+pub use rlp::{
+    encode_eip155_signed_tx,
+    encode_eip155_unsigned_tx,
+    rlp_encode_be32_uint,
+    rlp_encode_bytes,
+    rlp_encode_u128,
+    rlp_encode_u64,
+    rlp_wrap_list,
 }
 pub use wire::{
     MSG_TYPE_QUOTE,

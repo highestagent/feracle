@@ -135,6 +135,22 @@ pub fn parse_hex_u64(_ span: MemSpan) -> Option<u64> {
     Option::Some(acc)
 }
 
+pub fn parse_hex_u128(_ span: MemSpan) -> Option<u128> {
+    let trimmed = span.trim()
+    let raw = trimmed.tail(strip_0x_offset(trimmed))
+    if raw.is_empty() || raw.len() > 32 {
+        return Option::None
+    }
+    var acc: u128 = 0
+    var i: usize = 0
+    while i < raw.len() {
+        let d = hex_nibble(raw.byte_at(i))? as u128
+        acc = (acc << 4) | d
+        i += 1
+    }
+    Option::Some(acc)
+}
+
 pub fn decode_hex_bytes(_ span: MemSpan, _ out: mut MemBuffer) -> bool {
     out.clear()
     let trimmed = span.trim()
