@@ -1,0 +1,46 @@
+use std::time::{Clock, Instant}
+use coro::{Driver, Scheduler, TaskId}
+use super::io::SocketIo
+
+pub struct NetDriver { origin: Instant, max_wait_ms: u64, woken_scratch: MemVec<TaskId> }
+
+impl NetDriver {
+    pub fn new(max_wait_ms: u64) -> Self uses (clock: Clock) {
+        NetDriver { origin: clock.instant(), max_wait_ms, woken_scratch: MemVec::new() }
+    }
+
+    pub fn set_max_wait_ms(mut self, _ max_wait_ms: u64) {
+        self.max_wait_ms = max_wait_ms
+    }
+
+    pub fn sync_clock(self) -> u64 uses (clock: Clock, sched: mut Scheduler) {
+        let elapsed_ms = clock.instant().duration_since(self.origin).as_millis()
+        let _ = sched.advance_to(now_ms: elapsed_ms)
+        elapsed_ms
+    }
+}
+
+impl Driver for NetDriver {
+    uses E = (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+
+    fn begin_tick(mut self) uses E {
+        sched.clear_woken()
+        let _ = self.sync_clock()
+    }
+
+    fn wait(mut self) uses E {
+        let _ = self.sync_clock()
+        let timeout_ms = if io.has_ready_io() {
+            0
+        } else {
+            sched.next_timeout_ms(max_ms: self.max_wait_ms)
+        }
+        let _ = io.poll_os(timeout_ms, mut self.woken_scratch)
+        var i: usize = 0
+        while i < self.woken_scratch.len() {
+            sched.wake(self.woken_scratch[i])
+            i += 1
+        }
+        let _ = self.sync_clock()
+    }
+}

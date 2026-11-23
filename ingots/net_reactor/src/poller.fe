@@ -1,0 +1,280 @@
+use std::io::Error
+use std::net::{Events, Interest, Poller, SocketAddr, TcpListener, TcpStream, Token, UdpSocket}
+use std::time::Duration
+use coro::TaskId
+use super::io::{IoEntry, IoEvent, IoSlot, SocketIo}
+
+pub struct NetPoller {
+    poller: Poller<IoEntry>,
+    events: Events,
+    tokens: MemVec<Token>,
+    ready_io: MemVec<IoEvent>,
+}
+
+impl NetPoller {
+    pub fn new() -> Result<Error, Self> {
+        let poller = Poller<IoEntry>::new()?
+        Result::Ok(
+            NetPoller {
+                poller,
+                events: Events::with_capacity(128),
+                tokens: MemVec::new(),
+                ready_io: MemVec::new(),
+            },
+        )
+    }
+}
+
+fn push_unique_task(_ out: mut MemVec<TaskId>, _ task: TaskId) {
+    var i: usize = 0
+    while i < out.len() {
+        if out[i] == task { return }
+        i += 1
+    }
+    out.push(task)
+}
+
+impl SocketIo for NetPoller {
+    fn register_tcp_listener(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ listener: own TcpListener,
+    ) -> Result<Error, Token> {
+        let interest = Interest::READABLE
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::TcpListener(listener) }
+        let tok = self.poller.add(entry, interest)?
+        self.tokens.push(tok)
+        Result::Ok(tok)
+    }
+
+    fn register_tcp_stream(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ stream: own TcpStream,
+        _ interest: Interest,
+    ) -> Result<Error, Token> {
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::TcpStream(stream) }
+        let tok = self.poller.add(entry, interest)?
+        self.tokens.push(tok)
+        Result::Ok(tok)
+    }
+
+    fn register_udp_socket(mut self, owner: TaskId, tag: u32, _ sock: own UdpSocket) -> Result<
+        Error,
+        Token,
+    > {
+        let interest = Interest::READABLE
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::UdpSocket(sock) }
+        let tok = self.poller.add(entry, interest)?
+        self.tokens.push(tok)
+        Result::Ok(tok)
+    }
+
+    fn set_interest(mut self, _ token: Token, _ interest: Interest) -> Result<Error, ()> {
+        self.poller.set_interest(token, interest)?
+        if let Option::Some(mut entry) = self.poller.get(token) {
+            entry.interest = interest
+        }
+        Result::Ok(())
+    }
+
+    // Remove from Poller before dropping the IoEntry so kqueue/epoll unregisters
+    // the descriptor prior to close, then scrub stale tokens and queued events.
+    fn deregister(mut self, _ token: Token) {
+        let _ = self.poller.remove(token)
+        var ti: usize = 0
+        while ti < self.tokens.len() {
+            if self.tokens[ti] == token {
+                let _ = self.tokens.swap_remove(ti)
+                break
+            }
+            ti += 1
+        }
+        var ri: usize = 0
+        while ri < self.ready_io.len() {
+            if self.ready_io[ri].token == token {
+                let _ = self.ready_io.swap_remove(ri)
+            } else {
+                ri += 1
+            }
+        }
+    }
+
+    fn deregister_owner(mut self, _ owner: TaskId) {
+        var to_remove = MemVec<Token>::new()
+        var ti: usize = 0
+        while ti < self.tokens.len() {
+            let tok = self.tokens[ti]
+            if let Option::Some(ref entry) = self.poller.get(tok) {
+                if entry.owner == owner {
+                    to_remove.push(tok)
+                }
+            }
+            ti += 1
+        }
+        var ri: usize = 0
+        while ri < to_remove.len() {
+            self.deregister(to_remove[ri])
+            ri += 1
+        }
+
+        var ei: usize = 0
+        while ei < self.ready_io.len() {
+            if self.ready_io[ei].owner == owner {
+                let _ = self.ready_io.swap_remove(ei)
+            } else {
+                ei += 1
+            }
+        }
+    }
+
+    fn listener_accept(mut self, _ token: Token) -> Option<Result<Error, (TcpStream, SocketAddr)>> {
+        let Option::Some(mut entry) = self.poller.get(token) else {
+            return Option::None
+        }
+        match entry.slot {
+            IoSlot::TcpListener(mut l) => Option::Some(l.accept()),
+            _ => Option::None,
+        }
+    }
+
+    fn stream_read(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<Result<Error, usize>> {
+        let Option::Some(mut entry) = self.poller.get(token) else {
+            return Option::None
+        }
+        match entry.slot {
+            IoSlot::TcpStream(mut s) => Option::Some(s.read(mut buf)),
+            _ => Option::None,
+        }
+    }
+
+    fn stream_write(mut self, _ token: Token, _ bytes: MemSpan) -> Option<Result<Error, usize>> {
+        let Option::Some(mut entry) = self.poller.get(token) else {
+            return Option::None
+        }
+        match entry.slot {
+            IoSlot::TcpStream(mut s) => Option::Some(s.write(bytes)),
+            _ => Option::None,
+        }
+    }
+
+    fn stream_take_error(mut self, _ token: Token) -> Option<Result<Error, Option<Error>>> {
+        let Option::Some(mut entry) = self.poller.get(token) else {
+            return Option::None
+        }
+        match entry.slot {
+            IoSlot::TcpStream(mut s) => Option::Some(s.take_error()),
+            _ => Option::None,
+        }
+    }
+
+    fn udp_recv_from(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<
+        Result<Error, (usize, SocketAddr)>,
+    > {
+        let Option::Some(mut entry) = self.poller.get(token) else {
+            return Option::None
+        }
+        match entry.slot {
+            IoSlot::UdpSocket(mut u) => Option::Some(u.recv_from(mut buf)),
+            _ => Option::None,
+        }
+    }
+
+    fn udp_send_to(mut self, _ token: Token, _ bytes: MemSpan, _ to: SocketAddr) -> Option<
+        Result<Error, usize>,
+    > {
+        let Option::Some(mut entry) = self.poller.get(token) else {
+            return Option::None
+        }
+        match entry.slot {
+            IoSlot::UdpSocket(mut u) => Option::Some(u.send_to(bytes, to)),
+            _ => Option::None,
+        }
+    }
+
+    fn take_events_for(mut self, _ owner: TaskId, _ out: mut MemVec<IoEvent>) {
+        out.clear()
+        var i: usize = 0
+        while i < self.ready_io.len() {
+            if self.ready_io[i].owner == owner {
+                out.push(self.ready_io.swap_remove(i))
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    // Coalesces all queued kernel events for one token (e.g. macOS kqueue splits
+    // EVFILT_READ and EVFILT_WRITE into separate entries) without touching sibling sockets.
+    fn take_token_event(mut self, _ token: Token) -> Option<IoEvent> {
+        var found: Option<IoEvent> = Option::None
+        var i: usize = 0
+        while i < self.ready_io.len() {
+            if self.ready_io[i].token == token {
+                let ev = self.ready_io.swap_remove(i)
+                found = match found {
+                    Option::Some(prev) => Option::Some(
+                        IoEvent {
+                            token: prev.token,
+                            owner: prev.owner,
+                            tag: prev.tag,
+                            readable: prev.readable || ev.readable,
+                            writable: prev.writable || ev.writable,
+                            error: prev.error || ev.error,
+                            hangup: prev.hangup || ev.hangup,
+                        },
+                    ),
+                    Option::None => Option::Some(ev),
+                }
+            } else {
+                i += 1
+            }
+        }
+        found
+    }
+
+    fn has_ready_io(self) -> bool {
+        !self.ready_io.is_empty()
+    }
+
+    fn poll_os(mut self, timeout_ms: u64, _ woken_owners: mut MemVec<TaskId>) -> usize {
+        woken_owners.clear()
+        let n = match self.poller
+            .wait(
+                mut self.events,
+                Option::Some(Duration::from_millis(timeout_ms)),
+            ) {
+            Result::Ok(count) => count,
+            Result::Err(_) => 0,
+        }
+        var queued: usize = 0
+        var i: usize = 0
+        while i < n {
+            let ev = self.events.get(i)
+            let tok = ev.token()
+            var mapped: Option<IoEvent> = Option::None
+            if let Option::Some(ref entry) = self.poller.get(tok) {
+                mapped = Option::Some(
+                    IoEvent {
+                        token: tok,
+                        owner: entry.owner,
+                        tag: entry.tag,
+                        readable: ev.is_readable(),
+                        writable: ev.is_writable(),
+                        error: ev.is_error(),
+                        hangup: ev.is_hangup(),
+                    },
+                )
+            }
+            if let Option::Some(io_ev) = mapped {
+                self.ready_io.push(io_ev)
+                push_unique_task(mut woken_owners, io_ev.owner)
+                queued += 1
+            }
+            i += 1
+        }
+        queued
+    }
+}

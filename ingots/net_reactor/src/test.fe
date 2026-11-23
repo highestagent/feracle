@@ -1,0 +1,213 @@
+use std::net::{IpAddr, Ipv4Addr, Interest, Net, SocketAddr, Token}
+use std::time::Clock
+use coro::{Coroutine, LocalScheduler, Poll, Scheduler, Sleep, TaskId, block_on}
+use super::{IoEvent, NetDriver, NetPoller, SocketIo, is_would_block}
+
+struct TcpPingPong {
+    srv_task: TaskId,
+    cli_task: TaskId,
+    l_tok: Token,
+    cli_tok: Token,
+    acc_tok: Option<Token>,
+    sent: bool,
+    echoed: bool,
+    srv_buf: MemBuffer,
+    cli_buf: MemBuffer,
+    events: MemVec<IoEvent>,
+}
+
+impl TcpPingPong {
+    fn start(lo: SocketAddr) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let srv_task = sched.alloc_task()
+        let cli_task = sched.alloc_task()
+
+        var listener = net.listen(lo).unwrap()
+        listener.set_nonblocking(true).unwrap()
+        let srv_addr = listener.local_addr().unwrap()
+        let l_tok = io.register_tcp_listener(owner: srv_task, tag: 1, listener).unwrap()
+
+        var stream = net.connect_nonblocking(srv_addr).unwrap()
+        let _ = stream.set_nodelay(true)
+        let cli_tok = io
+            .register_tcp_stream(owner: cli_task, tag: 2, stream, Interest::BOTH)
+            .unwrap()
+
+        TcpPingPong {
+            srv_task,
+            cli_task,
+            l_tok,
+            cli_tok,
+            acc_tok: Option::None,
+            sent: false,
+            echoed: false,
+            srv_buf: MemBuffer::empty(),
+            cli_buf: MemBuffer::empty(),
+            events: MemVec::new(),
+        }
+    }
+}
+
+impl Coroutine for TcpPingPong {
+    type Output = bool
+    uses E = (sched: mut Scheduler, io: mut SocketIo)
+
+    fn poll(mut self) -> Poll<bool> uses E {
+        io.take_events_for(self.srv_task, mut self.events)
+        var tmp = MemBuffer::new(256)
+        var ei: usize = 0
+        while ei < self.events.len() {
+            let ev = self.events[ei]
+            if ev.token == self.l_tok {
+                while true {
+                    match io.listener_accept(self.l_tok) {
+                        Option::Some(Result::Ok((var s, _))) => {
+                            let _ = s.set_nonblocking(true)
+                            let tok = io
+                                .register_tcp_stream(
+                                    owner: self.srv_task,
+                                    tag: 3,
+                                    s,
+                                    Interest::READABLE,
+                                )
+                                .unwrap()
+                            self.acc_tok = Option::Some(tok)
+                        },
+                        _ => {
+                            break
+                        },
+                    }
+                }
+            } else if ev.readable {
+                let slice = mut tmp.span()
+                if let Option::Some(Result::Ok(n)) = io.stream_read(ev.token, mut slice) {
+                    if n > 0 {
+                        self.srv_buf.extend_from(tmp.span().head(n))
+                        if self.srv_buf == "ping" {
+                            let _ = io.stream_write(ev.token, "pong".span())
+                        }
+                    }
+                }
+            }
+            ei += 1
+        }
+
+        if let Option::Some(cev) = io.take_token_event(self.cli_tok) {
+            if cev.writable && !self.sent {
+                if let Option::Some(Result::Ok(n)) = io.stream_write(self.cli_tok, "ping".span()) {
+                    if n == 4 {
+                        self.sent = true
+                        let _ = io.set_interest(self.cli_tok, Interest::READABLE)
+                    }
+                }
+            }
+            if cev.readable {
+                let slice = mut tmp.span()
+                if let Option::Some(Result::Ok(n)) = io.stream_read(self.cli_tok, mut slice) {
+                    if n > 0 {
+                        self.cli_buf.extend_from(tmp.span().head(n))
+                        if self.cli_buf == "pong" {
+                            self.echoed = true
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.echoed {
+            self.cancel()
+            return Poll::Ready(true)
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        sched.cancel_owner_timers(self.srv_task)
+        sched.cancel_owner_timers(self.cli_task)
+        io.deregister_owner(self.srv_task)
+        io.deregister_owner(self.cli_task)
+    }
+}
+
+struct WrapperTransport { sched: LocalScheduler, io: NetPoller, driver: NetDriver }
+
+fn drive_sleep_in_fields(_ sched: mut LocalScheduler, _ io: mut NetPoller, _ driver: mut NetDriver)
+uses (clock: Clock)
+{
+    with (Scheduler = sched, SocketIo = io) {
+        let owner = sched.alloc_task()
+        var s = Sleep::after(owner, delay_ms: 15)
+        block_on(mut s, mut driver)
+    }
+}
+
+impl WrapperTransport {
+    fn step_once(mut self) uses (clock: Clock) {
+        drive_sleep_in_fields(mut self.sched, mut self.io, mut self.driver)
+    }
+}
+
+#[test]
+fn test_net_reactor_tcp_udp_timers_and_wrapper()
+uses (net: mut Net, clock: Clock)
+{
+    var sched = LocalScheduler::new(0)
+    var io = NetPoller::new().unwrap()
+    var driver = NetDriver::new(max_wait_ms: 20)
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+
+    with (Scheduler = sched, SocketIo = io) {
+        var ping_pong = TcpPingPong::start(lo)
+        assert!(block_on(mut ping_pong, mut driver))
+
+        let udp_task = sched.alloc_task()
+        var sa = net.bind_udp(lo).unwrap()
+        var sb = net.bind_udp(lo).unwrap()
+        sa.set_nonblocking(true).unwrap()
+        sb.set_nonblocking(true).unwrap()
+        let addr_b = sb.local_addr().unwrap()
+        let ta = io.register_udp_socket(owner: udp_task, tag: 1, sa).unwrap()
+        let tb = io.register_udp_socket(owner: udp_task, tag: 2, sb).unwrap()
+
+        var sent_ok = false
+        if let Option::Some(Result::Ok(n)) = io.udp_send_to(ta, "udp-hi".span(), addr_b) {
+            sent_ok = n == 6
+        }
+        assert!(sent_ok)
+
+        var rx = MemBuffer::new(64)
+        var got_udp = false
+        var steps: usize = 0
+        while !got_udp && steps < 30 {
+            driver.begin_tick()
+            if let Option::Some(ev) = io.take_token_event(tb) {
+                if ev.readable {
+                    let slice = mut rx.span()
+                    if let Option::Some(Result::Ok((n, _))) = io.udp_recv_from(tb, mut slice) {
+                        assert!(rx.span().head(n) == "udp-hi")
+                        got_udp = true
+                        break
+                    }
+                }
+            }
+            driver.wait()
+            steps += 1
+        }
+        assert!(got_udp)
+
+        io.deregister_owner(udp_task)
+        assert!(!io.has_ready_io())
+        assert!(
+            !is_would_block(std::io::Error::new(std::io::ErrorKind::TimedOut)),
+        )
+    }
+
+    var wrap = WrapperTransport {
+        sched: LocalScheduler::new(0),
+        io: NetPoller::new().unwrap(),
+        driver: NetDriver::new(max_wait_ms: 20),
+    }
+    wrap.step_once()
+    assert!(wrap.sched.now_ms() >= 15)
+}

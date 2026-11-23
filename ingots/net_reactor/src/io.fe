@@ -1,0 +1,77 @@
+use std::io::{Error, ErrorKind}
+use std::net::{Interest, Pollable, SocketAddr, TcpListener, TcpStream, Token, UdpSocket}
+use coro::TaskId
+
+pub enum IoSlot {
+    TcpListener(TcpListener),
+    TcpStream(TcpStream),
+    UdpSocket(UdpSocket),
+}
+
+pub struct IoEntry { pub owner: TaskId, pub tag: u32, pub interest: Interest, pub slot: IoSlot }
+
+impl Pollable for IoEntry {
+    fn raw_fd(self) -> i32 {
+        match self.slot {
+            IoSlot::TcpListener(ref l) => l.as_raw_fd(),
+            IoSlot::TcpStream(ref s) => s.as_raw_fd(),
+            IoSlot::UdpSocket(ref u) => u.as_raw_fd(),
+        }
+    }
+}
+
+pub struct IoEvent {
+    pub token: Token,
+    pub owner: TaskId,
+    pub tag: u32,
+    pub readable: bool,
+    pub writable: bool,
+    pub error: bool,
+    pub hangup: bool,
+}
+
+impl Copy for IoEvent {}
+
+pub trait SocketIo {
+    fn register_tcp_listener(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ listener: own TcpListener,
+    ) -> Result<Error, Token>
+    fn register_tcp_stream(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ stream: own TcpStream,
+        _ interest: Interest,
+    ) -> Result<Error, Token>
+    fn register_udp_socket(mut self, owner: TaskId, tag: u32, _ sock: own UdpSocket) -> Result<
+        Error,
+        Token,
+    >
+    fn set_interest(mut self, _ token: Token, _ interest: Interest) -> Result<Error, ()>
+    fn deregister(mut self, _ token: Token)
+    fn deregister_owner(mut self, _ owner: TaskId)
+    fn listener_accept(mut self, _ token: Token) -> Option<Result<Error, (TcpStream, SocketAddr)>>
+    fn stream_read(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<Result<Error, usize>>
+    fn stream_write(mut self, _ token: Token, _ bytes: MemSpan) -> Option<Result<Error, usize>>
+    fn stream_take_error(mut self, _ token: Token) -> Option<Result<Error, Option<Error>>>
+    fn udp_recv_from(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<
+        Result<Error, (usize, SocketAddr)>,
+    >
+    fn udp_send_to(mut self, _ token: Token, _ bytes: MemSpan, _ to: SocketAddr) -> Option<
+        Result<Error, usize>,
+    >
+    fn take_events_for(mut self, _ owner: TaskId, _ out: mut MemVec<IoEvent>)
+    fn take_token_event(mut self, _ token: Token) -> Option<IoEvent>
+    fn has_ready_io(self) -> bool
+    fn poll_os(mut self, timeout_ms: u64, _ woken_owners: mut MemVec<TaskId>) -> usize
+}
+
+pub fn is_would_block(_ err: Error) -> bool {
+    match err.kind() {
+        ErrorKind::WouldBlock => true,
+        _ => false,
+    }
+}

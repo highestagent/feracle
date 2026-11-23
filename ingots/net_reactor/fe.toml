@@ -1,0 +1,6 @@
+[ingot]
+name = "net_reactor"
+version = "0.1.0"
+
+[dependencies]
+coro = { path = "../coro" }
