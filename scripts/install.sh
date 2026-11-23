@@ -9,6 +9,7 @@ MODE="auto"
 ARCHIVE_PATH=""
 PACKAGE_OUT=""
 INSTALL_FOUNDRY=0
+INSTALL_DEPS=0
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,7 @@ Options:
   --version <TAG>       GitHub release tag to install when downloading (default: latest)
   --package <PATH>      Build from local source and emit a relocatable .tar.gz bundle
   --install-foundry     Install Foundry (anvil/cast) via foundryup if missing
+  --install-deps        Install runtime dependencies (Foundry, Node.js >= 20, Caddy) if missing
   -h, --help            Print help
 
 Environment variables:
@@ -81,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install-foundry)
       INSTALL_FOUNDRY=1
+      shift
+      ;;
+    --install-deps)
+      INSTALL_DEPS=1
       shift
       ;;
     -h|--help)
@@ -146,48 +152,6 @@ find_local_repo() {
   return 1
 }
 
-ensure_fe() {
-  if [[ -x "$HOME/.fe/bin/fe" ]]; then
-    export PATH="$HOME/.fe/bin:$PATH"
-  fi
-  if command -v fe >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "Installing Fe toolchain ($FE_VERSION)..."
-  curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh \
-    | bash -s -- --version "$FE_VERSION" --no-modify-path
-  export PATH="$HOME/.fe/bin:$PATH"
-  command -v fe >/dev/null 2>&1 || {
-    echo "error: fe installation succeeded but fe is still not on PATH" >&2
-    exit 1
-  }
-}
-
-ensure_cargo() {
-  if command -v cargo >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "error: cargo is required to build p2p-shim from source." >&2
-  echo "Install Rust via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
-  exit 1
-}
-
-maybe_install_foundry() {
-  if [[ "$INSTALL_FOUNDRY" -ne 1 ]]; then
-    return 0
-  fi
-  if [[ -x "$HOME/.foundry/bin/anvil" ]]; then
-    export PATH="$HOME/.foundry/bin:$PATH"
-  fi
-  if command -v anvil >/dev/null 2>&1 && command -v cast >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "Installing Foundry (anvil + cast)..."
-  curl -fsSL https://foundry.paradigm.xyz | bash
-  export PATH="$HOME/.foundry/bin:$PATH"
-  "$HOME/.foundry/bin/foundryup"
-}
-
 write_wrappers() {
   local dest="$1"
 
@@ -198,10 +162,9 @@ set -euo pipefail
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHARE_DIR="$(cd "$BIN_DIR/../share/feracle" && pwd)"
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "error: Node.js (>= 20) is required to run feracle-telemetry." >&2
-  exit 1
-fi
+# shellcheck disable=SC1091
+source "$SHARE_DIR/scripts/ensure-deps.sh"
+ensure_node
 
 exec node "$SHARE_DIR/telemetry/host.mjs" \
   --wasm "$SHARE_DIR/out/telemetry_wasm.wasm" \
@@ -217,16 +180,18 @@ BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHARE_DIR="$(cd "$BIN_DIR/../share/feracle" && pwd)"
 BACKEND="${P2P_BACKEND:-libp2p}"
 METRICS_PORT=9200
+USE_MOCK_FEEDS=0
 
 usage() {
   cat <<'HELP'
-Launch a local 3-node Feracle devnet (Anvil + mock feeds + WASM telemetry TUI)
+Launch a local 3-node Feracle devnet (Anvil + live feeds or --mock-feeds + WASM telemetry TUI)
 
 Usage: feracle-demo [OPTIONS]
 
 Options:
   --backend <libp2p|tcp|udp>  P2P backend (default: libp2p or $P2P_BACKEND)
   --metrics-port <PORT>       Prometheus/JSON HTTP port (default: 9200)
+  --mock-feeds                Use local infra/mock_feeds.py instead of live exchange feeds via Caddy
   -h, --help                  Print help
 HELP
 }
@@ -238,10 +203,22 @@ while [[ $# -gt 0 ]]; do
       BACKEND="$2"
       shift 2
       ;;
+    --backend=*)
+      BACKEND="${1#--backend=}"
+      shift
+      ;;
     --metrics-port)
       [[ $# -ge 2 ]] || { echo "error: --metrics-port requires a port" >&2; exit 2; }
       METRICS_PORT="$2"
       shift 2
+      ;;
+    --metrics-port=*)
+      METRICS_PORT="${1#--metrics-port=}"
+      shift
+      ;;
+    --mock-feeds)
+      USE_MOCK_FEEDS=1
+      shift
       ;;
     -h|--help)
       usage
@@ -255,15 +232,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for cmd in anvil cast node python3; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "error: missing required tool '$cmd' on PATH." >&2
-    if [[ "$cmd" == "anvil" || "$cmd" == "cast" ]]; then
-      echo "Install Foundry via: curl -L https://foundry.paradigm.xyz | bash && foundryup" >&2
-    fi
-    exit 1
-  fi
-done
+case "$BACKEND" in
+  libp2p|tcp|udp) ;;
+  *)
+    echo "error: invalid --backend '$BACKEND' (expected libp2p, tcp, or udp)" >&2
+    exit 2
+    ;;
+esac
+
+# shellcheck disable=SC1091
+source "$SHARE_DIR/scripts/ensure-deps.sh"
+ensure_foundry
+ensure_node
+if [[ "$USE_MOCK_FEEDS" -eq 1 ]]; then
+  ensure_python3
+else
+  ensure_caddy
+fi
 
 RPC_URL="http://127.0.0.1:8545"
 CHAIN_ID="31337"
@@ -299,28 +284,91 @@ trap cleanup EXIT INT TERM
 echo "Starting local Anvil on :8545..."
 anvil --port 8545 --chain-id "$CHAIN_ID" >"$LOG_DIR/anvil.log" 2>&1 &
 ANVIL_PID=$!
+ANVIL_READY=0
 for _ in $(seq 1 50); do
+  if ! kill -0 "$ANVIL_PID" 2>/dev/null; then
+    echo "error: anvil exited unexpectedly:" >&2
+    cat "$LOG_DIR/anvil.log" >&2 || true
+    exit 1
+  fi
   if cast block-number --rpc-url "$RPC_URL" >/dev/null 2>&1; then
+    ANVIL_READY=1
     break
   fi
   sleep 0.2
 done
+if [[ "$ANVIL_READY" -ne 1 ]]; then
+  echo "error: anvil did not become ready on :8545:" >&2
+  cat "$LOG_DIR/anvil.log" >&2 || true
+  exit 1
+fi
 
 BYTECODE="0x$(tr -d '\r\n' < "$SHARE_DIR/ingots/evm/out/OffchainMedianOracle.bin")"
 DEPLOY_JSON="$(cast send --rpc-url "$RPC_URL" --private-key "$PK0" --json --create "$BYTECODE")"
-CONTRACT_ADDR="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["contractAddress"])' <<<"$DEPLOY_JSON")"
+CONTRACT_ADDR="$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(0,"utf8")).contractAddress)' <<<"$DEPLOY_JSON")"
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR0" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR1" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR2" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 
-python3 "$SHARE_DIR/infra/mock_feeds.py" >"$LOG_DIR/feeds.log" 2>&1 &
-FEEDS_PID=$!
+if [[ "$USE_MOCK_FEEDS" -eq 1 ]]; then
+  FEEDS_MODE="mock"
+  echo "Starting local mock feeds on :9001..:9003..."
+  python3 "$SHARE_DIR/infra/mock_feeds.py" >"$LOG_DIR/feeds.log" 2>&1 &
+  FEEDS_PID=$!
+  READY=0
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$FEEDS_PID" 2>/dev/null; then
+      echo "error: mock_feeds.py exited unexpectedly:" >&2
+      cat "$LOG_DIR/feeds.log" >&2 || true
+      exit 1
+    fi
+    if curl -sf http://127.0.0.1:9003/products/BTC-USD/ticker >/dev/null 2>&1; then
+      READY=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [[ "$READY" -ne 1 ]]; then
+    echo "error: mock_feeds.py did not become ready on :9001..:9003:" >&2
+    cat "$LOG_DIR/feeds.log" >&2 || true
+    exit 1
+  fi
+else
+  FEEDS_MODE="live"
+  echo "Starting Caddy live-feed TLS proxy on :9001..:9003..."
+  caddy run --config "$SHARE_DIR/infra/Caddyfile" --adapter caddyfile >"$LOG_DIR/feeds.log" 2>&1 &
+  FEEDS_PID=$!
+  READY=0
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$FEEDS_PID" 2>/dev/null; then
+      echo "error: caddy exited unexpectedly:" >&2
+      cat "$LOG_DIR/feeds.log" >&2 || true
+      exit 1
+    fi
+    if node -e '
+      const net = require("node:net");
+      Promise.all([9001, 9002, 9003].map((port) => new Promise((res, rej) => {
+        const s = net.createConnection({ host: "127.0.0.1", port }, () => { s.destroy(); res(); });
+        s.on("error", rej);
+      }))).then(() => process.exit(0)).catch(() => process.exit(1));
+    ' 2>/dev/null; then
+      READY=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [[ "$READY" -ne 1 ]]; then
+    echo "error: Caddy proxy did not become ready on :9001..:9003:" >&2
+    cat "$LOG_DIR/feeds.log" >&2 || true
+    exit 1
+  fi
+fi
 
 "$BIN_DIR/feracle" \
   --node-id 0 --p2p-backend "$BACKEND" --p2p-port 7001 --telemetry-port 9101 \
   --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
   --privkey-hex "$PK0" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
-  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 15 \
+  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 25 \
   >"$LOG_DIR/node0.log" 2>&1 &
 PID0=$!
 
@@ -330,7 +378,7 @@ sleep 0.3
   --bootstrap "/ip4/127.0.0.1/tcp/7001" \
   --sources "binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
   --privkey-hex "$PK1" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
-  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 15 \
+  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 25 \
   >"$LOG_DIR/node1.log" 2>&1 &
 PID1=$!
 
@@ -339,12 +387,12 @@ PID1=$!
   --bootstrap "/ip4/127.0.0.1/tcp/7001,/ip4/127.0.0.1/tcp/7002" \
   --sources "hyperliquid=127.0.0.1:9001,coinbase=127.0.0.1:9003" \
   --privkey-hex "$PK2" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
-  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 15 \
+  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 25 \
   >"$LOG_DIR/node2.log" 2>&1 &
 PID2=$!
 NODE_PIDS=("$PID0" "$PID1" "$PID2")
 
-echo "Launching Feracle WASM telemetry TUI (backend=$BACKEND, metrics http://127.0.0.1:$METRICS_PORT/metrics). Press Ctrl-C to stop."
+echo "Launching Feracle WASM telemetry TUI (feeds=$FEEDS_MODE, backend=$BACKEND, metrics http://127.0.0.1:$METRICS_PORT/metrics). Press Ctrl-C to stop."
 "$BIN_DIR/feracle-telemetry" \
   --rpc-url "$RPC_URL" \
   --contract "$CONTRACT_ADDR" \
@@ -360,6 +408,8 @@ stage_from_source() {
   local src_dir="$1"
   local stage_dir="$2"
 
+  # shellcheck disable=SC1091
+  source "$src_dir/scripts/ensure-deps.sh"
   ensure_fe
   ensure_cargo
 
@@ -373,7 +423,8 @@ stage_from_source() {
     "$stage_dir/share/feracle/out" \
     "$stage_dir/share/feracle/ingots/evm/out" \
     "$stage_dir/share/feracle/telemetry" \
-    "$stage_dir/share/feracle/infra"
+    "$stage_dir/share/feracle/infra" \
+    "$stage_dir/share/feracle/scripts"
 
   cp "$src_dir/out/feracle" "$stage_dir/bin/feracle"
   chmod +x "$stage_dir/bin/feracle"
@@ -385,6 +436,8 @@ stage_from_source() {
   cp "$src_dir/telemetry/host.mjs" "$stage_dir/share/feracle/telemetry/"
   cp "$src_dir/infra/mock_feeds.py" "$stage_dir/share/feracle/infra/"
   cp "$src_dir/infra/Caddyfile" "$stage_dir/share/feracle/infra/"
+  cp "$src_dir/scripts/ensure-deps.sh" "$stage_dir/share/feracle/scripts/"
+  chmod +x "$stage_dir/share/feracle/scripts/ensure-deps.sh"
 
   write_wrappers "$stage_dir"
 }
@@ -397,6 +450,9 @@ install_stage_dir() {
   cp -R "$stage_dir/bin/." "$prefix/bin/"
   cp -R "$stage_dir/share/feracle/." "$prefix/share/feracle/"
   chmod +x "$prefix/bin/feracle" "$prefix/bin/feracle-telemetry" "$prefix/bin/feracle-demo"
+  if [[ -f "$prefix/share/feracle/scripts/ensure-deps.sh" ]]; then
+    chmod +x "$prefix/share/feracle/scripts/ensure-deps.sh"
+  fi
 }
 
 extract_and_install_archive() {
@@ -428,8 +484,6 @@ try_download_release() {
 }
 
 main() {
-  maybe_install_foundry
-
   local work_tmp
   work_tmp="$(mktemp -d)"
   trap 'rm -rf "${work_tmp:-}"' EXIT
@@ -481,6 +535,19 @@ main() {
     fi
   fi
 
+  if [[ -f "$PREFIX/share/feracle/scripts/ensure-deps.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$PREFIX/share/feracle/scripts/ensure-deps.sh"
+    feracle_init_paths
+    if [[ "$INSTALL_DEPS" -eq 1 || "$INSTALL_FOUNDRY" -eq 1 ]]; then
+      ensure_foundry
+      if [[ "$INSTALL_DEPS" -eq 1 ]]; then
+        ensure_node
+        ensure_caddy
+      fi
+    fi
+  fi
+
   echo ""
   echo "Installed Feracle to $PREFIX:"
   echo "  - $PREFIX/bin/feracle"
@@ -490,12 +557,14 @@ main() {
   echo ""
   echo "Smoke check:"
   "$PREFIX/bin/feracle" --version
-  if command -v node >/dev/null 2>&1; then
+  if declare -F feracle_has_node20 >/dev/null 2>&1 && feracle_has_node20; then
     "$PREFIX/bin/feracle-telemetry" --help >/dev/null
     echo "feracle-telemetry OK"
   else
-    echo "note: install Node.js (>= 20) to run feracle-telemetry"
+    echo "note: feracle-telemetry and feracle-demo will auto-install missing dependencies on first run (or pass --install-deps)"
   fi
+  "$PREFIX/bin/feracle-demo" --help >/dev/null
+  echo "feracle-demo OK"
   echo ""
   case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
@@ -508,7 +577,8 @@ main() {
   echo "Try it out:"
   echo "  feracle                         # show node CLI help"
   echo "  feracle-telemetry --help        # inspect WASM telemetry host options"
-  echo "  feracle-demo                    # launch local Anvil + 3 nodes + telemetry TUI"
+  echo "  feracle-demo                    # launch local Anvil + 3 nodes + live feeds + TUI"
+  echo "  feracle-demo --mock-feeds       # run offline with deterministic mock feeds"
 }
 
 main

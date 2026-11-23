@@ -1,20 +1,21 @@
 {
 	auto_https off
+	admin off
 }
 
-:9001 {
+http://127.0.0.1:9001 {
 	reverse_proxy https://api.hyperliquid.xyz {
 		header_up Host api.hyperliquid.xyz
 	}
 }
 
-:9002 {
-	reverse_proxy https://api.binance.com {
-		header_up Host api.binance.com
+http://127.0.0.1:9002 {
+	reverse_proxy https://data-api.binance.vision {
+		header_up Host data-api.binance.vision
 	}
 }
 
-:9003 {
+http://127.0.0.1:9003 {
 	reverse_proxy https://api.exchange.coinbase.com {
 		header_up Host api.exchange.coinbase.com
 	}
