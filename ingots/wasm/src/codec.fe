@@ -169,7 +169,7 @@ fn append_eth_call_item<D: Display>(
 
 pub fn build_rpc_batch_into(
     target_addr: MemSpan,
-    oracle_addrs: [FixedStr<48>; 3],
+    oracle_addrs: [FixedStr<48>; 4],
     oracle_count: usize,
     _ out: mut MemBuffer,
 ) {
@@ -192,7 +192,7 @@ pub fn build_rpc_batch_into(
     append_eth_call_item(id: 6, target_addr, data_hex: SEL_OWNER, mut out)
 
     var i: usize = 0
-    while i < oracle_count && i < 3 {
+    while i < oracle_count && i < 4 {
         var addr_buf = MemBuffer::empty()
         oracle_addrs[i].write_to(mut addr_buf)
         let trim_addr = addr_buf.span().trim()

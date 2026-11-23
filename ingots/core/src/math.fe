@@ -26,6 +26,60 @@ pub fn median_prices_3(_ a: [u64; 20], _ b: [u64; 20], _ c: [u64; 20]) -> [u64; 
     out
 }
 
+pub fn median_of_four(_ a: u64, _ b: u64, _ c: u64, _ d: u64) -> u64 {
+    var x0 = a
+    var x1 = b
+    var x2 = c
+    var x3 = d
+    if x0 > x1 {
+        let t = x0
+        x0 = x1
+        x1 = t
+    }
+    if x2 > x3 {
+        let t = x2
+        x2 = x3
+        x3 = t
+    }
+    if x0 > x2 {
+        let t = x0
+        x0 = x2
+        x2 = t
+    }
+    if x1 > x3 {
+        let t = x1
+        x1 = x3
+        x3 = t
+    }
+    if x1 > x2 {
+        let t = x1
+        x1 = x2
+        x2 = t
+    }
+    let _ = x0
+    let _ = x3
+    x1 + ((x2 - x1) / 2)
+}
+
+pub fn median_u64_4(_ values: [u64; 4]) -> u64 {
+    median_of_four(values[0], values[1], values[2], values[3])
+}
+
+pub fn median_prices_4(
+    _ a: [u64; 20],
+    _ b: [u64; 20],
+    _ c: [u64; 20],
+    _ d: [u64; 20],
+) -> [u64; 20] {
+    var out: [u64; 20] = [0; 20]
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        out[i] = median_of_four(a[i], b[i], c[i], d[i])
+        i += 1
+    }
+    out
+}
+
 pub fn prices_eq(_ a: [u64; 20], _ b: [u64; 20]) -> bool {
     var i: usize = 0
     while i < ASSET_COUNT {

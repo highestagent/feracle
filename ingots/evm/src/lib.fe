@@ -1,3 +1,4 @@
+use core::num::IntDowncast
 use std::abi::sol
 use std::evm::{Address, Ctx, Log, StorageMap, crypto, revert_error}
 pub use feracle_core::{ASSET_COUNT, QUORUM}
@@ -29,6 +30,15 @@ pub struct InvalidAsset {}
 #[error]
 pub struct PriceOverflow {}
 
+#[error]
+pub struct ZeroAddress {}
+
+#[error]
+pub struct Paused {}
+
+#[error]
+pub struct NotPaused {}
+
 const MAX_PRICE_U64: u256 = 0xffffffffffffffff
 const SECP256K1_N_HALF: u256 = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0
 
@@ -42,6 +52,34 @@ pub struct OracleAdded {
 pub struct OracleRemoved {
     #[indexed]
     pub node: Address,
+}
+
+#[event]
+pub struct OwnershipTransferStarted {
+    #[indexed]
+    pub previous_owner: Address,
+    #[indexed]
+    pub new_owner: Address,
+}
+
+#[event]
+pub struct OwnershipTransferred {
+    #[indexed]
+    pub previous_owner: Address,
+    #[indexed]
+    pub new_owner: Address,
+}
+
+#[event]
+pub struct OraclePaused {
+    #[indexed]
+    pub account: Address,
+}
+
+#[event]
+pub struct OracleUnpaused {
+    #[indexed]
+    pub account: Address,
 }
 
 #[event]
@@ -62,6 +100,14 @@ pub msg OracleMsg {
     AddOracle { node: Address },
     #[selector = sol("removeOracle(address)")]
     RemoveOracle { node: Address },
+    #[selector = sol("transferOwnership(address)")]
+    TransferOwnership { new_owner: Address },
+    #[selector = sol("acceptOwnership()")]
+    AcceptOwnership,
+    #[selector = sol("pause()")]
+    Pause,
+    #[selector = sol("unpause()")]
+    Unpause,
     #[selector = sol(
         "submitMedians(uint256,uint256[20],uint256,(uint8,uint256,uint256)[3])",
     )]
@@ -70,6 +116,10 @@ pub msg OracleMsg {
     LatestPrice { asset_id: u256 } -> (u256, u256),
     #[selector = sol("latestPrices()")]
     LatestPrices -> ([u256; 20], u256),
+    #[selector = sol("latestRoundData()")]
+    LatestRoundData -> (u256, i256, u256, u256, u256),
+    #[selector = sol("decimals()")]
+    Decimals -> u8,
     #[selector = sol("assetCount()")]
     AssetCount -> u256,
     #[selector = sol("currentRound()")]
@@ -78,14 +128,26 @@ pub msg OracleMsg {
     IsOracle { node: Address } -> bool,
     #[selector = sol("owner()")]
     Owner -> Address,
+    #[selector = sol("pendingOwner()")]
+    PendingOwner -> Address,
+    #[selector = sol("paused()")]
+    IsPaused -> bool,
 }
 
 struct OracleStore {
     owner: Address,
+    pending_owner: Address,
+    paused: bool,
     is_oracle: StorageMap<Address, bool>,
     current_round: u256,
     latest_prices: StorageMap<u256, u256>,
     last_updated: u256,
+}
+
+fn require_owner(_ owner: Address) uses (ctx: Ctx) {
+    if ctx.caller() != owner {
+        revert_error(Unauthorized {})
+    }
 }
 
 pub contract OffchainMedianOracle uses (ctx: Ctx, log: mut Log) {
@@ -95,30 +157,74 @@ pub contract OffchainMedianOracle uses (ctx: Ctx, log: mut Log) {
     uses (ctx, mut store)
     {
         store.owner = ctx.caller()
+        store.pending_owner = Address::zero()
+        store.paused = false
         store.current_round = 1
         store.last_updated = 0
     }
 
     recv OracleMsg {
         AddOracle { node } uses (ctx, mut store, mut log) {
-            if ctx.caller() != store.owner {
-                revert_error(Unauthorized {})
+            require_owner(store.owner)
+            if node == Address::zero() {
+                revert_error(ZeroAddress {})
             }
             store.is_oracle.set(key: node, value: true)
             log.emit(OracleAdded { node })
         }
 
         RemoveOracle { node } uses (ctx, mut store, mut log) {
-            if ctx.caller() != store.owner {
-                revert_error(Unauthorized {})
-            }
+            require_owner(store.owner)
             store.is_oracle.set(key: node, value: false)
             log.emit(OracleRemoved { node })
+        }
+
+        TransferOwnership { new_owner } uses (ctx, mut store, mut log) {
+            require_owner(store.owner)
+            if new_owner == Address::zero() {
+                revert_error(ZeroAddress {})
+            }
+            store.pending_owner = new_owner
+            log.emit(
+                OwnershipTransferStarted { previous_owner: store.owner, new_owner },
+            )
+        }
+
+        AcceptOwnership uses (ctx, mut store, mut log) {
+            if store.pending_owner == Address::zero() || ctx.caller() != store.pending_owner {
+                revert_error(Unauthorized {})
+            }
+            let previous_owner = store.owner
+            let new_owner = store.pending_owner
+            store.owner = new_owner
+            store.pending_owner = Address::zero()
+            log.emit(OwnershipTransferred { previous_owner, new_owner })
+        }
+
+        Pause uses (ctx, mut store, mut log) {
+            require_owner(store.owner)
+            if store.paused {
+                revert_error(Paused {})
+            }
+            store.paused = true
+            log.emit(OraclePaused { account: ctx.caller() })
+        }
+
+        Unpause uses (ctx, mut store, mut log) {
+            require_owner(store.owner)
+            if !store.paused {
+                revert_error(NotPaused {})
+            }
+            store.paused = false
+            log.emit(OracleUnpaused { account: ctx.caller() })
         }
 
         SubmitMedians { round_id, prices, timestamp, sigs }
         uses (ctx, mut store, mut log)
         {
+            if store.paused {
+                revert_error(Paused {})
+            }
             if round_id != store.current_round {
                 revert_error(InvalidRound {})
             }
@@ -213,6 +319,23 @@ pub contract OffchainMedianOracle uses (ctx: Ctx, log: mut Log) {
             (out, store.last_updated)
         }
 
+        LatestRoundData -> (u256, i256, u256, u256, u256)
+        uses (store)
+        {
+            let settled_round: u256 = if store.current_round > 1 {
+                store.current_round - 1
+            } else {
+                0
+            }
+            let btc_price = store.latest_prices.get(0) & MAX_PRICE_U64
+            let updated_at = store.last_updated
+            (settled_round, btc_price.downcast_unchecked(), updated_at, updated_at, settled_round)
+        }
+
+        Decimals -> u8 {
+            8
+        }
+
         AssetCount -> u256 {
             ASSET_COUNT as u256
         }
@@ -227,6 +350,14 @@ pub contract OffchainMedianOracle uses (ctx: Ctx, log: mut Log) {
 
         Owner -> Address uses (store) {
             store.owner
+        }
+
+        PendingOwner -> Address uses (store) {
+            store.pending_owner
+        }
+
+        IsPaused -> bool uses (store) {
+            store.paused
         }
     }
 }

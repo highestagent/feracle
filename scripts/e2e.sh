@@ -21,6 +21,8 @@ ADDR1="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 PK1="0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 ADDR2="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
 PK2="0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+ADDR3="0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+PK3="0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
 
 LOG_DIR="$(mktemp -d)"
 ANVIL_PID=""
@@ -58,11 +60,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[1/7] Building evm and feracle..."
+echo "[1/8] Building evm and feracle..."
 fe build --emit abi,bytecode --out-dir "$ROOT_DIR/ingots/evm/out" "$ROOT_DIR/ingots/evm"
 "$ROOT_DIR/scripts/build-feracle.sh"
 
-echo "[2/7] Starting Anvil on port 8545 (chainId=$CHAIN_ID)..."
+echo "[2/8] Starting Anvil on port 8545 (chainId=$CHAIN_ID)..."
 anvil --port 8545 --chain-id "$CHAIN_ID" >"$LOG_DIR/anvil.log" 2>&1 &
 ANVIL_PID=$!
 
@@ -74,7 +76,7 @@ for _ in $(seq 1 50); do
 done
 cast block-number --rpc-url "$RPC_URL" >/dev/null
 
-echo "[3/7] Deploying OffchainMedianOracle and registering 3 oracles..."
+echo "[3/8] Deploying OffchainMedianOracle and registering 4 oracles..."
 BYTECODE="0x$(tr -d '\r\n' < "$ROOT_DIR/ingots/evm/out/OffchainMedianOracle.bin")"
 DEPLOY_JSON="$(cast send --rpc-url "$RPC_URL" --private-key "$PK0" --json --create "$BYTECODE")"
 CONTRACT_ADDR="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["contractAddress"])' <<<"$DEPLOY_JSON")"
@@ -83,8 +85,9 @@ echo "Deployed OffchainMedianOracle at $CONTRACT_ADDR"
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR0" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR1" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR2" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
+cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR3" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 
-echo "[4/7] Starting mock feeds on ports 9001, 9002, 9003..."
+echo "[4/8] Starting mock feeds on ports 9001, 9002, 9003..."
 python3 "$ROOT_DIR/infra/mock_feeds.py" >"$LOG_DIR/feeds.log" 2>&1 &
 FEEDS_PID=$!
 
@@ -99,7 +102,7 @@ curl -sf "http://127.0.0.1:9002/api/v3/ticker/price?symbol=BTCUSDT" >/dev/null
 curl -sf http://127.0.0.1:9003/products/BTC-USD/ticker >/dev/null
 curl -sf http://127.0.0.1:9003/products/AAVE-USD/ticker >/dev/null
 
-echo "[5/7] Running Rounds 1 & 2 across 3 native Fe oracle nodes (Top-20 basket, backend=$P2P_BACKEND)..."
+echo "[5/8] Running Rounds 1 & 2 across 4 native Fe oracle nodes (3-of-4 quorum, Top-20 basket, backend=$P2P_BACKEND)..."
 "$ROOT_DIR/out/feracle" \
   --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7001 \
   --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
@@ -127,13 +130,23 @@ PID1=$!
   >"$LOG_DIR/node2_r12.log" 2>&1 &
 PID2=$!
 
-NODE_PIDS=("$PID0" "$PID1" "$PID2")
+"$ROOT_DIR/out/feracle" \
+  --node-id 3 --p2p-backend "$P2P_BACKEND" --p2p-port 7004 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7001,/ip4/127.0.0.1/tcp/7002,/ip4/127.0.0.1/tcp/7003" \
+  --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK3" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 2 --round-timeout-secs 15 \
+  >"$LOG_DIR/node3_r12.log" 2>&1 &
+PID3=$!
+
+NODE_PIDS=("$PID0" "$PID1" "$PID2" "$PID3")
 wait "$PID0"
 wait "$PID1"
 wait "$PID2"
+wait "$PID3"
 NODE_PIDS=()
 
-echo "[6/7] Asserting on-chain Top-20 prices and single-tx-per-round leader rotation..."
+echo "[6/8] Asserting on-chain Top-20 prices and single-tx-per-round leader rotation..."
 ASSET_COUNT_VAL="$(cast call "$CONTRACT_ADDR" "assetCount()(uint256)" --rpc-url "$RPC_URL" | awk '{print $1}')"
 CUR_ROUND="$(cast call "$CONTRACT_ADDR" "currentRound()(uint256)" --rpc-url "$RPC_URL" | awk '{print $1}')"
 BTC_RAW="$(cast call "$CONTRACT_ADDR" "latestPrice(uint256)(uint256,uint256)" 0 --rpc-url "$RPC_URL")"
@@ -164,7 +177,7 @@ prices = [int(raw[i * 64:(i + 1) * 64], 16) for i in range(20)]
 last_updated = int(raw[20 * 64:21 * 64], 16)
 
 assert all(p > 0 for p in prices), f"found zero price in {prices}"
-assert 9244800000000 <= prices[0] <= 9245500000000, f"BTC price out of range: {prices[0]}"
+assert prices[0] == 9245100000000, f"expected 4-node BTC median 9245100000000, got {prices[0]}"
 assert 341980000000 <= prices[1] <= 342210000000, f"ETH price out of range: {prices[1]}"
 assert 31820000000 <= prices[19] <= 31890000000, f"AAVE price out of range: {prices[19]}"
 assert last_updated > 0
@@ -187,12 +200,77 @@ assert len(submit_txs) == 2, f"expected 2 submitMedians txs, got {len(submit_txs
 assert submit_txs[0]["from"].lower() == addr1.lower(), f"round 1 leader mismatch: {submit_txs[0]['from']}"
 assert submit_txs[1]["from"].lower() == addr2.lower(), f"round 2 leader mismatch: {submit_txs[1]['from']}"
 print(
-    f"Verified Rounds 1 & 2 (20 assets): currentRound=3, btc={prices[0]}, eth={prices[1]}, "
+    f"Verified Rounds 1 & 2 (4-of-4, 20 assets): currentRound=3, btc={prices[0]}, eth={prices[1]}, "
     f"aave={prices[19]}, submit_txs=2 (leaders: {addr1}, {addr2})"
 )
 PY
 
-echo "[7/7] Testing outlier fault tolerance (Round 3A tolerance guard + Round 3B 3-source median immunity)..."
+echo "[7/8] Testing 3-of-4 liveness fault tolerance (Round 3 with offline primary leader Node 3 -> failover to Node 0)..."
+"$ROOT_DIR/out/feracle" \
+  --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7051 \
+  --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
+  --privkey-hex "$PK0" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 6 \
+  >"$LOG_DIR/node0_r3_liveness.log" 2>&1 &
+PID0=$!
+
+sleep 0.3
+"$ROOT_DIR/out/feracle" \
+  --node-id 1 --p2p-backend "$P2P_BACKEND" --p2p-port 7052 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7051" \
+  --sources "binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK1" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 6 \
+  >"$LOG_DIR/node1_r3_liveness.log" 2>&1 &
+PID1=$!
+
+"$ROOT_DIR/out/feracle" \
+  --node-id 2 --p2p-backend "$P2P_BACKEND" --p2p-port 7053 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7051,/ip4/127.0.0.1/tcp/7052" \
+  --sources "hyperliquid=127.0.0.1:9001,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK2" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 6 \
+  >"$LOG_DIR/node2_r3_liveness.log" 2>&1 &
+PID2=$!
+
+NODE_PIDS=("$PID0" "$PID1" "$PID2")
+wait "$PID0"
+wait "$PID1"
+wait "$PID2"
+NODE_PIDS=()
+
+CUR_ROUND_3="$(cast call "$CONTRACT_ADDR" "currentRound()(uint256)" --rpc-url "$RPC_URL" | awk '{print $1}')"
+BTC_RAW_3="$(cast call "$CONTRACT_ADDR" "latestPrice(uint256)(uint256,uint256)" 0 --rpc-url "$RPC_URL")"
+python3 - "$RPC_URL" "$CONTRACT_ADDR" "$CUR_ROUND_3" "$BTC_RAW_3" "$ADDR0" <<'PY'
+import json, sys, urllib.request
+rpc_url, contract, cur_round, btc_raw, addr0 = sys.argv[1:]
+assert int(cur_round) == 4, f"Round 3 liveness expected currentRound=4, got {cur_round}"
+price = int([l.strip().split()[0] for l in btc_raw.strip().splitlines() if l.strip()][0])
+assert price == 9245150000000, f"Round 3 expected 3-of-4 BTC median 9245150000000, got {price}"
+
+def rpc(method, params):
+    req = urllib.request.Request(
+        rpc_url,
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode())["result"]
+
+tip = int(rpc("eth_blockNumber", []), 16)
+submit_txs = [
+    tx
+    for b in range(1, tip + 1)
+    for tx in rpc("eth_getBlockByNumber", [hex(b), True])["transactions"]
+    if (tx.get("to") or "").lower() == contract.lower()
+    and tx.get("input", "").lower().startswith("0x6d2b8b3f")
+]
+assert len(submit_txs) == 3, f"Round 3 expected submit_txs=3, got {len(submit_txs)}"
+assert submit_txs[2]["from"].lower() == addr0.lower(), f"Round 3 backup leader mismatch: {submit_txs[2]['from']}"
+print(f"Verified Round 3 (3-of-4 Liveness + Leader Failover): currentRound=4, btc={price}, submit_txs=3 (failover: {addr0})")
+PY
+
+echo "[8/8] Testing outlier fault tolerance (Round 4A tolerance guard + Round 4B 3-source median immunity)..."
 kill "$FEEDS_PID"
 wait "$FEEDS_PID" 2>/dev/null || true
 FEEDS_PID=""
@@ -206,13 +284,13 @@ for _ in $(seq 1 30); do
   sleep 0.1
 done
 
-# 3A: 2-source configs cause tolerance guard breach on Node 0 (no on-chain write)
+# 4A: 2-source configs cause tolerance guard breach on Node 0 & Node 3 (no on-chain write)
 "$ROOT_DIR/out/feracle" \
   --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7101 \
   --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002" \
   --privkey-hex "$PK0" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
   --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 6 \
-  >"$LOG_DIR/node0_r3a.log" 2>&1 &
+  >"$LOG_DIR/node0_r4a.log" 2>&1 &
 PID0=$!
 
 sleep 0.3
@@ -222,7 +300,7 @@ sleep 0.3
   --sources "binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
   --privkey-hex "$PK1" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
   --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 6 \
-  >"$LOG_DIR/node1_r3a.log" 2>&1 &
+  >"$LOG_DIR/node1_r4a.log" 2>&1 &
 PID1=$!
 
 "$ROOT_DIR/out/feracle" \
@@ -231,24 +309,34 @@ PID1=$!
   --sources "hyperliquid=127.0.0.1:9001,coinbase=127.0.0.1:9003" \
   --privkey-hex "$PK2" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
   --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 6 \
-  >"$LOG_DIR/node2_r3a.log" 2>&1 &
+  >"$LOG_DIR/node2_r4a.log" 2>&1 &
 PID2=$!
 
-NODE_PIDS=("$PID0" "$PID1" "$PID2")
+"$ROOT_DIR/out/feracle" \
+  --node-id 3 --p2p-backend "$P2P_BACKEND" --p2p-port 7104 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7101,/ip4/127.0.0.1/tcp/7102,/ip4/127.0.0.1/tcp/7103" \
+  --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK3" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 6 \
+  >"$LOG_DIR/node3_r4a.log" 2>&1 &
+PID3=$!
+
+NODE_PIDS=("$PID0" "$PID1" "$PID2" "$PID3")
 wait "$PID0"
 wait "$PID1"
 wait "$PID2"
+wait "$PID3"
 NODE_PIDS=()
 
-grep -q "tolerance guard breached on BTC" "$LOG_DIR/node0_r3a.log"
-CUR_ROUND_3A="$(cast call "$CONTRACT_ADDR" "currentRound()(uint256)" --rpc-url "$RPC_URL" | awk '{print $1}')"
-BTC_RAW_3A="$(cast call "$CONTRACT_ADDR" "latestPrice(uint256)(uint256,uint256)" 0 --rpc-url "$RPC_URL")"
-python3 - "$RPC_URL" "$CONTRACT_ADDR" "$CUR_ROUND_3A" "$BTC_RAW_3A" <<'PY'
+grep -q "tolerance guard breached on BTC" "$LOG_DIR/node0_r4a.log"
+CUR_ROUND_4A="$(cast call "$CONTRACT_ADDR" "currentRound()(uint256)" --rpc-url "$RPC_URL" | awk '{print $1}')"
+BTC_RAW_4A="$(cast call "$CONTRACT_ADDR" "latestPrice(uint256)(uint256,uint256)" 0 --rpc-url "$RPC_URL")"
+python3 - "$RPC_URL" "$CONTRACT_ADDR" "$CUR_ROUND_4A" "$BTC_RAW_4A" <<'PY'
 import json, sys, urllib.request
 rpc_url, contract, cur_round, btc_raw = sys.argv[1:]
-assert int(cur_round) == 3, f"3A expected currentRound=3, got {cur_round}"
+assert int(cur_round) == 4, f"4A expected currentRound=4, got {cur_round}"
 price = int([l.strip().split()[0] for l in btc_raw.strip().splitlines() if l.strip()][0])
-assert 9244800000000 <= price <= 9245500000000, f"3A outlier leaked on-chain: {price}"
+assert price == 9245150000000, f"4A outlier leaked on-chain: {price}"
 assert price != 99999900000000
 
 def rpc(method, params):
@@ -268,18 +356,18 @@ count = sum(
     if (tx.get("to") or "").lower() == contract.lower()
     and tx.get("input", "").lower().startswith("0x6d2b8b3f")
 )
-assert count == 2, f"3A expected submit_txs=2, got {count}"
-print(f"Verified Round 3A (Tolerance Guard): BTC outlier rejected, currentRound=3, btc={price}, submit_txs=2")
+assert count == 3, f"4A expected submit_txs=3, got {count}"
+print(f"Verified Round 4A (Tolerance Guard): BTC outlier rejected, currentRound=4, btc={price}, submit_txs=3")
 PY
 
-# 3B: 3-source median immunity against outlier on 9003 (leader for round 3 is 3 % 3 = Node 0)
+# 4B: 3-source median immunity against outlier on 9003 (leader for round 4 is 4 % 4 = Node 0)
 ALL_SOURCES="hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002,coinbase=127.0.0.1:9003"
 "$ROOT_DIR/out/feracle" \
   --node-id 0 --p2p-backend "$P2P_BACKEND" --p2p-port 7201 \
   --sources "$ALL_SOURCES" \
   --privkey-hex "$PK0" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
   --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 15 \
-  >"$LOG_DIR/node0_r3b.log" 2>&1 &
+  >"$LOG_DIR/node0_r4b.log" 2>&1 &
 PID0=$!
 
 sleep 0.3
@@ -289,7 +377,7 @@ sleep 0.3
   --sources "$ALL_SOURCES" \
   --privkey-hex "$PK1" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
   --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 15 \
-  >"$LOG_DIR/node1_r3b.log" 2>&1 &
+  >"$LOG_DIR/node1_r4b.log" 2>&1 &
 PID1=$!
 
 "$ROOT_DIR/out/feracle" \
@@ -298,23 +386,39 @@ PID1=$!
   --sources "$ALL_SOURCES" \
   --privkey-hex "$PK2" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
   --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 15 \
-  >"$LOG_DIR/node2_r3b.log" 2>&1 &
+  >"$LOG_DIR/node2_r4b.log" 2>&1 &
 PID2=$!
 
-NODE_PIDS=("$PID0" "$PID1" "$PID2")
+"$ROOT_DIR/out/feracle" \
+  --node-id 3 --p2p-backend "$P2P_BACKEND" --p2p-port 7204 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7201,/ip4/127.0.0.1/tcp/7202,/ip4/127.0.0.1/tcp/7203" \
+  --sources "$ALL_SOURCES" \
+  --privkey-hex "$PK3" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 1 --round-timeout-secs 15 \
+  >"$LOG_DIR/node3_r4b.log" 2>&1 &
+PID3=$!
+
+NODE_PIDS=("$PID0" "$PID1" "$PID2" "$PID3")
 wait "$PID0"
 wait "$PID1"
 wait "$PID2"
+wait "$PID3"
 NODE_PIDS=()
 
-CUR_ROUND_3B="$(cast call "$CONTRACT_ADDR" "currentRound()(uint256)" --rpc-url "$RPC_URL" | awk '{print $1}')"
-BTC_RAW_3B="$(cast call "$CONTRACT_ADDR" "latestPrice(uint256)(uint256,uint256)" 0 --rpc-url "$RPC_URL")"
-python3 - "$RPC_URL" "$CONTRACT_ADDR" "$CUR_ROUND_3B" "$BTC_RAW_3B" "$ADDR0" <<'PY'
+CUR_ROUND_4B="$(cast call "$CONTRACT_ADDR" "currentRound()(uint256)" --rpc-url "$RPC_URL" | awk '{print $1}')"
+BTC_RAW_4B="$(cast call "$CONTRACT_ADDR" "latestPrice(uint256)(uint256,uint256)" 0 --rpc-url "$RPC_URL")"
+DECIMALS_VAL="$(cast call "$CONTRACT_ADDR" "decimals()(uint8)" --rpc-url "$RPC_URL" | awk '{print $1}')"
+LRD_RAW="$(cast call "$CONTRACT_ADDR" "latestRoundData()(uint80,int256,uint256,uint256,uint80)" --rpc-url "$RPC_URL")"
+python3 - "$RPC_URL" "$CONTRACT_ADDR" "$CUR_ROUND_4B" "$BTC_RAW_4B" "$DECIMALS_VAL" "$LRD_RAW" "$ADDR0" <<'PY'
 import json, sys, urllib.request
-rpc_url, contract, cur_round, btc_raw, addr0 = sys.argv[1:]
-assert int(cur_round) == 4, f"3B expected currentRound=4, got {cur_round}"
+rpc_url, contract, cur_round, btc_raw, decimals_val, lrd_raw, addr0 = sys.argv[1:]
+assert int(cur_round) == 5, f"4B expected currentRound=5, got {cur_round}"
+assert int(decimals_val) == 8, f"expected decimals=8, got {decimals_val}"
 price = int([l.strip().split()[0] for l in btc_raw.strip().splitlines() if l.strip()][0])
-assert price == 9245500000000, f"3B expected exact BTC median 9245500000000, got {price}"
+assert price == 9245500000000, f"4B expected exact BTC median 9245500000000, got {price}"
+lrd_parts = [int(l.strip().split()[0]) for l in lrd_raw.strip().splitlines() if l.strip()]
+assert len(lrd_parts) == 5, f"expected 5 latestRoundData fields, got {lrd_parts}"
+assert lrd_parts[0] == 4 and lrd_parts[1] == price and lrd_parts[2] > 0 and lrd_parts[3] == lrd_parts[2] and lrd_parts[4] == 4, lrd_parts
 
 def rpc(method, params):
     req = urllib.request.Request(
@@ -333,9 +437,12 @@ submit_txs = [
     if (tx.get("to") or "").lower() == contract.lower()
     and tx.get("input", "").lower().startswith("0x6d2b8b3f")
 ]
-assert len(submit_txs) == 3, f"3B expected submit_txs=3, got {len(submit_txs)}"
-assert submit_txs[2]["from"].lower() == addr0.lower(), f"round 3 leader mismatch: {submit_txs[2]['from']}"
-print(f"Verified Round 3B (3-Source Outlier Immunity): currentRound=4, btc={price}, submit_txs=3 (leader: {addr0})")
+assert len(submit_txs) == 4, f"4B expected submit_txs=4, got {len(submit_txs)}"
+assert submit_txs[3]["from"].lower() == addr0.lower(), f"round 4 leader mismatch: {submit_txs[3]['from']}"
+print(
+    f"Verified Round 4B (3-Source Outlier Immunity + Chainlink View): currentRound=5, "
+    f"decimals=8, latestRoundData={lrd_parts}, submit_txs=4 (leader: {addr0})"
+)
 PY
 
 echo "ALL E2E CHECKS PASSED!"

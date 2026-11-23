@@ -11,6 +11,10 @@ pub const SEL_ASSET_COUNT: String<10> = "0xeafe7a74"
 pub const SEL_CURRENT_ROUND: String<10> = "0x8a19c8bc"
 pub const SEL_OWNER: String<10> = "0x8da5cb5b"
 pub const SEL_IS_ORACLE: String<10> = "0xa97e5c93"
+pub const SEL_PENDING_OWNER: String<10> = "0xe30c3978"
+pub const SEL_PAUSED: String<10> = "0x5c975abb"
+pub const SEL_DECIMALS: String<10> = "0x313ce567"
+pub const SEL_LATEST_ROUND_DATA: String<10> = "0xfeaf968c"
 
 pub fn parse_abi_word_u64(_ hex_no_0x: MemSpan, word_idx: usize) -> Option<u64> {
     let start = word_idx * 64

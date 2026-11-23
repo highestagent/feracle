@@ -10,7 +10,7 @@ USE_MOCK_FEEDS=0
 
 usage() {
   cat <<'EOF'
-Build from source and launch a local 3-node Feracle devnet (Anvil + live feeds or --mock-feeds + WASM telemetry TUI)
+Build from source and launch a local 4-node Feracle devnet (Anvil + live feeds or --mock-feeds + WASM telemetry TUI)
 
 Usage: dev-telemetry.sh [OPTIONS]
 
@@ -86,6 +86,8 @@ ADDR1="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 PK1="0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 ADDR2="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
 PK2="0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+ADDR3="0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+PK3="0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
 
 LOG_DIR="$(mktemp -d)"
 ANVIL_PID=""
@@ -142,6 +144,7 @@ CONTRACT_ADDR="$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.read
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR0" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR1" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR2" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
+cast send "$CONTRACT_ADDR" "addOracle(address)" "$ADDR3" --rpc-url "$RPC_URL" --private-key "$PK0" >/dev/null
 
 if [[ "$USE_MOCK_FEEDS" -eq 1 ]]; then
   FEEDS_MODE="mock"
@@ -223,13 +226,22 @@ PID1=$!
   --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 25 \
   >"$LOG_DIR/node2.log" 2>&1 &
 PID2=$!
-NODE_PIDS=("$PID0" "$PID1" "$PID2")
+
+"$ROOT_DIR/out/feracle" \
+  --node-id 3 --p2p-backend "$BACKEND" --p2p-port 7004 --telemetry-port 9104 \
+  --bootstrap "/ip4/127.0.0.1/tcp/7001,/ip4/127.0.0.1/tcp/7002,/ip4/127.0.0.1/tcp/7003" \
+  --sources "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002,coinbase=127.0.0.1:9003" \
+  --privkey-hex "$PK3" --rpc-url "$RPC_URL" --chain-id "$CHAIN_ID" \
+  --contract "$CONTRACT_ADDR" --rounds 0 --round-timeout-secs 25 \
+  >"$LOG_DIR/node3.log" 2>&1 &
+PID3=$!
+NODE_PIDS=("$PID0" "$PID1" "$PID2" "$PID3")
 
 echo "Launching Fe WASM telemetry TUI (feeds=$FEEDS_MODE, backend=$BACKEND, metrics http://127.0.0.1:$METRICS_PORT/metrics). Press Ctrl-C to stop."
 node "$ROOT_DIR/telemetry/host.mjs" \
   --rpc-url "$RPC_URL" \
   --contract "$CONTRACT_ADDR" \
-  --oracles "$ADDR0,$ADDR1,$ADDR2" \
-  --nodes "http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103" \
+  --oracles "$ADDR0,$ADDR1,$ADDR2,$ADDR3" \
+  --nodes "http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103,http://127.0.0.1:9104" \
   --metrics-port "$METRICS_PORT" \
   --mode tui

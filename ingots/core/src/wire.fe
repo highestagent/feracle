@@ -4,10 +4,20 @@ use super::assets::ASSET_COUNT
 
 pub const MSG_TYPE_QUOTE: u8 = 0
 pub const MSG_TYPE_SIG: u8 = 1
-pub const QUOTE_FRAME_LEN: usize = 177
+pub const QUOTE_FRAME_LEN: usize = 262
 pub const SIG_FRAME_LEN: usize = 262
+pub const QUOTE_SIGN_DOMAIN: String<16> = "feracle-quote-v1"
+pub const QUOTE_PREIMAGE_LEN: usize = 220
 
-pub struct QuoteMsg { pub round_id: u64, pub timestamp: u64, pub prices: [u64; 20] }
+pub struct QuoteMsg {
+    pub round_id: u64,
+    pub timestamp: u64,
+    pub prices: [u64; 20],
+    pub signer_addr: [u8; 20],
+    pub v: u8,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
+}
 
 impl Copy for QuoteMsg {}
 
@@ -22,6 +32,16 @@ pub struct SigMsg {
 }
 
 impl Copy for SigMsg {}
+
+struct SignedPayloadFrame {
+    round_id: u64,
+    timestamp: u64,
+    prices: [u64; 20],
+    signer_addr: [u8; 20],
+    v: u8,
+    r: [u8; 32],
+    s: [u8; 32],
+}
 
 pub fn write_prices_be(_ out: mut MemBuffer, offset: usize, _ prices: [u64; 20]) {
     var i: usize = 0
@@ -47,86 +67,64 @@ pub fn encode_prices_be160(_ prices: [u64; 20]) -> MemBuffer {
     buf
 }
 
-pub fn encode_quote_buf(_ q: QuoteMsg) -> MemBuffer {
-    var buf = MemBuffer::new(QUOTE_FRAME_LEN)
-    buf[0] = MSG_TYPE_QUOTE
-    buf.write_be<u64>(offset: 1, value: q.round_id)
-    buf.write_be<u64>(offset: 9, value: q.timestamp)
-    write_prices_be(mut buf, offset: 17, q.prices)
-    buf
-}
-
-pub fn encode_quote(_ q: QuoteMsg) -> [u8; 177] {
-    let buf = encode_quote_buf(q)
-    var out: [u8; 177] = [0; 177]
-    var i: usize = 0
-    while i < QUOTE_FRAME_LEN {
-        out[i] = buf[i]
-        i += 1
+/// Encodes the 220-byte domain-separated preimage hashed and ECDSA-signed for wire `QuoteMsg`.
+pub fn encode_quote_sign_preimage(
+    chain_id: u64,
+    contract20: MemSpan,
+    round_id: u64,
+    timestamp: u64,
+    prices: [u64; 20],
+    _ out: mut MemBuffer,
+) -> bool {
+    if contract20.len() != 20 {
+        return false
     }
-    out
-}
-
-pub fn decode_quote(_ data: MemSpan) -> Option<QuoteMsg> {
-    if data.len() != QUOTE_FRAME_LEN || data.byte_at(0) != MSG_TYPE_QUOTE {
-        return Option::None
+    out.clear()
+    out.resize(QUOTE_PREIMAGE_LEN)
+    let domain = "feracle-quote-v1".span()
+    var di: usize = 0
+    while di < 16 {
+        out[di] = domain.byte_at(di)
+        di += 1
     }
-    Option::Some(
-        QuoteMsg {
-            round_id: data.read_be<u64>(1),
-            timestamp: data.read_be<u64>(9),
-            prices: read_prices_be(data, offset: 17),
-        },
-    )
-}
-
-pub fn decode_quote_array(_ raw: [u8; 177]) -> Option<QuoteMsg> {
-    var buf = MemBuffer::new(QUOTE_FRAME_LEN)
-    var i: usize = 0
-    while i < QUOTE_FRAME_LEN {
-        buf[i] = raw[i]
-        i += 1
+    out.write_be<u64>(offset: 16, value: chain_id)
+    var ci: usize = 0
+    while ci < 20 {
+        out[24 + ci] = contract20.byte_at(ci)
+        ci += 1
     }
-    decode_quote(buf.span())
+    out.write_be<u64>(offset: 44, value: round_id)
+    out.write_be<u64>(offset: 52, value: timestamp)
+    write_prices_be(mut out, offset: 60, prices)
+    true
 }
 
-pub fn encode_sig_msg_buf(_ m: SigMsg) -> MemBuffer {
+fn encode_signed_frame_buf(msg_type: u8, _ f: SignedPayloadFrame) -> MemBuffer {
     var buf = MemBuffer::new(SIG_FRAME_LEN)
-    buf[0] = MSG_TYPE_SIG
-    buf.write_be<u64>(offset: 1, value: m.round_id)
-    buf.write_be<u64>(offset: 9, value: m.timestamp)
-    write_prices_be(mut buf, offset: 17, m.median_prices)
+    buf[0] = msg_type
+    buf.write_be<u64>(offset: 1, value: f.round_id)
+    buf.write_be<u64>(offset: 9, value: f.timestamp)
+    write_prices_be(mut buf, offset: 17, f.prices)
     var i: usize = 0
     while i < 20 {
-        buf[177 + i] = m.signer_addr[i]
+        buf[177 + i] = f.signer_addr[i]
         i += 1
     }
-    buf[197] = m.v
+    buf[197] = f.v
     var j: usize = 0
     while j < 32 {
-        buf[198 + j] = m.r[j]
-        buf[230 + j] = m.s[j]
+        buf[198 + j] = f.r[j]
+        buf[230 + j] = f.s[j]
         j += 1
     }
     buf
 }
 
-pub fn encode_sig_msg(_ m: SigMsg) -> [u8; 262] {
-    let buf = encode_sig_msg_buf(m)
-    var out: [u8; 262] = [0; 262]
-    var i: usize = 0
-    while i < SIG_FRAME_LEN {
-        out[i] = buf[i]
-        i += 1
-    }
-    out
-}
-
-pub fn decode_sig_msg(_ data: MemSpan) -> Option<SigMsg> {
-    if data.len() != SIG_FRAME_LEN || data.byte_at(0) != MSG_TYPE_SIG {
+fn decode_signed_frame(expected_type: u8, _ data: MemSpan) -> Option<SignedPayloadFrame> {
+    if data.len() != SIG_FRAME_LEN || data.byte_at(0) != expected_type {
         return Option::None
     }
-    let median_prices = read_prices_be(data, offset: 17)
+    let prices = read_prices_be(data, offset: 17)
     var signer_addr: [u8; 20] = [0; 20]
     var i: usize = 0
     while i < 20 {
@@ -143,10 +141,10 @@ pub fn decode_sig_msg(_ data: MemSpan) -> Option<SigMsg> {
         j += 1
     }
     Option::Some(
-        SigMsg {
+        SignedPayloadFrame {
             round_id: data.read_be<u64>(1),
             timestamp: data.read_be<u64>(9),
-            median_prices,
+            prices,
             signer_addr,
             v,
             r,
@@ -155,13 +153,101 @@ pub fn decode_sig_msg(_ data: MemSpan) -> Option<SigMsg> {
     )
 }
 
-pub fn decode_sig_msg_array(_ raw: [u8; 262]) -> Option<SigMsg> {
+fn buf_to_frame262(_ buf: MemBuffer) -> [u8; 262] {
+    var out: [u8; 262] = [0; 262]
+    var i: usize = 0
+    while i < SIG_FRAME_LEN {
+        out[i] = buf[i]
+        i += 1
+    }
+    out
+}
+
+fn frame262_to_buf(_ raw: [u8; 262]) -> MemBuffer {
     var buf = MemBuffer::new(SIG_FRAME_LEN)
     var i: usize = 0
     while i < SIG_FRAME_LEN {
         buf[i] = raw[i]
         i += 1
     }
+    buf
+}
+
+pub fn encode_quote_buf(_ q: QuoteMsg) -> MemBuffer {
+    encode_signed_frame_buf(
+        msg_type: MSG_TYPE_QUOTE,
+        SignedPayloadFrame {
+            round_id: q.round_id,
+            timestamp: q.timestamp,
+            prices: q.prices,
+            signer_addr: q.signer_addr,
+            v: q.v,
+            r: q.r,
+            s: q.s,
+        },
+    )
+}
+
+pub fn encode_quote(_ q: QuoteMsg) -> [u8; 262] {
+    buf_to_frame262(encode_quote_buf(q))
+}
+
+pub fn decode_quote(_ data: MemSpan) -> Option<QuoteMsg> {
+    let f = decode_signed_frame(expected_type: MSG_TYPE_QUOTE, data)?
+    Option::Some(
+        QuoteMsg {
+            round_id: f.round_id,
+            timestamp: f.timestamp,
+            prices: f.prices,
+            signer_addr: f.signer_addr,
+            v: f.v,
+            r: f.r,
+            s: f.s,
+        },
+    )
+}
+
+pub fn decode_quote_array(_ raw: [u8; 262]) -> Option<QuoteMsg> {
+    let buf = frame262_to_buf(raw)
+    decode_quote(buf.span())
+}
+
+pub fn encode_sig_msg_buf(_ m: SigMsg) -> MemBuffer {
+    encode_signed_frame_buf(
+        msg_type: MSG_TYPE_SIG,
+        SignedPayloadFrame {
+            round_id: m.round_id,
+            timestamp: m.timestamp,
+            prices: m.median_prices,
+            signer_addr: m.signer_addr,
+            v: m.v,
+            r: m.r,
+            s: m.s,
+        },
+    )
+}
+
+pub fn encode_sig_msg(_ m: SigMsg) -> [u8; 262] {
+    buf_to_frame262(encode_sig_msg_buf(m))
+}
+
+pub fn decode_sig_msg(_ data: MemSpan) -> Option<SigMsg> {
+    let f = decode_signed_frame(expected_type: MSG_TYPE_SIG, data)?
+    Option::Some(
+        SigMsg {
+            round_id: f.round_id,
+            timestamp: f.timestamp,
+            median_prices: f.prices,
+            signer_addr: f.signer_addr,
+            v: f.v,
+            r: f.r,
+            s: f.s,
+        },
+    )
+}
+
+pub fn decode_sig_msg_array(_ raw: [u8; 262]) -> Option<SigMsg> {
+    let buf = frame262_to_buf(raw)
     decode_sig_msg(buf.span())
 }
 

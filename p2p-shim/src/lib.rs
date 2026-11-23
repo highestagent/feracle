@@ -18,7 +18,7 @@ pub const TOPIC_NAME: &str = "fe-oracle/top20-usd/v1";
 pub const ASSET_COUNT: usize = 20;
 const MAX_INBOX_LEN: usize = 1024;
 const MSG_TYPE_QUOTE: u8 = 0;
-const QUOTE_FRAME_LEN: usize = 177;
+const QUOTE_FRAME_LEN: usize = 262;
 
 #[derive(NetworkBehaviour)]
 struct OracleBehaviour {
@@ -124,7 +124,7 @@ impl P2pNode {
                                 }
                             }
                             _ = redial_tick.tick() => {
-                                if subscribed_peers.len() < 2 && !bootstrap_addrs.is_empty() {
+                                if subscribed_peers.len() < 3 && !bootstrap_addrs.is_empty() {
                                     for addr in &bootstrap_addrs {
                                         let _ = swarm.dial(addr.clone());
                                     }
@@ -444,12 +444,8 @@ pub fn derive_eth_address_bytes(privkey: &[u8; 32]) -> Result<[u8; 20], String> 
     Ok(derive_eth_address(&signing_key))
 }
 
-pub fn verify_oracle_sig(
-    chain_id: u64,
-    contract_addr: &[u8; 20],
-    round_id: u64,
-    prices: &[u64; ASSET_COUNT],
-    timestamp: u64,
+fn verify_prehash_sig(
+    digest: &[u8; 32],
     expected_addr: &[u8; 20],
     v: u8,
     r: &[u8; 32],
@@ -467,14 +463,42 @@ pub fn verify_oracle_sig(
     if sig.normalize_s().is_some() {
         return false;
     }
-    let digest = build_oracle_digest(chain_id, contract_addr, round_id, prices, timestamp);
     let Ok(rec_id) = k256::ecdsa::RecoveryId::try_from(v - 27) else {
         return false;
     };
-    let Ok(recovered_vk) = VerifyingKey::recover_from_prehash(&digest, &sig, rec_id) else {
+    let Ok(recovered_vk) = VerifyingKey::recover_from_prehash(digest, &sig, rec_id) else {
         return false;
     };
     &verifying_key_to_eth_address(&recovered_vk) == expected_addr
+}
+
+pub fn verify_oracle_sig(
+    chain_id: u64,
+    contract_addr: &[u8; 20],
+    round_id: u64,
+    prices: &[u64; ASSET_COUNT],
+    timestamp: u64,
+    expected_addr: &[u8; 20],
+    v: u8,
+    r: &[u8; 32],
+    s: &[u8; 32],
+) -> bool {
+    let digest = build_oracle_digest(chain_id, contract_addr, round_id, prices, timestamp);
+    verify_prehash_sig(&digest, expected_addr, v, r, s)
+}
+
+pub fn verify_keccak_bytes_sig(
+    data: &[u8],
+    expected_addr: &[u8; 20],
+    v: u8,
+    r: &[u8; 32],
+    s: &[u8; 32],
+) -> bool {
+    let mut digest = [0u8; 32];
+    let mut keccak = Keccak::v256();
+    keccak.update(data);
+    keccak.finalize(&mut digest);
+    verify_prehash_sig(&digest, expected_addr, v, r, s)
 }
 
 fn sign_prehash_with_key(
@@ -949,6 +973,48 @@ pub extern "C" fn crypto_verify_oracle_sig(
     .unwrap_or(-99)
 }
 
+#[no_mangle]
+pub extern "C" fn crypto_verify_keccak_bytes_sig(
+    data_ptr: *const u8,
+    data_len: usize,
+    expected_addr20_ptr: *const u8,
+    v: u32,
+    r32_ptr: *const u8,
+    s32_ptr: *const u8,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if (data_len > 0 && data_ptr.is_null())
+            || expected_addr20_ptr.is_null()
+            || r32_ptr.is_null()
+            || s32_ptr.is_null()
+        {
+            return -2;
+        }
+        let Ok(v_u8) = u8::try_from(v) else {
+            return 0;
+        };
+        let data = if data_len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(data_ptr, data_len) }
+        };
+        let mut expected = [0u8; 20];
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected_addr20_ptr, expected.as_mut_ptr(), 20);
+            std::ptr::copy_nonoverlapping(r32_ptr, r.as_mut_ptr(), 32);
+            std::ptr::copy_nonoverlapping(s32_ptr, s.as_mut_ptr(), 32);
+        }
+        if verify_keccak_bytes_sig(data, &expected, v_u8, &r, &s) {
+            1
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(-99)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,12 +1053,12 @@ mod tests {
     #[test]
     fn test_crypto_keccak_and_sign_parity_with_evm_vectors() {
         // Exact test vector verified against ingots/evm/src/test.fe and cast!
-        let contract = hex::decode("12b7796311880f2adce95dd9da0265425fed32b0").unwrap();
+        let contract = hex::decode("184a05ae4c04d7c42175b96c3faca8084d8ae4e8").unwrap();
         let contract20: [u8; 20] = contract.try_into().unwrap();
         let digest = build_oracle_digest(1, &contract20, 1, &TEST_PRICES, 1);
         assert_eq!(
             hex::encode(digest),
-            "abaa019c372782c3b99f19a716dc0e73d5a653ebefb898e4af0584b04c985f8a"
+            "b6f49643337479678b657fb9e111e650e7e2b222b2b8b97d2df3fc1ee080101f"
         );
 
         let prices_be = prices_to_be160(&TEST_PRICES);
@@ -1107,12 +1173,14 @@ mod tests {
             "csv_b={csv_b}"
         );
 
-        // Publish a 177-byte quote from A twice; B and C must each receive it once (deduped)
+        // Publish a signed-length 262-byte quote from A twice; B and C must each receive it once (deduped)
         let mut quote = vec![0u8; QUOTE_FRAME_LEN];
         quote[0] = MSG_TYPE_QUOTE;
         quote[1..9].copy_from_slice(&1u64.to_be_bytes());
         quote[9..17].copy_from_slice(&1_795_250_000u64.to_be_bytes());
         quote[17..177].copy_from_slice(&prices_to_be160(&TEST_PRICES));
+        quote[177..197].copy_from_slice(&[0x11; 20]);
+        quote[197] = 27;
 
         node_a.publish(quote.clone()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -1320,6 +1388,134 @@ mod tests {
                 prices_be.as_ptr(),
                 1,
                 derived.as_ptr(),
+                flipped_v,
+                r.as_ptr(),
+                high_s.as_ptr(),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_crypto_verify_keccak_bytes_sig_and_domain_sep() {
+        let pk: [u8; 32] =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let contract20: [u8; 20] = hex::decode("3244d0de654b2d7e00fedb548d3f5a6c6175dcf0")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut preimage = Vec::with_capacity(220);
+        preimage.extend_from_slice(b"feracle-quote-v1");
+        preimage.extend_from_slice(&1u64.to_be_bytes());
+        preimage.extend_from_slice(&contract20);
+        preimage.extend_from_slice(&1u64.to_be_bytes());
+        preimage.extend_from_slice(&1u64.to_be_bytes());
+        preimage.extend_from_slice(&prices_to_be160(&TEST_PRICES));
+        assert_eq!(preimage.len(), 220);
+
+        let mut addr = [0u8; 20];
+        let mut rec_id = 9u8;
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        assert_eq!(
+            crypto_keccak_and_sign_bytes(
+                pk.as_ptr(),
+                preimage.as_ptr(),
+                preimage.len(),
+                addr.as_mut_ptr(),
+                &mut rec_id as *mut u8,
+                r.as_mut_ptr(),
+                s.as_mut_ptr(),
+            ),
+            0
+        );
+        let v = u32::from(27 + rec_id);
+        assert_eq!(
+            crypto_verify_keccak_bytes_sig(
+                preimage.as_ptr(),
+                preimage.len(),
+                addr.as_ptr(),
+                v,
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            1
+        );
+
+        // Domain separation: quote signature must NOT verify as on-chain oracle settlement sig
+        let prices_be = prices_to_be160(&TEST_PRICES);
+        assert_eq!(
+            crypto_verify_oracle_sig(
+                1,
+                contract20.as_ptr(),
+                1,
+                prices_be.as_ptr(),
+                1,
+                addr.as_ptr(),
+                v,
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            0
+        );
+
+        // Tampered payload fails
+        let mut tampered = preimage.clone();
+        tampered[219] ^= 0x01;
+        assert_eq!(
+            crypto_verify_keccak_bytes_sig(
+                tampered.as_ptr(),
+                tampered.len(),
+                addr.as_ptr(),
+                v,
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            0
+        );
+
+        // Wrong address fails
+        let mut wrong_addr = addr;
+        wrong_addr[0] ^= 0xff;
+        assert_eq!(
+            crypto_verify_keccak_bytes_sig(
+                preimage.as_ptr(),
+                preimage.len(),
+                wrong_addr.as_ptr(),
+                v,
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            0
+        );
+
+        // Invalid v and high-s malleability fail
+        assert_eq!(
+            crypto_verify_keccak_bytes_sig(
+                preimage.as_ptr(),
+                preimage.len(),
+                addr.as_ptr(),
+                26,
+                r.as_ptr(),
+                s.as_ptr(),
+            ),
+            0
+        );
+        use k256::elliptic_curve::bigint::Encoding as _;
+        let n_minus_s = k256::U256::from_be_hex(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        )
+        .wrapping_sub(&k256::U256::from_be_slice(&s));
+        let high_s: [u8; 32] = n_minus_s.to_be_bytes();
+        let flipped_v = if v == 27 { 28 } else { 27 };
+        assert_eq!(
+            crypto_verify_keccak_bytes_sig(
+                preimage.as_ptr(),
+                preimage.len(),
+                addr.as_ptr(),
                 flipped_v,
                 r.as_ptr(),
                 high_s.as_ptr(),

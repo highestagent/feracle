@@ -13,6 +13,7 @@ const DEFAULT_ORACLES = [
   "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
   "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+  "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
 ].join(",");
 const DEFAULT_WASM_PATH = path.join(REPO_ROOT, "out", "telemetry_wasm.wasm");
 const SUBMIT_MEDIANS_SELECTOR = "0x6d2b8b3f";
@@ -25,7 +26,7 @@ Usage: node telemetry/host.mjs [OPTIONS]
 Options:
   --rpc-url <URL>        EVM JSON-RPC endpoint URL [env: FERACLE_RPC_URL] [default: ${DEFAULT_RPC_URL}]
   --contract <ADDR>      Deployed OffchainMedianOracle address (required) [env: FERACLE_CONTRACT]
-  --oracles <CSV>        Comma-separated oracle addresses (up to 3) [env: FERACLE_ORACLES]
+  --oracles <CSV>        Comma-separated oracle addresses (up to 4) [env: FERACLE_ORACLES]
   --nodes <CSV>          Optional comma-separated node telemetry URLs (e.g. http://127.0.0.1:9101,...) [env: FERACLE_NODES]
   --wasm <PATH>          Path to compiled Fe WASM module [env: FERACLE_WASM] [default: ${DEFAULT_WASM_PATH}]
   --interval-ms <MS>     Poll & refresh interval in milliseconds [default: 1000]

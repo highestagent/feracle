@@ -1,7 +1,7 @@
 //! Canonical Top-20 asset registry and oracle protocol parameters.
 
 pub const ASSET_COUNT: usize = 20
-pub const NODE_COUNT: u64 = 3
+pub const NODE_COUNT: u64 = 4
 pub const QUORUM: usize = 3
 pub const MAX_TOLERANCE_BPS: u64 = 100
 pub const PRICE_SCALE: u64 = 100_000_000

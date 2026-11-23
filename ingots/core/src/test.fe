@@ -1,6 +1,8 @@
-use core::num::IntDowncast
+use core::num::Bounded
 use super::{
     ASSET_COUNT,
+    QUOTE_PREIMAGE_LEN,
+    QUOTE_SIGN_DOMAIN,
     QuoteMsg,
     SEL_CURRENT_ROUND,
     SEL_LATEST_PRICES,
@@ -21,6 +23,7 @@ use super::{
     encode_prices_be160,
     encode_quote,
     encode_quote_buf,
+    encode_quote_sign_preimage,
     encode_sig_msg,
     encode_sig_msg_buf,
     encode_submit_medians_calldata,
@@ -32,9 +35,12 @@ use super::{
     json_next_array_elem,
     json_next_object_field,
     leader_index,
+    median_of_four,
     median_of_three,
     median_prices_3,
+    median_prices_4,
     median_u64,
+    median_u64_4,
     normalize_addr20_hex,
     parse_abi_word_bool,
     parse_abi_word_u64,
@@ -101,6 +107,22 @@ fn test_median_of_three_and_batch_medians() {
     var zeroed = med
     zeroed[19] = 0
     assert!(!all_prices_nonzero(zeroed))
+
+    assert!(median_of_four(10, 40, 20, 30) == 25)
+    assert!(median_of_four(10, 9_999_999, 20, 21) == 20)
+    assert!(
+        median_u64_4([9245050000000, 9245150000000, 1, 99999900000000]) == 9245100000000,
+    )
+    let near_max = u64::max() - 1
+    assert!(
+        median_of_four(0, near_max - 1, u64::max(), u64::max()) == near_max,
+    )
+    var p3: [u64; 20] = [400; 20]
+    p3[1] = 342_130_000_000
+    let med4 = median_prices_4(p0, p1, p2, p3)
+    assert!(
+        med4[0] == 250 && med4[1] == 342_170_000_000 && med4[19] == 250,
+    )
 }
 
 #[test]
@@ -166,17 +188,6 @@ fn test_quote_and_sig_wire_and_quorum() {
         be160.len() == 160 && be160.read_be<u64>(0) == 9_245_025_000_000,
     )
 
-    let q = QuoteMsg { round_id: 0x0102030405060708, timestamp: 1_795_250_000, prices }
-    let q_raw = encode_quote(q)
-    let q_buf = encode_quote_buf(q)
-    assert!(q_buf.len() == 177 && q_raw[0] == 0x00 && q_raw[8] == 0x08)
-    assert!(
-        prices_eq(decode_quote(q_buf.span()).unwrap().prices, prices),
-    )
-    assert!(
-        prices_eq(decode_quote_array(q_raw).unwrap().prices, prices),
-    )
-
     var s0_addr: [u8; 20] = [0; 20]
     s0_addr[0] = 0x70
     var s1_addr: [u8; 20] = [0; 20]
@@ -185,6 +196,64 @@ fn test_quote_and_sig_wire_and_quorum() {
     s2_addr[0] = 0xf3
     let r: [u8; 32] = [0xaa; 32]
     let s: [u8; 32] = [0xbb; 32]
+
+    let q = QuoteMsg {
+        round_id: 0x0102030405060708,
+        timestamp: 1_795_250_000,
+        prices,
+        signer_addr: s0_addr,
+        v: 27,
+        r,
+        s,
+    }
+    let q_raw = encode_quote(q)
+    let q_buf = encode_quote_buf(q)
+    assert!(
+        q_buf.len() == 262 && q_raw[0] == 0x00 && q_raw[8] == 0x08 && q_raw[197] == 27,
+    )
+    let q_dec = decode_quote(q_buf.span()).unwrap()
+    assert!(
+        prices_eq(q_dec.prices, prices) && addr20_eq(q_dec.signer_addr, s0_addr) && q_dec.v == 27,
+    )
+    assert!(
+        prices_eq(decode_quote_array(q_raw).unwrap().prices, prices),
+    )
+
+    var contract20_buf = MemBuffer::new(20)
+    contract20_buf[0] = 0x12
+    contract20_buf[19] = 0x34
+    var preimage = MemBuffer::empty()
+    assert!(
+        encode_quote_sign_preimage(
+            chain_id: 31337,
+            contract20: contract20_buf.span(),
+            round_id: 0x0102030405060708,
+            timestamp: 1_795_250_000,
+            prices,
+            mut preimage,
+        ),
+    )
+    assert!(
+        preimage.len() == QUOTE_PREIMAGE_LEN
+            && preimage.span().head(16) == QUOTE_SIGN_DOMAIN
+            && preimage.span().read_be<u64>(16) == 31337
+            && preimage[24] == 0x12
+            && preimage[43] == 0x34
+            && preimage.span().read_be<u64>(44) == 0x0102030405060708
+            && preimage.span().read_be<u64>(52) == 1_795_250_000
+            && preimage.span().read_be<u64>(60) == 9_245_025_000_000
+            && preimage.span().read_be<u64>(212) == 31_850_000_000,
+    )
+    assert!(
+        !encode_quote_sign_preimage(
+            chain_id: 31337,
+            contract20: MemBuffer::new(19).span(),
+            round_id: 1,
+            timestamp: 1,
+            prices,
+            mut preimage,
+        ),
+    )
 
     let m0 = SigMsg {
         round_id: 7,
@@ -243,6 +312,7 @@ fn test_quote_and_sig_wire_and_quorum() {
 #[test]
 fn test_hex_abi_and_json_helpers() {
     assert!(leader_index(round_id: 4, node_count: 3) == 1)
+    assert!(leader_index(round_id: 7, node_count: 4) == 3)
     assert!(to_ascii_lower(b'Z') == b'z')
     assert!(
         SEL_CURRENT_ROUND == "0x8a19c8bc" && SEL_LATEST_PRICES == "0xda8fa900",

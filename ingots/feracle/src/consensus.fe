@@ -6,6 +6,7 @@ use coro::{Coroutine, Poll, Scheduler, Sleep, TaskId}
 use feracle_core::{
     MAX_TOLERANCE_BPS,
     NODE_COUNT,
+    QUORUM,
     QuoteMsg,
     SigMsg,
     add_sig_dedup,
@@ -14,7 +15,9 @@ use feracle_core::{
     first_tolerance_breach_asset,
     leader_index,
     median_prices_3,
+    median_prices_4,
     median_u64,
+    median_u64_4,
     prices_eq,
     sort_three_sigs,
     write_asset_symbol,
@@ -24,7 +27,7 @@ use super::config::NodeConfig
 use super::feeds::{FeedReport, FetchFeedsCoro, feed_kind_name}
 use super::ffi
 use super::network::PeerSession
-use super::round_io::{QuoteRouting, SourcedQuote, add_quote_dedup, poll_all_messages}
+use super::round_io::{OracleAuthCache, QuoteRouting, add_quote_dedup, poll_all_messages}
 use super::rpc::{QueryCurrentRound, QueryRoundState}
 use super::submit::{SubmitMediansCoro, SubmitOutcome}
 use super::telemetry::{TelemetryEvent, TelemetrySink}
@@ -46,6 +49,7 @@ enum ConsensusState {
         started_ms: u64,
         deadline: Sleep,
         pub_sleep: Sleep,
+        quorum_grace: Option<Sleep>,
     },
     ToleranceBreachWait {
         deadline: Sleep,
@@ -86,7 +90,8 @@ enum StepAction {
 struct RoundContext {
     owner: TaskId,
     config: NodeConfig,
-    pending_quotes: MemVec<SourcedQuote>,
+    auth_cache: OracleAuthCache,
+    pending_quotes: MemVec<QuoteMsg>,
     pending_sigs: MemVec<SigMsg>,
     scratch: MemBuffer,
     completed_rounds: u64,
@@ -97,7 +102,7 @@ struct RoundContext {
     local_ts: u64,
     group_medians: [u64; 20],
     round_ts: u64,
-    quotes: MemVec<SourcedQuote>,
+    quotes: MemVec<QuoteMsg>,
     quote_frame: MemBuffer,
     sigs: MemVec<SigMsg>,
     sorted_sigs: [SigMsg; 3],
@@ -180,9 +185,15 @@ uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
         ConsensusState::FetchingFeeds { try_idx: _, mut fetcher } => fetcher.cancel(),
         ConsensusState::FeedRetryDelay { next_try_idx: _, mut sleep } => sleep.cancel(),
         ConsensusState::FeedErrorCooldown { mut sleep } => sleep.cancel(),
-        ConsensusState::PhaseAQuotes { started_ms: _, mut deadline, mut pub_sleep } => {
+        ConsensusState::PhaseAQuotes {
+            started_ms: _,
+            mut deadline,
+            mut pub_sleep,
+            mut quorum_grace,
+        } => {
             deadline.cancel()
             pub_sleep.cancel()
+            cancel_opt_sleep(mut quorum_grace)
         },
         ConsensusState::ToleranceBreachWait { mut deadline, mut rpc_sleep, mut round_query } => {
             deadline.cancel()
@@ -248,11 +259,12 @@ impl RoundContext {
         _ peer: mut PeerSession,
         _ telemetry: mut TelemetrySink,
     )
-    uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
     {
         poll_all_messages(
             mut peer,
             mut telemetry,
+            auth_cache: mut self.auth_cache,
             round_id: self.round_id,
             chain_id: self.config.chain_id,
             contract20: self.config.contract20.span(),
@@ -280,10 +292,11 @@ impl RoundContext {
         if let Poll::Ready(_) = pub_sleep.poll() {
             if use_quote {
                 let _ = peer.publish(self.quote_frame.span(), mut telemetry)
+                pub_sleep = Sleep::after(owner: self.owner, delay_ms: 1000)
             } else {
                 let _ = peer.publish(self.sig_frame.span(), mut telemetry)
+                pub_sleep = Sleep::after(owner: self.owner, delay_ms: 2000)
             }
-            pub_sleep = Sleep::after(owner: self.owner, delay_ms: 2000)
         }
     }
 
@@ -367,22 +380,46 @@ impl RoundContext {
                 round_ts: self.local_ts,
             )
 
-        let self_quote = QuoteMsg {
+        let self_quote = match ffi::sign_quote(
+            privkey32: self.config.privkey32.span(),
+            chain_id: self.config.chain_id,
+            contract20: self.config.contract20.span(),
             round_id: self.round_id,
             timestamp: self.local_ts,
             prices: self.local_prices,
+        ) {
+            Option::Some(q) => q,
+            Option::None => {
+                eprintln!(
+                    "node ",
+                    self.config.node_id,
+                    " round ",
+                    self.round_id,
+                    " failed to sign quote",
+                )
+                self.completed_rounds += 1
+                return self.next_round_state()
+            },
         }
         self.quotes = MemVec::new()
-        self.quotes.push(SourcedQuote { origin: 0, quote: self_quote })
+        add_quote_dedup(
+            mut self.quotes,
+            self_quote,
+            max_len: NODE_COUNT.downcast_unchecked(),
+        )
 
-        var next_pending = MemVec<SourcedQuote>::new()
+        var next_pending = MemVec<QuoteMsg>::new()
         var pq_i: usize = 0
         while pq_i < self.pending_quotes.len() {
-            let sq = self.pending_quotes[pq_i]
-            if sq.quote.round_id == self.round_id {
-                add_quote_dedup(mut self.quotes, sq, max_len: 3)
-            } else if sq.quote.round_id > self.round_id {
-                add_quote_dedup(mut next_pending, sq, max_len: 0)
+            let pq = self.pending_quotes[pq_i]
+            if pq.round_id == self.round_id {
+                add_quote_dedup(
+                    mut self.quotes,
+                    pq,
+                    max_len: NODE_COUNT.downcast_unchecked(),
+                )
+            } else if pq.round_id > self.round_id {
+                add_quote_dedup(mut next_pending, pq, max_len: 0)
             }
             pq_i += 1
         }
@@ -391,8 +428,14 @@ impl RoundContext {
         self.quote_frame = encode_quote_buf(self_quote)
         let _ = peer.publish(self.quote_frame.span(), mut telemetry)
 
-        if self.quotes.len() >= 3 {
+        let full_nodes: usize = NODE_COUNT.downcast_unchecked()
+        if self.quotes.len() >= full_nodes {
             return self.enter_phase_b_state(mut peer, mut telemetry)
+        }
+        let quorum_grace = if self.quotes.len() >= QUORUM {
+            Option::Some(Sleep::after(owner: self.owner, delay_ms: 2000))
+        } else {
+            Option::None
         }
         ConsensusState::PhaseAQuotes {
             started_ms: sched.now_ms(),
@@ -400,7 +443,8 @@ impl RoundContext {
                 owner: self.owner,
                 delay_ms: self.config.round_timeout_secs * 1000,
             ),
-            pub_sleep: Sleep::after(owner: self.owner, delay_ms: 2000),
+            pub_sleep: Sleep::after(owner: self.owner, delay_ms: 1000),
+            quorum_grace,
         }
     }
 
@@ -418,18 +462,32 @@ impl RoundContext {
         io: mut SocketIo,
     )
     {
-        self.group_medians = median_prices_3(
-            self.quotes[0].quote.prices,
-            self.quotes[1].quote.prices,
-            self.quotes[2].quote.prices,
-        )
-        self.round_ts = median_u64(
-            [
-                self.quotes[0].quote.timestamp,
-                self.quotes[1].quote.timestamp,
-                self.quotes[2].quote.timestamp,
-            ],
-        )
+        let full_nodes: usize = NODE_COUNT.downcast_unchecked()
+        if self.quotes.len() >= full_nodes {
+            self.group_medians = median_prices_4(
+                self.quotes[0].prices,
+                self.quotes[1].prices,
+                self.quotes[2].prices,
+                self.quotes[3].prices,
+            )
+            self.round_ts = median_u64_4(
+                [
+                    self.quotes[0].timestamp,
+                    self.quotes[1].timestamp,
+                    self.quotes[2].timestamp,
+                    self.quotes[3].timestamp,
+                ],
+            )
+        } else {
+            self.group_medians = median_prices_3(
+                self.quotes[0].prices,
+                self.quotes[1].prices,
+                self.quotes[2].prices,
+            )
+            self.round_ts = median_u64(
+                [self.quotes[0].timestamp, self.quotes[1].timestamp, self.quotes[2].timestamp],
+            )
+        }
 
         if let Option::Some(bad_idx) = first_tolerance_breach_asset(
             local: self.local_prices,
@@ -527,7 +585,7 @@ impl RoundContext {
                 round_ts: self.round_ts,
             )
 
-        if self.sigs.len() >= 3 {
+        if self.sigs.len() >= QUORUM {
             return self.enter_submit_or_settle_state(mut telemetry)
         }
         ConsensusState::PhaseCSigs {
@@ -665,9 +723,16 @@ impl ConsensusCoro {
     pub fn new(config: own NodeConfig) -> Self uses (sched: mut Scheduler) {
         let owner = sched.alloc_task()
         let now_ms = sched.now_ms()
+        let auth_cache = OracleAuthCache::new(
+            self_addr20: config.self_addr20,
+            rpc_addr: config.rpc_addr,
+            rpc_path: MemBuffer::from_span(config.rpc_path.span()),
+            contract_0x: MemBuffer::from_span(config.contract_0x.span()),
+        )
         let ctx = RoundContext {
             owner,
             config,
+            auth_cache,
             pending_quotes: MemVec::new(),
             pending_sigs: MemVec::new(),
             scratch: MemBuffer::with_capacity(512),
@@ -704,6 +769,7 @@ impl ConsensusCoro {
     uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
     {
         self.transition(ConsensusState::Done(0))
+        self.ctx.auth_cache.cancel()
         sched.cancel_owner_timers(self.ctx.owner)
         io.deregister_owner(self.ctx.owner)
     }
@@ -731,7 +797,10 @@ impl ConsensusCoro {
             ConsensusState::MeshWarmup { started_ms, mut tick } => {
                 let peers = peer.peer_count()
                 let elapsed_ms = sched.now_ms() - started_ms
-                if peers >= 2 || (elapsed_ms >= 5000 && peers >= 1) || elapsed_ms >= 15000 {
+                if peers >= 3
+                    || (elapsed_ms >= 2000 && peers >= 2)
+                    || (elapsed_ms >= 6000 && peers >= 1)
+                    || elapsed_ms >= 15000 {
                     println!(
                         "node ",
                         ctx.config.node_id,
@@ -849,8 +918,25 @@ impl ConsensusCoro {
                     StepAction::Stay
                 }
             },
-            ConsensusState::PhaseAQuotes { started_ms: _, mut deadline, mut pub_sleep } => {
-                if ctx.quotes.len() >= 3 {
+            ConsensusState::PhaseAQuotes {
+                started_ms: _,
+                mut deadline,
+                mut pub_sleep,
+                mut quorum_grace,
+            } => {
+                let full_nodes: usize = NODE_COUNT.downcast_unchecked()
+                var proceed = ctx.quotes.len() >= full_nodes
+                if !proceed && ctx.quotes.len() >= QUORUM {
+                    if let Option::Some(mut gs) = quorum_grace {
+                        if let Poll::Ready(_) = gs.poll() {
+                            quorum_grace = Option::None
+                            proceed = true
+                        }
+                    } else {
+                        quorum_grace = Option::Some(Sleep::after(owner: ctx.owner, delay_ms: 2000))
+                    }
+                }
+                if proceed {
                     StepAction::Transition(ctx.enter_phase_b_state(mut peer, mut telemetry))
                 } else if let Poll::Ready(_) = deadline.poll() {
                     let zero_prices: [u64; 20] = [0; 20]
@@ -920,7 +1006,7 @@ impl ConsensusCoro {
                 }
             },
             ConsensusState::PhaseCSigs { started_ms: _, mut deadline, mut pub_sleep } => {
-                if ctx.sigs.len() >= 3 {
+                if ctx.sigs.len() >= QUORUM {
                     StepAction::Transition(ctx.enter_submit_or_settle_state(mut telemetry))
                 } else if let Poll::Ready(_) = deadline.poll() {
                     eprintln!(
@@ -1024,7 +1110,9 @@ impl ConsensusCoro {
                         )
                     }
                     let elapsed_ms = sched.now_ms() - started_ms
-                    if elapsed_ms >= ctx.config.round_timeout_secs * 1000
+                    let half_ms = ctx.config.round_timeout_secs * 500
+                    let failover_ms = if half_ms >= 2000 { half_ms } else { 2000 }
+                    if elapsed_ms >= failover_ms
                         && !ctx.submitted
                         && !failover_started
                         && ctx.config.node_id == backup_leader {

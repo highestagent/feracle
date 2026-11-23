@@ -2,10 +2,13 @@ use std::net::{Net, SocketAddr}
 use coro::{Coroutine, Join2, Poll, Scheduler, TaskId, Timeout}
 use feracle_core::{
     SEL_CURRENT_ROUND,
+    SEL_IS_ORACLE,
     SEL_LATEST_PRICES,
     decode_latest_prices_abi_hex,
     json_get_str_bounds,
+    parse_abi_word_bool,
     parse_abi_word_u64,
+    push_hex_bytes,
 }
 use http::HttpRequest
 use net_reactor::SocketIo
@@ -46,6 +49,31 @@ uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
     )
 }
 
+pub fn start_eth_call_data(
+    owner: TaskId,
+    rpc_addr: SocketAddr,
+    rpc_path: MemSpan,
+    contract_0x: MemSpan,
+    data_hex: MemSpan,
+) -> Timeout<HttpRequest>
+uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+{
+    let body = format!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"",
+        contract_0x,
+        "\",\"data\":\"",
+        data_hex,
+        "\"},\"latest\"]}",
+    )
+    start_rpc_request(
+        owner,
+        rpc_addr,
+        rpc_path,
+        rpc_body: body.span(),
+        timeout_ms: RPC_TIMEOUT_MS,
+    )
+}
+
 pub fn start_eth_call(
     owner: TaskId,
     rpc_addr: SocketAddr,
@@ -55,19 +83,13 @@ pub fn start_eth_call(
 ) -> Timeout<HttpRequest>
 uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
 {
-    let body = format!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"",
-        contract_0x,
-        "\",\"data\":\"",
-        selector_0x,
-        "\"},\"latest\"]}",
-    )
-    start_rpc_request(
+    let sel_buf = format!(selector_0x)
+    start_eth_call_data(
         owner,
         rpc_addr,
         rpc_path,
-        rpc_body: body.span(),
-        timeout_ms: RPC_TIMEOUT_MS,
+        contract_0x,
+        data_hex: sel_buf.span(),
     )
 }
 
@@ -220,6 +242,78 @@ impl Coroutine for QueryRoundState {
         if !self.done {
             self.done = true
             self.join.cancel()
+            sched.cancel_owner_timers(self.owner)
+            io.deregister_owner(self.owner)
+        }
+    }
+}
+
+pub struct QueryIsOracle {
+    owner: TaskId,
+    req: Timeout<HttpRequest>,
+    done: bool,
+    result: Option<bool>,
+}
+
+impl QueryIsOracle {
+    pub fn start(
+        rpc_addr: SocketAddr,
+        rpc_path: MemSpan,
+        contract_0x: MemSpan,
+        addr20: [u8; 20],
+    ) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let owner = sched.alloc_task()
+        var addr_buf = MemBuffer::new(20)
+        var i: usize = 0
+        while i < 20 {
+            addr_buf[i] = addr20[i]
+            i += 1
+        }
+        var data = MemBuffer::with_capacity(74)
+        write!(mut data, SEL_IS_ORACLE, "000000000000000000000000")
+        push_hex_bytes(mut data, addr_buf.span())
+        let req = start_eth_call_data(
+            owner,
+            rpc_addr,
+            rpc_path,
+            contract_0x,
+            data_hex: data.span(),
+        )
+        QueryIsOracle { owner, req, done: false, result: Option::None }
+    }
+}
+
+impl Coroutine for QueryIsOracle {
+    type Output = Option<bool>
+    uses E = (sched: mut Scheduler, io: mut SocketIo)
+
+    fn poll(mut self) -> Poll<Option<bool>> uses E {
+        if self.done {
+            return Poll::Ready(self.result)
+        }
+        if let Poll::Ready(res) = self.req.poll() {
+            let body_opt = flatten_http_body(res)
+            self.result = match body_opt {
+                Option::Some(ref body) => match parse_eth_call_hex(body.span()) {
+                    Option::Some(raw_hex) => parse_abi_word_bool(raw_hex.span(), word_idx: 0),
+                    Option::None => Option::None,
+                },
+                Option::None => Option::None,
+            }
+            self.done = true
+            sched.cancel_owner_timers(self.owner)
+            io.deregister_owner(self.owner)
+            return Poll::Ready(self.result)
+        }
+        Poll::Pending
+    }
+
+    fn cancel(mut self) uses E {
+        if !self.done {
+            self.done = true
+            self.req.cancel()
             sched.cancel_owner_timers(self.owner)
             io.deregister_owner(self.owner)
         }

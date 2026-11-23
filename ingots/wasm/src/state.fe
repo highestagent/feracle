@@ -11,7 +11,9 @@ use feracle_core::{
     first_tolerance_breach_asset,
     leader_index,
     median_prices_3,
+    median_prices_4,
     median_u64,
+    median_u64_4,
     prices_eq,
 }
 use super::codec::{
@@ -34,7 +36,7 @@ use super::codec::{
     strip_0x_offset,
 }
 
-pub const MAX_ORACLES: usize = 3
+pub const MAX_ORACLES: usize = 4
 pub const MAX_FEEDS_PER_NODE: usize = 4
 pub const MAX_ROUNDS_HISTORY: usize = 32
 pub const MAX_WIRE_SLOTS: usize = 16
@@ -103,6 +105,8 @@ pub struct WireQuoteSlot {
     pub round_id: u64,
     pub prices: [u64; 20],
     pub timestamp: u64,
+    pub signer_addr: [u8; 20],
+    pub signer_hex: FixedStr<48>,
     pub rx_count: u32,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
@@ -154,7 +158,7 @@ impl Copy for OnChainSnap {}
 pub struct TelemetryEngine {
     pub onchain: OnChainSnap,
     pub oracle_count: usize,
-    pub nodes: [NodeSnap; 3],
+    pub nodes: [NodeSnap; 4],
     pub rounds_head: usize,
     pub rounds_len: usize,
     pub rounds: [RoundSample; 32],
@@ -273,10 +277,11 @@ impl TelemetryEngine {
     pub fn build_rpc_batch(self, _ out: mut MemBuffer) {
         var contract_buf = MemBuffer::empty()
         self.onchain.contract_addr.write_to(mut contract_buf)
-        let addrs: [FixedStr<48>; 3] = [
+        let addrs: [FixedStr<48>; 4] = [
             self.nodes[0].evm_addr,
             self.nodes[1].evm_addr,
             self.nodes[2].evm_addr,
+            self.nodes[3].evm_addr,
         ]
         build_rpc_batch_into(
             target_addr: contract_buf.span(),
@@ -470,7 +475,8 @@ impl TelemetryEngine {
             }
             return false
         }
-        if id >= 7 && id < 10 {
+        let max_oracles_u64: u64 = MAX_ORACLES.downcast_unchecked()
+        if id >= 7 && id < 7 + max_oracles_u64 {
             let idx: usize = (id - 7).downcast_unchecked()
             if idx < MAX_ORACLES {
                 if let Option::Some((off, len)) = json_get_str_bounds(item, "result".span()) {
@@ -631,7 +637,22 @@ impl TelemetryEngine {
     }
 
     fn recompute_wire_metrics(mut self) {
-        if self.wire_quote_count >= 3 {
+        if self.wire_quote_count >= 4 {
+            self.wire_group_medians = median_prices_4(
+                self.wire_quotes[0].prices,
+                self.wire_quotes[1].prices,
+                self.wire_quotes[2].prices,
+                self.wire_quotes[3].prices,
+            )
+            self.wire_round_ts = median_u64_4(
+                [
+                    self.wire_quotes[0].timestamp,
+                    self.wire_quotes[1].timestamp,
+                    self.wire_quotes[2].timestamp,
+                    self.wire_quotes[3].timestamp,
+                ],
+            )
+        } else if self.wire_quote_count >= 3 {
             self.wire_group_medians = median_prices_3(
                 self.wire_quotes[0].prices,
                 self.wire_quotes[1].prices,
@@ -644,30 +665,32 @@ impl TelemetryEngine {
                     self.wire_quotes[2].timestamp,
                 ],
             )
-            var breach = false
-            var breach_asset: i64 = -1
-            var i: usize = 0
-            while i < self.wire_quote_count && i < MAX_WIRE_SLOTS {
-                if let Option::Some(bad_idx) = first_tolerance_breach_asset(
-                    local: self.wire_quotes[i].prices,
-                    proposed: self.wire_group_medians,
-                    max_bps: MAX_TOLERANCE_BPS,
-                ) {
-                    breach = true
-                    if breach_asset < 0 {
-                        breach_asset = bad_idx.downcast_unchecked()
-                    }
-                }
-                i += 1
-            }
-            self.wire_breach_detected = breach
-            self.wire_breach_asset = breach_asset
         } else {
             self.wire_group_medians = [0; 20]
             self.wire_round_ts = 0
             self.wire_breach_detected = false
             self.wire_breach_asset = -1
+            return
         }
+
+        var breach = false
+        var breach_asset: i64 = -1
+        var i: usize = 0
+        while i < self.wire_quote_count && i < MAX_WIRE_SLOTS {
+            if let Option::Some(bad_idx) = first_tolerance_breach_asset(
+                local: self.wire_quotes[i].prices,
+                proposed: self.wire_group_medians,
+                max_bps: MAX_TOLERANCE_BPS,
+            ) {
+                breach = true
+                if breach_asset < 0 {
+                    breach_asset = bad_idx.downcast_unchecked()
+                }
+            }
+            i += 1
+        }
+        self.wire_breach_detected = breach
+        self.wire_breach_asset = breach_asset
     }
 
     pub fn ingest_wire_frame(
@@ -694,11 +717,23 @@ impl TelemetryEngine {
 
             let trimmed_peer = peer_tag.trim()
             let peer_key = FixedStr<64>::from_span(trimmed_peer)
+            var has_signer = false
+            var si: usize = 0
+            while si < 20 {
+                if q.signer_addr[si] != 0 {
+                    has_signer = true
+                    break
+                }
+                si += 1
+            }
+
             var existing_idx: Option<usize> = Option::None
             var i: usize = 0
             while i < self.wire_quote_count {
                 let slot = self.wire_quotes[i]
-                let match_slot = if !peer_key.is_empty() && !slot.peer_tag.is_empty() {
+                let match_slot = if has_signer {
+                    addr20_eq(slot.signer_addr, q.signer_addr)
+                } else if !peer_key.is_empty() && !slot.peer_tag.is_empty() {
                     slot.peer_tag.equals(peer_key)
                 } else {
                     prices_eq(slot.prices, q.prices) && slot.timestamp == q.timestamp
@@ -719,11 +754,15 @@ impl TelemetryEngine {
                 Option::None => {
                     if self.wire_quote_count < MAX_WIRE_SLOTS {
                         let idx = self.wire_quote_count
+                        var qhex = MemBuffer::empty()
+                        push_addr20_hex(q.signer_addr, mut qhex)
                         self.wire_quotes[idx] = WireQuoteSlot {
                             used: true,
                             round_id: q.round_id,
                             prices: q.prices,
                             timestamp: q.timestamp,
+                            signer_addr: q.signer_addr,
+                            signer_hex: FixedStr<48>::from_span(qhex.span()),
                             rx_count: 1,
                             first_seen_ms: now_ms,
                             last_seen_ms: now_ms,

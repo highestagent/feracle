@@ -1,17 +1,29 @@
+use core::num::IntDowncast
+use std::net::{Net, SocketAddr}
 use std::time::Clock
-use coro::Scheduler
-use feracle_core::{QuoteMsg, SigMsg, add_sig_dedup, decode_quote, decode_sig_msg, prices_eq}
+use coro::{Poll, Scheduler}
+use feracle_core::{
+    NODE_COUNT,
+    QuoteMsg,
+    SigMsg,
+    add_sig_dedup,
+    addr20_eq,
+    all_prices_nonzero,
+    decode_quote,
+    decode_sig_msg,
+    prices_eq,
+}
 use net_reactor::SocketIo
 use super::ffi
 use super::network::PeerSession
+use super::rpc::QueryIsOracle
 use super::telemetry::TelemetrySink
 
 const MAX_PENDING_MSGS: usize = 32
 const MAX_FUTURE_ROUND_LOOKAHEAD: u64 = 2
-
-pub struct SourcedQuote { pub origin: u64, pub quote: QuoteMsg }
-
-impl Copy for SourcedQuote {}
+const MAX_AUTH_CACHE: usize = 32
+const MAX_WAIT_QUEUE: usize = 16
+const AUTH_CACHE_TTL_MS: u64 = 60_000
 
 pub enum QuoteRouting {
     BufferPending,
@@ -21,18 +33,29 @@ pub enum QuoteRouting {
 
 impl Copy for QuoteRouting {}
 
-pub fn add_quote_dedup(_ list: mut MemVec<SourcedQuote>, _ item: SourcedQuote, max_len: usize) {
+enum AuthLookup {
+    Authorized,
+    Rejected,
+    Unknown,
+}
+
+impl Copy for AuthLookup {}
+
+struct AuthEntry { addr: [u8; 20], authorized: bool, checked_ms: u64, permanent: bool }
+
+impl Copy for AuthEntry {}
+
+pub fn add_quote_dedup(_ list: mut MemVec<QuoteMsg>, _ item: QuoteMsg, max_len: usize) {
     if max_len > 0 && list.len() >= max_len {
         return
     }
-    if item.origin != 0 {
-        var i: usize = 0
-        while i < list.len() {
-            if list[i].origin == item.origin && list[i].quote.round_id == item.quote.round_id {
-                return
-            }
-            i += 1
+    var i: usize = 0
+    while i < list.len() {
+        let existing = list[i]
+        if existing.round_id == item.round_id && addr20_eq(existing.signer_addr, item.signer_addr) {
+            return
         }
+        i += 1
     }
     list.push(item)
 }
@@ -44,15 +67,378 @@ fn add_pending_sig_bounded(_ pending_sigs: mut MemVec<SigMsg>, _ s: SigMsg) {
     add_sig_dedup(mut pending_sigs, s)
 }
 
+fn route_verified_quote(
+    _ q: QuoteMsg,
+    round_id: u64,
+    quote_routing: QuoteRouting,
+    _ quotes: mut MemVec<QuoteMsg>,
+    _ pending_quotes: mut MemVec<QuoteMsg>,
+) {
+    let quote_cap: usize = NODE_COUNT.downcast_unchecked()
+    if q.round_id == round_id {
+        match quote_routing {
+            QuoteRouting::AcceptCurrent => add_quote_dedup(mut quotes, q, max_len: quote_cap),
+            QuoteRouting::BufferPending => {
+                add_quote_dedup(mut pending_quotes, q, max_len: MAX_PENDING_MSGS)
+            },
+            QuoteRouting::IgnoreCurrent => {},
+        }
+    } else if q.round_id > round_id && q.round_id <= round_id + MAX_FUTURE_ROUND_LOOKAHEAD {
+        add_quote_dedup(mut pending_quotes, q, max_len: MAX_PENDING_MSGS)
+    }
+}
+
+fn route_verified_sig(
+    _ s: SigMsg,
+    round_id: u64,
+    accept_sigs: bool,
+    expected_prices: [u64; 20],
+    expected_ts: u64,
+    _ sigs: mut MemVec<SigMsg>,
+    _ pending_sigs: mut MemVec<SigMsg>,
+) {
+    if s.round_id == round_id {
+        if accept_sigs
+            && prices_eq(s.median_prices, expected_prices)
+            && s.timestamp == expected_ts {
+            add_sig_dedup(mut sigs, s)
+        } else if !accept_sigs {
+            add_pending_sig_bounded(mut pending_sigs, s)
+        }
+    } else if s.round_id > round_id && s.round_id <= round_id + MAX_FUTURE_ROUND_LOOKAHEAD {
+        add_pending_sig_bounded(mut pending_sigs, s)
+    }
+}
+
+pub struct OracleAuthCache {
+    rpc_addr: SocketAddr,
+    rpc_path: MemBuffer,
+    contract_0x: MemBuffer,
+    entries: MemVec<AuthEntry>,
+    auth_queue: MemVec<[u8; 20]>,
+    wait_quotes: MemVec<QuoteMsg>,
+    wait_sigs: MemVec<SigMsg>,
+    inflight: Option<([u8; 20], QueryIsOracle)>,
+}
+
+fn pop_front_addr(_ queue: mut MemVec<[u8; 20]>) -> Option<[u8; 20]> {
+    if queue.is_empty() {
+        return Option::None
+    }
+    let front = queue[0]
+    var i: usize = 1
+    while i < queue.len() {
+        queue[i - 1] = queue[i]
+        i += 1
+    }
+    let _ = queue.pop()
+    Option::Some(front)
+}
+
+impl OracleAuthCache {
+    pub fn new(
+        self_addr20: [u8; 20],
+        rpc_addr: SocketAddr,
+        rpc_path: own MemBuffer,
+        contract_0x: own MemBuffer,
+    ) -> Self {
+        var entries = MemVec<AuthEntry>::new()
+        entries
+            .push(
+                AuthEntry { addr: self_addr20, authorized: true, checked_ms: 0, permanent: true },
+            )
+        OracleAuthCache {
+            rpc_addr,
+            rpc_path,
+            contract_0x,
+            entries,
+            auth_queue: MemVec::new(),
+            wait_quotes: MemVec::new(),
+            wait_sigs: MemVec::new(),
+            inflight: Option::None,
+        }
+    }
+
+    fn lookup(self, _ addr: [u8; 20], now_ms: u64) -> AuthLookup {
+        var i: usize = 0
+        while i < self.entries.len() {
+            let entry = self.entries[i]
+            if addr20_eq(entry.addr, addr) {
+                if entry.permanent || now_ms < entry.checked_ms + AUTH_CACHE_TTL_MS {
+                    return if entry.authorized {
+                        AuthLookup::Authorized
+                    } else {
+                        AuthLookup::Rejected
+                    }
+                }
+                return AuthLookup::Unknown
+            }
+            i += 1
+        }
+        AuthLookup::Unknown
+    }
+
+    fn record_auth(mut self, _ addr: [u8; 20], authorized: bool, now_ms: u64) {
+        var i: usize = 0
+        while i < self.entries.len() {
+            if addr20_eq(self.entries[i].addr, addr) {
+                if !self.entries[i].permanent {
+                    self.entries[i].authorized = authorized
+                    self.entries[i].checked_ms = now_ms
+                }
+                return
+            }
+            i += 1
+        }
+        let fresh = AuthEntry { addr, authorized, checked_ms: now_ms, permanent: false }
+        if self.entries.len() < MAX_AUTH_CACHE {
+            self.entries.push(fresh)
+            return
+        }
+        var oldest_idx: Option<usize> = Option::None
+        var oldest_ts: u64 = 0
+        var j: usize = 0
+        while j < self.entries.len() {
+            let e = self.entries[j]
+            if !e.permanent && (oldest_idx.is_none() || e.checked_ms < oldest_ts) {
+                oldest_idx = Option::Some(j)
+                oldest_ts = e.checked_ms
+            }
+            j += 1
+        }
+        if let Option::Some(idx) = oldest_idx {
+            self.entries[idx] = fresh
+        }
+    }
+
+    fn enqueue_addr(mut self, _ addr: [u8; 20]) {
+        if let Option::Some((cur_addr, _)) = self.inflight {
+            if addr20_eq(cur_addr, addr) {
+                return
+            }
+        }
+        var i: usize = 0
+        while i < self.auth_queue.len() {
+            if addr20_eq(self.auth_queue[i], addr) {
+                return
+            }
+            i += 1
+        }
+        if self.auth_queue.len() < MAX_WAIT_QUEUE {
+            self.auth_queue.push(addr)
+        }
+    }
+
+    fn enqueue_quote(mut self, _ q: QuoteMsg) {
+        add_quote_dedup(mut self.wait_quotes, q, max_len: MAX_WAIT_QUEUE)
+        self.enqueue_addr(q.signer_addr)
+    }
+
+    fn enqueue_sig(mut self, _ s: SigMsg) {
+        if self.wait_sigs.len() < MAX_WAIT_QUEUE {
+            add_sig_dedup(mut self.wait_sigs, s)
+        }
+        self.enqueue_addr(s.signer_addr)
+    }
+
+    fn flush_waiters_for(
+        mut self,
+        _ addr: [u8; 20],
+        authorized: bool,
+        round_id: u64,
+        quote_routing: QuoteRouting,
+        accept_sigs: bool,
+        expected_prices: [u64; 20],
+        expected_ts: u64,
+        _ quotes: mut MemVec<QuoteMsg>,
+        _ pending_quotes: mut MemVec<QuoteMsg>,
+        _ sigs: mut MemVec<SigMsg>,
+        _ pending_sigs: mut MemVec<SigMsg>,
+    ) {
+        var keep_quotes = MemVec<QuoteMsg>::new()
+        var qi: usize = 0
+        while qi < self.wait_quotes.len() {
+            let q = self.wait_quotes[qi]
+            if addr20_eq(q.signer_addr, addr) {
+                if authorized {
+                    route_verified_quote(q, round_id, quote_routing, mut quotes, mut pending_quotes)
+                }
+            } else {
+                keep_quotes.push(q)
+            }
+            qi += 1
+        }
+        self.wait_quotes = keep_quotes
+
+        var keep_sigs = MemVec<SigMsg>::new()
+        var si: usize = 0
+        while si < self.wait_sigs.len() {
+            let s = self.wait_sigs[si]
+            if addr20_eq(s.signer_addr, addr) {
+                if authorized {
+                    route_verified_sig(
+                        s,
+                        round_id,
+                        accept_sigs,
+                        expected_prices,
+                        expected_ts,
+                        mut sigs,
+                        mut pending_sigs,
+                    )
+                }
+            } else {
+                keep_sigs.push(s)
+            }
+            si += 1
+        }
+        self.wait_sigs = keep_sigs
+    }
+
+    fn pump_queue(
+        mut self,
+        round_id: u64,
+        quote_routing: QuoteRouting,
+        accept_sigs: bool,
+        expected_prices: [u64; 20],
+        expected_ts: u64,
+        _ quotes: mut MemVec<QuoteMsg>,
+        _ pending_quotes: mut MemVec<QuoteMsg>,
+        _ sigs: mut MemVec<SigMsg>,
+        _ pending_sigs: mut MemVec<SigMsg>,
+    )
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let now_ms = sched.now_ms()
+        while self.inflight.is_none() {
+            let Option::Some(addr) = pop_front_addr(mut self.auth_queue) else {
+                return
+            }
+            match self.lookup(addr, now_ms) {
+                AuthLookup::Authorized => self.flush_waiters_for(
+                    addr,
+                    authorized: true,
+                    round_id,
+                    quote_routing,
+                    accept_sigs,
+                    expected_prices,
+                    expected_ts,
+                    mut quotes,
+                    mut pending_quotes,
+                    mut sigs,
+                    mut pending_sigs,
+                ),
+                AuthLookup::Rejected => self.flush_waiters_for(
+                    addr,
+                    authorized: false,
+                    round_id,
+                    quote_routing,
+                    accept_sigs,
+                    expected_prices,
+                    expected_ts,
+                    mut quotes,
+                    mut pending_quotes,
+                    mut sigs,
+                    mut pending_sigs,
+                ),
+                AuthLookup::Unknown => {
+                    let query = QueryIsOracle::start(
+                        rpc_addr: self.rpc_addr,
+                        rpc_path: self.rpc_path.span(),
+                        contract_0x: self.contract_0x.span(),
+                        addr20: addr,
+                    )
+                    self.inflight = Option::Some((addr, query))
+                    return
+                },
+            }
+        }
+    }
+
+    pub fn poll_checks(
+        mut self,
+        round_id: u64,
+        quote_routing: QuoteRouting,
+        accept_sigs: bool,
+        expected_prices: [u64; 20],
+        expected_ts: u64,
+        _ quotes: mut MemVec<QuoteMsg>,
+        _ pending_quotes: mut MemVec<QuoteMsg>,
+        _ sigs: mut MemVec<SigMsg>,
+        _ pending_sigs: mut MemVec<SigMsg>,
+    )
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        if let Option::Some((addr, mut query)) = self.inflight {
+            if let Poll::Ready(res_opt) = query.poll() {
+                self.inflight = Option::None
+                let now_ms = sched.now_ms()
+                match res_opt {
+                    Option::Some(authorized) => {
+                        self.record_auth(addr, authorized, now_ms)
+                        self.flush_waiters_for(
+                            addr,
+                            authorized,
+                            round_id,
+                            quote_routing,
+                            accept_sigs,
+                            expected_prices,
+                            expected_ts,
+                            mut quotes,
+                            mut pending_quotes,
+                            mut sigs,
+                            mut pending_sigs,
+                        )
+                    },
+                    Option::None => self.flush_waiters_for(
+                        addr,
+                        authorized: false,
+                        round_id,
+                        quote_routing,
+                        accept_sigs,
+                        expected_prices,
+                        expected_ts,
+                        mut quotes,
+                        mut pending_quotes,
+                        mut sigs,
+                        mut pending_sigs,
+                    ),
+                }
+            }
+        }
+        self.pump_queue(
+            round_id,
+            quote_routing,
+            accept_sigs,
+            expected_prices,
+            expected_ts,
+            mut quotes,
+            mut pending_quotes,
+            mut sigs,
+            mut pending_sigs,
+        )
+    }
+
+    pub fn cancel(mut self) uses (sched: mut Scheduler, io: mut SocketIo) {
+        if let Option::Some((_, mut query)) = self.inflight {
+            query.cancel()
+            self.inflight = Option::None
+        }
+        self.auth_queue.clear()
+        self.wait_quotes.clear()
+        self.wait_sigs.clear()
+    }
+}
+
 pub fn poll_all_messages(
     peer: mut PeerSession,
     telemetry: mut TelemetrySink,
+    auth_cache: mut OracleAuthCache,
     round_id: u64,
     chain_id: u64,
     contract20: MemSpan,
     quote_routing: QuoteRouting,
-    _ quotes: mut MemVec<SourcedQuote>,
-    _ pending_quotes: mut MemVec<SourcedQuote>,
+    _ quotes: mut MemVec<QuoteMsg>,
+    _ pending_quotes: mut MemVec<QuoteMsg>,
     _ sigs: mut MemVec<SigMsg>,
     _ pending_sigs: mut MemVec<SigMsg>,
     accept_sigs: bool,
@@ -60,26 +446,37 @@ pub fn poll_all_messages(
     expected_ts: u64,
     _ scratch: mut MemBuffer,
 )
-uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
 {
-    while let Option::Some(origin) = peer.poll_into(mut scratch, mut telemetry) {
+    let now_ms = sched.now_ms()
+    while let Option::Some(_) = peer.poll_into(mut scratch, mut telemetry) {
         let span = scratch.span()
         match decode_quote(span) {
             Option::Some(q) => {
-                let sq = SourcedQuote { origin, quote: q }
+                if q.round_id < round_id || q.round_id > round_id + MAX_FUTURE_ROUND_LOOKAHEAD {
+                    continue
+                }
                 if q.round_id == round_id {
-                    match quote_routing {
-                        QuoteRouting::AcceptCurrent => {
-                            add_quote_dedup(mut quotes, sq, max_len: 3)
-                        },
-                        QuoteRouting::BufferPending => {
-                            add_quote_dedup(mut pending_quotes, sq, max_len: MAX_PENDING_MSGS)
-                        },
-                        QuoteRouting::IgnoreCurrent => {},
+                    if let QuoteRouting::IgnoreCurrent = quote_routing {
+                        continue
                     }
-                } else if q.round_id > round_id
-                    && q.round_id <= round_id + MAX_FUTURE_ROUND_LOOKAHEAD {
-                    add_quote_dedup(mut pending_quotes, sq, max_len: MAX_PENDING_MSGS)
+                }
+                if !all_prices_nonzero(q.prices) {
+                    continue
+                }
+                if !ffi::verify_quote(chain_id, contract20, quote: q) {
+                    continue
+                }
+                match auth_cache.lookup(q.signer_addr, now_ms) {
+                    AuthLookup::Authorized => route_verified_quote(
+                        q,
+                        round_id,
+                        quote_routing,
+                        mut quotes,
+                        mut pending_quotes,
+                    ),
+                    AuthLookup::Rejected => {},
+                    AuthLookup::Unknown => auth_cache.enqueue_quote(q),
                 }
             },
             Option::None => {
@@ -90,19 +487,33 @@ uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
                     if !ffi::verify_sig(chain_id, contract20, sig: s) {
                         continue
                     }
-                    if s.round_id == round_id {
-                        if accept_sigs
-                            && prices_eq(s.median_prices, expected_prices)
-                            && s.timestamp == expected_ts {
-                            add_sig_dedup(mut sigs, s)
-                        } else if !accept_sigs {
-                            add_pending_sig_bounded(mut pending_sigs, s)
-                        }
-                    } else {
-                        add_pending_sig_bounded(mut pending_sigs, s)
+                    match auth_cache.lookup(s.signer_addr, now_ms) {
+                        AuthLookup::Authorized => route_verified_sig(
+                            s,
+                            round_id,
+                            accept_sigs,
+                            expected_prices,
+                            expected_ts,
+                            mut sigs,
+                            mut pending_sigs,
+                        ),
+                        AuthLookup::Rejected => {},
+                        AuthLookup::Unknown => auth_cache.enqueue_sig(s),
                     }
                 }
             },
         }
     }
+    auth_cache
+        .poll_checks(
+            round_id,
+            quote_routing,
+            accept_sigs,
+            expected_prices,
+            expected_ts,
+            mut quotes,
+            mut pending_quotes,
+            mut sigs,
+            mut pending_sigs,
+        )
 }

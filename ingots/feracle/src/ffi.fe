@@ -32,6 +32,54 @@ extern {
         _ r32_ptr: *u8,
         _ s32_ptr: *u8,
     ) -> i32
+    fn crypto_verify_keccak_bytes_sig(
+        _ data_ptr: *u8,
+        _ data_len: usize,
+        _ expected_addr20_ptr: *u8,
+        _ v: u32,
+        _ r32_ptr: *u8,
+        _ s32_ptr: *u8,
+    ) -> i32
+}
+
+fn read_addr20(_ buf: ref MemBuffer) -> [u8; 20] {
+    var out: [u8; 20] = [0; 20]
+    var i: usize = 0
+    while i < 20 {
+        out[i] = buf[i]
+        i += 1
+    }
+    out
+}
+
+fn write_addr20(_ addr: [u8; 20]) -> MemBuffer {
+    var buf = MemBuffer::new(20)
+    var i: usize = 0
+    while i < 20 {
+        buf[i] = addr[i]
+        i += 1
+    }
+    buf
+}
+
+fn read_word32(_ buf: ref MemBuffer) -> [u8; 32] {
+    var out: [u8; 32] = [0; 32]
+    var i: usize = 0
+    while i < 32 {
+        out[i] = buf[i]
+        i += 1
+    }
+    out
+}
+
+fn write_word32(_ word: [u8; 32]) -> MemBuffer {
+    var buf = MemBuffer::new(32)
+    var i: usize = 0
+    while i < 32 {
+        buf[i] = word[i]
+        i += 1
+    }
+    buf
 }
 
 pub fn sign_digest(
@@ -69,31 +117,15 @@ pub fn sign_digest(
         return Option::None
     }
 
-    var signer_addr: [u8; 20] = [0; 20]
-    var i: usize = 0
-    while i < 20 {
-        signer_addr[i] = addr_buf[i]
-        i += 1
-    }
-
-    var r: [u8; 32] = [0; 32]
-    var s: [u8; 32] = [0; 32]
-    var j: usize = 0
-    while j < 32 {
-        r[j] = r_buf[j]
-        s[j] = s_buf[j]
-        j += 1
-    }
-
     Option::Some(
         feracle_core::SigMsg {
             round_id,
             timestamp,
             median_prices: prices,
-            signer_addr,
+            signer_addr: read_addr20(ref addr_buf),
             v: v_buf[0],
-            r,
-            s,
+            r: read_word32(ref r_buf),
+            s: read_word32(ref s_buf),
         },
     )
 }
@@ -124,22 +156,43 @@ pub fn sign_raw_bytes(privkey32: MemSpan, data: MemSpan) -> Option<
         return Option::None
     }
 
-    var addr: [u8; 20] = [0; 20]
-    var i: usize = 0
-    while i < 20 {
-        addr[i] = addr_buf[i]
-        i += 1
-    }
-    var r: [u8; 32] = [0; 32]
-    var s: [u8; 32] = [0; 32]
-    var j: usize = 0
-    while j < 32 {
-        r[j] = r_buf[j]
-        s[j] = s_buf[j]
-        j += 1
-    }
     let rec_id = rec_buf[0]
-    Option::Some((addr, rec_id, r, s))
+    Option::Some(
+        (read_addr20(ref addr_buf), rec_id, read_word32(ref r_buf), read_word32(ref s_buf)),
+    )
+}
+
+pub fn sign_quote(
+    privkey32: MemSpan,
+    chain_id: u64,
+    contract20: MemSpan,
+    round_id: u64,
+    timestamp: u64,
+    prices: [u64; 20],
+) -> Option<feracle_core::QuoteMsg> {
+    var preimage = MemBuffer::with_capacity(feracle_core::QUOTE_PREIMAGE_LEN)
+    if !feracle_core::encode_quote_sign_preimage(
+        chain_id,
+        contract20,
+        round_id,
+        timestamp,
+        prices,
+        mut preimage,
+    ) {
+        return Option::None
+    }
+    let (addr, rec_id, r, s) = sign_raw_bytes(privkey32, data: preimage.span())?
+    Option::Some(
+        feracle_core::QuoteMsg {
+            round_id,
+            timestamp,
+            prices,
+            signer_addr: addr,
+            v: 27 + (rec_id & 1),
+            r,
+            s,
+        },
+    )
 }
 
 pub fn derive_eth_addr(privkey32: MemSpan) -> Option<[u8; 20]> {
@@ -153,13 +206,7 @@ pub fn derive_eth_addr(privkey32: MemSpan) -> Option<[u8; 20]> {
     if rc != 0 {
         return Option::None
     }
-    var addr: [u8; 20] = [0; 20]
-    var i: usize = 0
-    while i < 20 {
-        addr[i] = addr_buf[i]
-        i += 1
-    }
-    Option::Some(addr)
+    Option::Some(read_addr20(ref addr_buf))
 }
 
 pub fn verify_sig(chain_id: u64, contract20: MemSpan, sig: feracle_core::SigMsg) -> bool {
@@ -167,20 +214,9 @@ pub fn verify_sig(chain_id: u64, contract20: MemSpan, sig: feracle_core::SigMsg)
         return false
     }
     let prices_buf = feracle_core::encode_prices_be160(sig.median_prices)
-    var expected_buf = MemBuffer::new(20)
-    var i: usize = 0
-    while i < 20 {
-        expected_buf[i] = sig.signer_addr[i]
-        i += 1
-    }
-    var r_buf = MemBuffer::new(32)
-    var s_buf = MemBuffer::new(32)
-    var j: usize = 0
-    while j < 32 {
-        r_buf[j] = sig.r[j]
-        s_buf[j] = sig.s[j]
-        j += 1
-    }
+    let expected_buf = write_addr20(sig.signer_addr)
+    let r_buf = write_word32(sig.r)
+    let s_buf = write_word32(sig.s)
     let rc = unsafe {
         crypto_verify_oracle_sig(
             chain_id,
@@ -190,6 +226,34 @@ pub fn verify_sig(chain_id: u64, contract20: MemSpan, sig: feracle_core::SigMsg)
             sig.timestamp,
             expected_buf.ptr(),
             sig.v as u32,
+            r_buf.ptr(),
+            s_buf.ptr(),
+        )
+    }
+    rc == 1
+}
+
+pub fn verify_quote(chain_id: u64, contract20: MemSpan, quote: feracle_core::QuoteMsg) -> bool {
+    var preimage = MemBuffer::with_capacity(feracle_core::QUOTE_PREIMAGE_LEN)
+    if !feracle_core::encode_quote_sign_preimage(
+        chain_id,
+        contract20,
+        round_id: quote.round_id,
+        timestamp: quote.timestamp,
+        prices: quote.prices,
+        mut preimage,
+    ) {
+        return false
+    }
+    let expected_buf = write_addr20(quote.signer_addr)
+    let r_buf = write_word32(quote.r)
+    let s_buf = write_word32(quote.s)
+    let rc = unsafe {
+        crypto_verify_keccak_bytes_sig(
+            preimage.ptr(),
+            preimage.len(),
+            expected_buf.ptr(),
+            quote.v as u32,
             r_buf.ptr(),
             s_buf.ptr(),
         )

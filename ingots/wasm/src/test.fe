@@ -69,7 +69,7 @@ fn sample_prices() -> [u64; 20] {
 fn make_configured_engine() -> *TelemetryEngine {
     let p = TelemetryEngine::alloc_new()
     let target_contract = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-    let oracles = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+    let oracles = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC,0x90F79bf6EB2c4f870365E785982E1f101E93b906"
     unsafe {
         (*p).configure(
                 contract_hex: target_contract.span(),
@@ -106,6 +106,12 @@ fn test_rpc_batch_generation_and_selectors() {
         contains_span(
             s,
             "0xa97e5c930000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc".span(),
+        ),
+    )
+    assert!(
+        contains_span(
+            s,
+            "0xa97e5c9300000000000000000000000090f79bf6eb2c4f870365e785982e1f101e93b906".span(),
         ),
     )
 }
@@ -179,6 +185,9 @@ fn test_rpc_ingest_and_price_formatting() {
         "\"},",
         "{\"id\":9,\"result\":\"",
         bool_true,
+        "\"},",
+        "{\"id\":10,\"result\":\"",
+        bool_true,
         "\"}]",
     )
 
@@ -200,6 +209,7 @@ fn test_rpc_ingest_and_price_formatting() {
         assert!((*p).nodes[0].is_authorized_onchain)
         assert!((*p).nodes[1].is_authorized_onchain)
         assert!((*p).nodes[2].is_authorized_onchain)
+        assert!((*p).nodes[3].is_authorized_onchain)
         assert!((*p).rounds_len == 1)
         assert!((*p).round_at(0).round_id == 2)
         assert!((*p).round_at(0).expected_leader_idx == 2)
@@ -218,14 +228,50 @@ fn test_wire_quote_and_sig_decoding_with_breach_detection() {
     var higher_eth = sample_prices()
     higher_eth[1] = 342_210_000_000
 
+    var addr0: [u8; 20] = [0; 20]
+    addr0[0] = 0xf3
+    addr0[19] = 0x66
+    var addr1: [u8; 20] = [0; 20]
+    addr1[0] = 0x70
+    addr1[19] = 0xc8
+    var addr2: [u8; 20] = [0; 20]
+    addr2[0] = 0x3c
+    addr2[19] = 0xbc
+    var qr: [u8; 32] = [0x11; 32]
+    var qs: [u8; 32] = [0x22; 32]
+
     let q0 = encode_quote_buf(
-        QuoteMsg { round_id: 3, timestamp: 1_795_255_398, prices: outlier_eth },
+        QuoteMsg {
+            round_id: 3,
+            timestamp: 1_795_255_398,
+            prices: outlier_eth,
+            signer_addr: addr0,
+            v: 27,
+            r: qr,
+            s: qs,
+        },
     )
     let q1 = encode_quote_buf(
-        QuoteMsg { round_id: 3, timestamp: 1_795_255_399, prices: normal_p },
+        QuoteMsg {
+            round_id: 3,
+            timestamp: 1_795_255_399,
+            prices: normal_p,
+            signer_addr: addr1,
+            v: 27,
+            r: qr,
+            s: qs,
+        },
     )
     let q2 = encode_quote_buf(
-        QuoteMsg { round_id: 3, timestamp: 1_795_255_400, prices: higher_eth },
+        QuoteMsg {
+            round_id: 3,
+            timestamp: 1_795_255_400,
+            prices: higher_eth,
+            signer_addr: addr2,
+            v: 28,
+            r: qr,
+            s: qs,
+        },
     )
 
     var h0 = MemBuffer::empty()
@@ -281,6 +327,38 @@ fn test_wire_quote_and_sig_decoding_with_breach_detection() {
         assert!((*p).wire_group_medians[1] == 342_210_000_000)
         assert!((*p).wire_breach_detected)
         assert!((*p).wire_breach_asset == 1)
+
+        var addr3: [u8; 20] = [0; 20]
+        addr3[0] = 0x90
+        addr3[19] = 0x06
+        var fourth_eth = sample_prices()
+        fourth_eth[1] = 342_130_000_000
+        let q3 = encode_quote_buf(
+            QuoteMsg {
+                round_id: 3,
+                timestamp: 1_795_255_402,
+                prices: fourth_eth,
+                signer_addr: addr3,
+                v: 28,
+                r: qr,
+                s: qs,
+            },
+        )
+        var h3 = MemBuffer::empty()
+        push_hex_span(q3.span(), mut h3)
+        assert!(
+            (*p)
+                .ingest_wire_frame(
+                    frame_hex: h3.span(),
+                    peer_tag: "12D3KooWNode3".span(),
+                    is_tx: false,
+                    now_ms,
+                ),
+        )
+        assert!((*p).wire_quote_count == 4)
+        // Sorted 4-quote ETH: [342_050_000_000, 342_130_000_000, 342_210_000_000, 9_999_900_000_000]
+        assert!((*p).wire_group_medians[1] == 342_170_000_000)
+        assert!((*p).wire_breach_detected)
 
         var addr1: [u8; 20] = [0; 20]
         addr1[0] = 0x70

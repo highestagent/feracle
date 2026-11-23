@@ -37,7 +37,7 @@ pub fn build_cli() -> App {
         .arg(
             Arg::option("node-id")
                 .short(b'n')
-                .value_name("0|1|2")
+                .value_name("0|1|2|3")
                 .env("FERACLE_NODE_ID")
                 .required()
                 .help("Zero-based oracle node index"),
@@ -145,7 +145,7 @@ pub fn load_config() -> Result<CliError, NodeConfig> uses (cli: Cli) {
             CliError::InvalidValue {
                 arg: format!("--node-id"),
                 value: format!(node_id),
-                detail: format!("must be 0, 1, or 2"),
+                detail: format!("must be < ", feracle_core::NODE_COUNT),
             },
         )
     }
