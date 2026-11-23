@@ -25,8 +25,8 @@ use feracle_core::{
 use net_reactor::SocketIo
 use super::config::NodeConfig
 use super::feeds::{FeedReport, FetchFeedsCoro, feed_kind_name}
-use super::ffi
-use super::network::PeerSession
+use super::crypto::Crypto
+use super::network::PeerMesh
 use super::round_io::{OracleAuthCache, QuoteRouting, add_quote_dedup, poll_all_messages}
 use super::rpc::{QueryCurrentRound, QueryRoundState}
 use super::submit::{SubmitMediansCoro, SubmitOutcome}
@@ -176,7 +176,7 @@ fn cancel_opt_sleep(_ slot: mut Option<Sleep>) uses (sched: mut Scheduler) {
 }
 
 fn cancel_state(_ state: mut ConsensusState)
-uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+uses (net: mut Net, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
 {
     match state {
         ConsensusState::MeshWarmup { started_ms: _, mut tick } => tick.cancel(),
@@ -252,14 +252,14 @@ fn quote_routing_for(_ state: ref ConsensusState) -> (QuoteRouting, bool) {
 }
 
 impl RoundContext {
-    fn drain_inbox(
+    fn drain_inbox<M: PeerMesh>(
         mut self,
         _ quote_routing: QuoteRouting,
         _ accept_sigs: bool,
-        _ peer: mut PeerSession,
+        _ peer: mut M,
         _ telemetry: mut TelemetrySink,
     )
-    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    uses (net: mut Net, clock: Clock, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
     {
         poll_all_messages(
             mut peer,
@@ -280,11 +280,11 @@ impl RoundContext {
         )
     }
 
-    fn step_rebroadcast(
+    fn step_rebroadcast<M: PeerMesh>(
         mut self,
         use_quote: bool,
         _ pub_sleep: mut Sleep,
-        _ peer: mut PeerSession,
+        _ peer: mut M,
         _ telemetry: mut TelemetrySink,
     )
     uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
@@ -341,15 +341,16 @@ impl RoundContext {
         }
     }
 
-    fn enter_phase_a_state(
+    fn enter_phase_a_state<M: PeerMesh>(
         mut self,
         _ prices: [u64; 20],
-        _ peer: mut PeerSession,
+        _ peer: mut M,
         _ telemetry: mut TelemetrySink,
     ) -> ConsensusState
     uses (
         net: mut Net,
         clock: Clock,
+        crypto: Crypto,
         out: mut Stdout,
         err: mut Stderr,
         sched: mut Scheduler,
@@ -380,14 +381,15 @@ impl RoundContext {
                 round_ts: self.local_ts,
             )
 
-        let self_quote = match ffi::sign_quote(
-            privkey32: self.config.privkey32.span(),
-            chain_id: self.config.chain_id,
-            contract20: self.config.contract20.span(),
-            round_id: self.round_id,
-            timestamp: self.local_ts,
-            prices: self.local_prices,
-        ) {
+        let self_quote = match crypto
+            .sign_quote(
+                privkey32: self.config.privkey32.span(),
+                chain_id: self.config.chain_id,
+                contract20: self.config.contract20.span(),
+                round_id: self.round_id,
+                timestamp: self.local_ts,
+                prices: self.local_prices,
+            ) {
             Option::Some(q) => q,
             Option::None => {
                 eprintln!(
@@ -448,14 +450,15 @@ impl RoundContext {
         }
     }
 
-    fn enter_phase_b_state(
+    fn enter_phase_b_state<M: PeerMesh>(
         mut self,
-        _ peer: mut PeerSession,
+        _ peer: mut M,
         _ telemetry: mut TelemetrySink,
     ) -> ConsensusState
     uses (
         net: mut Net,
         clock: Clock,
+        crypto: Crypto,
         out: mut Stdout,
         err: mut Stderr,
         sched: mut Scheduler,
@@ -535,14 +538,15 @@ impl RoundContext {
             }
         }
 
-        let self_sig = match ffi::sign_digest(
-            privkey32: self.config.privkey32.span(),
-            chain_id: self.config.chain_id,
-            contract20: self.config.contract20.span(),
-            round_id: self.round_id,
-            prices: self.group_medians,
-            timestamp: self.round_ts,
-        ) {
+        let self_sig = match crypto
+            .sign_digest(
+                privkey32: self.config.privkey32.span(),
+                chain_id: self.config.chain_id,
+                contract20: self.config.contract20.span(),
+                round_id: self.round_id,
+                prices: self.group_medians,
+                timestamp: self.round_ts,
+            ) {
             Option::Some(s) => s,
             Option::None => {
                 eprintln!(
@@ -758,15 +762,23 @@ impl ConsensusCoro {
         ConsensusCoro { ctx, state }
     }
 
+    pub fn round_id(self) -> u64 {
+        self.ctx.round_id
+    }
+
+    pub fn completed_rounds(self) -> u64 {
+        self.ctx.completed_rounds
+    }
+
     fn transition(mut self, _ next: own ConsensusState)
-    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    uses (net: mut Net, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
     {
         cancel_state(mut self.state)
         self.state = next
     }
 
     pub fn cancel(mut self)
-    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    uses (net: mut Net, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
     {
         self.transition(ConsensusState::Done(0))
         self.ctx.auth_cache.cancel()
@@ -774,10 +786,11 @@ impl ConsensusCoro {
         io.deregister_owner(self.ctx.owner)
     }
 
-    pub fn poll(mut self, _ peer: mut PeerSession, _ telemetry: mut TelemetrySink) -> Poll<i32>
+    pub fn poll<M: PeerMesh>(mut self, _ peer: mut M, _ telemetry: mut TelemetrySink) -> Poll<i32>
     uses (
         net: mut Net,
         clock: Clock,
+        crypto: Crypto,
         out: mut Stdout,
         err: mut Stderr,
         sched: mut Scheduler,

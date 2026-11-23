@@ -7,6 +7,7 @@ use coro::{Coroutine, LocalScheduler, Poll, Scheduler, Sleep, TaskId, block_on}
 use net_reactor::{NetDriver, NetPoller, SocketIo}
 use super::config::{build_cli, load_config}
 use super::consensus::ConsensusCoro
+use super::crypto::{Crypto, NativeCrypto}
 use super::ffi
 use super::network::PeerSession
 use super::telemetry::{TelemetryServer, TelemetrySink}
@@ -40,6 +41,7 @@ impl Coroutine for NodeCoro {
     uses E = (
         net: mut Net,
         clock: Clock,
+        crypto: Crypto,
         out: mut Stdout,
         err: mut Stderr,
         sched: mut Scheduler,
@@ -119,7 +121,8 @@ uses (args: Args, env: Env, out: mut Stdout, err: mut Stderr, net: mut Net, cloc
     build_cli()
         .run(
             |matches: Matches| -> i32 {
-                let config = match (with (Cli = matches) {
+                let native_crypto = NativeCrypto {}
+                let config = match (with (Cli = matches, Crypto = native_crypto) {
                     load_config()
                 }) {
                     Result::Ok(cfg) => cfg,
@@ -145,7 +148,7 @@ uses (args: Args, env: Env, out: mut Stdout, err: mut Stderr, net: mut Net, cloc
                     },
                 }
 
-                with (Scheduler = sched, SocketIo = io) {
+                with (Scheduler = sched, SocketIo = io, Crypto = native_crypto) {
                     let label = PeerSession::backend_label(config.p2p_backend)
                     println!(
                         "node ",

@@ -20,7 +20,7 @@ use feracle_core::{
 }
 use http::HttpRequest
 use net_reactor::SocketIo
-use super::ffi
+use super::crypto::Crypto
 use super::rpc::{RPC_TIMEOUT_MS, flatten_http_body, parse_rpc_str_result, start_rpc_request}
 
 const RECEIPT_ATTEMPT_TIMEOUT_MS: u64 = 4_000
@@ -305,7 +305,7 @@ impl SubmitMediansCoro {
     }
 
     fn begin_signed_broadcast(mut self) -> Poll<SubmitOutcome>
-    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    uses (net: mut Net, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
     {
         var unsigned_tx = MemBuffer::with_capacity(1150)
         match self.fee_mode {
@@ -339,10 +339,11 @@ impl SubmitMediansCoro {
             },
         }
 
-        let Option::Some((_, rec_id, r, s)) = ffi::sign_raw_bytes(
-            privkey32: self.privkey32.span(),
-            data: unsigned_tx.span(),
-        ) else {
+        let Option::Some((_, rec_id, r, s)) = crypto
+            .sign_raw_bytes(
+                privkey32: self.privkey32.span(),
+                data: unsigned_tx.span(),
+            ) else {
             return self.finish(
                 SubmitOutcome::Failed(
                     format!("failed to sign raw tx for round ", self.round_id),
@@ -462,7 +463,7 @@ impl SubmitMediansCoro {
 
 impl Coroutine for SubmitMediansCoro {
     type Output = SubmitOutcome
-    uses E = (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    uses E = (net: mut Net, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
 
     fn poll(mut self) -> Poll<SubmitOutcome> uses E {
         match self.phase {

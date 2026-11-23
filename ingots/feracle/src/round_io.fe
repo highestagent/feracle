@@ -14,8 +14,8 @@ use feracle_core::{
     prices_eq,
 }
 use net_reactor::SocketIo
-use super::ffi
-use super::network::PeerSession
+use super::crypto::Crypto
+use super::network::PeerMesh
 use super::rpc::QueryIsOracle
 use super::telemetry::TelemetrySink
 
@@ -429,8 +429,8 @@ impl OracleAuthCache {
     }
 }
 
-pub fn poll_all_messages(
-    peer: mut PeerSession,
+pub fn poll_all_messages<M: PeerMesh>(
+    peer: mut M,
     telemetry: mut TelemetrySink,
     auth_cache: mut OracleAuthCache,
     round_id: u64,
@@ -446,7 +446,7 @@ pub fn poll_all_messages(
     expected_ts: u64,
     _ scratch: mut MemBuffer,
 )
-uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+uses (net: mut Net, clock: Clock, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
 {
     let now_ms = sched.now_ms()
     while let Option::Some(_) = peer.poll_into(mut scratch, mut telemetry) {
@@ -464,7 +464,7 @@ uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
                 if !all_prices_nonzero(q.prices) {
                     continue
                 }
-                if !ffi::verify_quote(chain_id, contract20, quote: q) {
+                if !crypto.verify_quote(chain_id, contract20, quote: q) {
                     continue
                 }
                 match auth_cache.lookup(q.signer_addr, now_ms) {
@@ -484,7 +484,7 @@ uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
                     if s.round_id < round_id || s.round_id > round_id + MAX_FUTURE_ROUND_LOOKAHEAD {
                         continue
                     }
-                    if !ffi::verify_sig(chain_id, contract20, sig: s) {
+                    if !crypto.verify_sig(chain_id, contract20, sig: s) {
                         continue
                     }
                     match auth_cache.lookup(s.signer_addr, now_ms) {

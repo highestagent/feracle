@@ -1,0 +1,1709 @@
+use core::num::IntDowncast
+use std::io::{Error, ErrorKind, Stderr, Stdout}
+use std::net::{
+    IpAddr,
+    Ipv4Addr,
+    Interest,
+    Net,
+    Poller,
+    SocketAddr,
+    TcpListener,
+    TcpStream,
+    Token,
+    UdpSocket,
+}
+use std::time::Clock
+use cli::{BufferOutput, Cli, FromArg, Matches, MemoryInput, ValueSource}
+use coro::{Coroutine, Driver, LocalScheduler, Poll, Scheduler, TaskId, VirtualClockDriver, block_on}
+use feracle_core::{
+    ASSET_COUNT,
+    MSG_TYPE_QUOTE,
+    MSG_TYPE_SIG,
+    QuoteMsg,
+    SEL_CURRENT_ROUND,
+    SEL_IS_ORACLE,
+    SEL_LATEST_PRICES,
+    SigMsg,
+    decode_quote,
+    decode_sig_msg,
+    encode_quote_buf,
+    encode_sig_msg_buf,
+    push_hex_bytes,
+    write_asset_symbol,
+}
+use net_reactor::{IoEntry, IoEvent, IoSlot, SocketIo}
+use super::args::{FeedSources, HexAddr20, HexKey32, PeerBackend, RpcEndpoint}
+use super::config::{NodeConfig, build_cli, load_config}
+use super::consensus::ConsensusCoro
+use super::crypto::Crypto
+use super::feeds::{
+    FeedKind,
+    FeedSource,
+    FetchFeedsCoro,
+    compute_medians,
+    parse_binance_body,
+    parse_coinbase_price,
+    parse_hyperliquid_body,
+}
+use super::network::PeerMesh
+use super::round_io::{OracleAuthCache, QuoteRouting, add_quote_dedup, poll_all_messages}
+use super::rpc::{
+    QueryCurrentRound,
+    QueryIsOracle,
+    QueryRoundState,
+    RPC_TIMEOUT_MS,
+    flatten_http_body,
+    parse_eth_call_hex,
+    parse_rpc_str_result,
+}
+use super::telemetry::{TelemetryEvent, TelemetrySink, TelemetryState}
+
+fn fill_buf(_ tag: u8, _ len: usize) -> MemBuffer {
+    var buf = MemBuffer::new(len)
+    var i: usize = 0
+    while i < len {
+        buf[i] = tag
+        i += 1
+    }
+    buf
+}
+
+fn make_key(_ tag: u8) -> MemBuffer {
+    fill_buf(tag, 32)
+}
+
+fn make_key_hex(_ tag: u8) -> MemBuffer {
+    let raw = make_key(tag)
+    var hex = MemBuffer::with_capacity(66)
+    hex.extend_from("0x".span())
+    push_hex_bytes(mut hex, raw.span())
+    hex
+}
+
+fn make_contract20(_ tag: u8) -> MemBuffer {
+    fill_buf(tag, 20)
+}
+
+fn make_contract_0x(_ tag: u8) -> MemBuffer {
+    let raw = make_contract20(tag)
+    var hex = MemBuffer::with_capacity(42)
+    hex.extend_from("0x".span())
+    push_hex_bytes(mut hex, raw.span())
+    hex
+}
+
+fn make_addr20(_ tag: u8) -> [u8; 20] {
+    [tag; 20]
+}
+
+fn make_prices(_ btc_price: u64, _ other_base: u64) -> [u64; 20] {
+    var out: [u64; 20] = [0; 20]
+    out[0] = btc_price
+    var i: usize = 1
+    while i < ASSET_COUNT {
+        let idx_u64: u64 = i.downcast_unchecked()
+        out[i] = other_base + idx_u64 * 100_000_000
+        i += 1
+    }
+    out
+}
+
+fn is_all_zero32(_ s: MemSpan) -> bool {
+    var i: usize = 0
+    while i < 32 {
+        if s.byte_at(i) != 0 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn low_byte_u64(_ v: u64) -> u8 {
+    (v & 0xff).downcast_unchecked()
+}
+
+struct MockCrypto {}
+
+impl Copy for MockCrypto {}
+
+impl Crypto for MockCrypto {
+    fn derive_eth_addr(self, privkey32: MemSpan) -> Option<[u8; 20]> {
+        if privkey32.len() != 32 || is_all_zero32(privkey32) {
+            return Option::None
+        }
+        let tag = privkey32.byte_at(31)
+        if tag == 0 {
+            return Option::None
+        }
+        Option::Some([tag; 20])
+    }
+
+    fn sign_digest(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        prices: [u64; 20],
+        timestamp: u64,
+    ) -> Option<SigMsg> {
+        if contract20.len() != 20 {
+            return Option::None
+        }
+        let signer_addr = self.derive_eth_addr(privkey32: privkey32)?
+        var s: [u8; 32] = [0; 32]
+        s[0] = low_byte_u64(round_id) ^ 0x5A
+        s[1] = 0xAA
+        s[2] = low_byte_u64(chain_id)
+        Option::Some(
+            SigMsg {
+                round_id,
+                timestamp,
+                median_prices: prices,
+                signer_addr,
+                v: 27,
+                r: [signer_addr[0]; 32],
+                s,
+            },
+        )
+    }
+
+    fn sign_raw_bytes(self, privkey32: MemSpan, data: MemSpan) -> Option<
+        ([u8; 20], u8, [u8; 32], [u8; 32]),
+    > {
+        if data.is_empty() {
+            return Option::None
+        }
+        let addr = self.derive_eth_addr(privkey32: privkey32)?
+        Option::Some((addr, 0, [0x11; 32], [0x22; 32]))
+    }
+
+    fn sign_quote(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        timestamp: u64,
+        prices: [u64; 20],
+    ) -> Option<QuoteMsg> {
+        if contract20.len() != 20 {
+            return Option::None
+        }
+        let signer_addr = self.derive_eth_addr(privkey32: privkey32)?
+        var s: [u8; 32] = [0; 32]
+        s[0] = low_byte_u64(round_id) ^ 0x5A
+        s[1] = 0xAA
+        s[2] = low_byte_u64(chain_id)
+        Option::Some(
+            QuoteMsg {
+                round_id,
+                timestamp,
+                prices,
+                signer_addr,
+                v: 27,
+                r: [signer_addr[0]; 32],
+                s,
+            },
+        )
+    }
+
+    fn verify_sig(self, chain_id: u64, contract20: MemSpan, sig: SigMsg) -> bool {
+        if contract20.len() != 20 || sig.signer_addr[0] == 0 {
+            return false
+        }
+        sig.v == 27
+            && sig.r[0] == sig.signer_addr[0]
+            && sig.s[0] == (low_byte_u64(sig.round_id) ^ 0x5A)
+            && sig.s[1] == 0xAA
+            && sig.s[2] == low_byte_u64(chain_id)
+    }
+
+    fn verify_quote(self, chain_id: u64, contract20: MemSpan, quote: QuoteMsg) -> bool {
+        if contract20.len() != 20 || quote.signer_addr[0] == 0 {
+            return false
+        }
+        quote.v == 27
+            && quote.r[0] == quote.signer_addr[0]
+            && quote.s[0] == (low_byte_u64(quote.round_id) ^ 0x5A)
+            && quote.s[1] == 0xAA
+            && quote.s[2] == low_byte_u64(chain_id)
+    }
+}
+
+struct MockPeerMesh { inbox: MemVec<MemBuffer>, published: MemVec<MemBuffer>, peers: usize }
+
+impl MockPeerMesh {
+    fn new(_ peers: usize) -> Self {
+        MockPeerMesh { inbox: MemVec::new(), published: MemVec::new(), peers }
+    }
+
+    fn push_incoming(mut self, _ frame: MemSpan) {
+        self.inbox.push(MemBuffer::from_span(frame))
+    }
+}
+
+impl PeerMesh for MockPeerMesh {
+    fn publish(mut self, _ data: MemSpan, _ telemetry: mut TelemetrySink) -> bool
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    {
+        self.published.push(MemBuffer::from_span(data))
+        telemetry.record_frame(is_tx: true, peer: "local".span(), data)
+        true
+    }
+
+    fn poll_into(mut self, _ out: mut MemBuffer, _ telemetry: mut TelemetrySink) -> Option<u64>
+    uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    {
+        if self.inbox.is_empty() {
+            return Option::None
+        }
+        let first = MemBuffer::from_span(self.inbox[0].span())
+        var i: usize = 1
+        while i < self.inbox.len() {
+            self.inbox[i - 1] = MemBuffer::from_span(self.inbox[i].span())
+            i += 1
+        }
+        let _ = self.inbox.pop()
+        out.clear()
+        out.extend_from(first.span())
+        telemetry.record_frame(is_tx: false, peer: "peer-mock".span(), data: out.span())
+        Option::Some(1)
+    }
+
+    fn peer_count(self) -> usize {
+        self.peers
+    }
+}
+
+struct ScriptedMeta {
+    token: Token,
+    owner: TaskId,
+    tag: u32,
+    req_buf: MemBuffer,
+    resp_buf: MemBuffer,
+    resp_pos: usize,
+    resp_built: bool,
+    write_ready: bool,
+    read_ready: bool,
+    silent: bool,
+}
+
+struct ScriptedSocketIo {
+    poller: Poller<IoEntry>,
+    listener: TcpListener,
+    slots: MemVec<ScriptedMeta>,
+    ready_io: MemVec<IoEvent>,
+    onchain_round: u64,
+    last_updated: u64,
+    is_oracle_allow: bool,
+    deny_addr_hex: MemBuffer,
+    fail_next_cb_btc: bool,
+    cb_btc_attempts: usize,
+    advances_round_on_send: bool,
+    send_raw_count: usize,
+    timeout_all_http: bool,
+    captured_reqs: MemVec<MemBuffer>,
+}
+
+fn push_abi_u64_hex(_ out: mut MemBuffer, _ val: u64) {
+    var word = MemBuffer::new(32)
+    word.write_be<u64>(offset: 24, value: val)
+    push_hex_bytes(mut out, word.span())
+}
+
+fn wrap_http_response(_ status: MemSpan, _ body: MemSpan, _ out: mut MemBuffer) {
+    out.clear()
+    write!(
+        mut out,
+        "HTTP/1.1 ",
+        status,
+        "\r\nContent-Length: ",
+        body.len(),
+        "\r\nConnection: close\r\n\r\n",
+        body,
+    )
+}
+
+impl ScriptedSocketIo {
+    fn new(listen_addr: SocketAddr) -> Self uses (net: mut Net) {
+        var listener = net.listen(listen_addr).unwrap()
+        listener.set_nonblocking(true).unwrap()
+        ScriptedSocketIo {
+            poller: Poller<IoEntry>::new().unwrap(),
+            listener,
+            slots: MemVec::new(),
+            ready_io: MemVec::new(),
+            onchain_round: 1,
+            last_updated: 1,
+            is_oracle_allow: true,
+            deny_addr_hex: MemBuffer::empty(),
+            fail_next_cb_btc: false,
+            cb_btc_attempts: 0,
+            advances_round_on_send: false,
+            send_raw_count: 0,
+            timeout_all_http: false,
+            captured_reqs: MemVec::new(),
+        }
+    }
+
+    fn local_addr(self) -> SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
+
+    fn has_captured(self, _ needle: MemSpan) -> bool {
+        var i: usize = 0
+        while i < self.captured_reqs.len() {
+            if self.captured_reqs[i].span().index_of(needle).is_some() {
+                return true
+            }
+            i += 1
+        }
+        false
+    }
+
+    fn find_slot(self, _ token: Token) -> Option<usize> {
+        var i: usize = 0
+        while i < self.slots.len() {
+            if self.slots[i].token == token {
+                return Option::Some(i)
+            }
+            i += 1
+        }
+        Option::None
+    }
+
+    fn build_http_response(mut self, _ req: MemSpan, _ out: mut MemBuffer) -> bool {
+        self.captured_reqs.push(MemBuffer::from_span(req))
+        if self.timeout_all_http {
+            return false
+        }
+
+        if req.index_of("POST /info").is_some() {
+            var body = MemBuffer::with_capacity(512)
+            body.push(b'{')
+            var i: usize = 0
+            while i < ASSET_COUNT {
+                if i > 0 { body.push(b',') }
+                body.push(b'"')
+                write_asset_symbol(i, mut body)
+                body.extend_from("\":\"".span())
+                if i == 0 {
+                    body.extend_from("92450.50".span())
+                } else {
+                    write!(mut body, 100 + i, ".00")
+                }
+                body.push(b'"')
+                i += 1
+            }
+            body.push(b'}')
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        if req.index_of("GET /api/v3/ticker/price").is_some() {
+            var body = MemBuffer::with_capacity(1024)
+            body.push(b'[')
+            var i: usize = 0
+            while i < ASSET_COUNT {
+                if i > 0 { body.push(b',') }
+                body.extend_from("{\"symbol\":\"".span())
+                write_asset_symbol(i, mut body)
+                body.extend_from("USDT\",\"price\":\"".span())
+                if i == 0 {
+                    body.extend_from("92455.00".span())
+                } else {
+                    write!(mut body, 102 + i, ".00")
+                }
+                body.extend_from("\"}".span())
+                i += 1
+            }
+            body.push(b']')
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        if req.index_of("GET /products/").is_some() {
+            if req.index_of("/products/BTC-USD/").is_some() {
+                self.cb_btc_attempts += 1
+                if self.fail_next_cb_btc && self.cb_btc_attempts == 1 {
+                    wrap_http_response("500 Internal Server Error".span(), "err".span(), mut out)
+                    return true
+                }
+                let body = "{\"price\":\"92448.00\"}"
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+            let body = "{\"price\":\"101.00\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        if req.index_of("\"eth_call\"").is_some() {
+            let sel_round = format!(SEL_CURRENT_ROUND)
+            if req.index_of(sel_round.span()).is_some() {
+                var body = MemBuffer::with_capacity(128)
+                body.extend_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x".span())
+                push_abi_u64_hex(mut body, self.onchain_round)
+                body.extend_from("\"}".span())
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+            let sel_prices = format!(SEL_LATEST_PRICES)
+            if req.index_of(sel_prices.span()).is_some() {
+                var body = MemBuffer::with_capacity(1450)
+                body.extend_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x".span())
+                var w: usize = 0
+                while w < ASSET_COUNT {
+                    push_abi_u64_hex(mut body, 0)
+                    w += 1
+                }
+                push_abi_u64_hex(mut body, self.last_updated)
+                body.extend_from("\"}".span())
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+            let sel_oracle = format!(SEL_IS_ORACLE)
+            if req.index_of(sel_oracle.span()).is_some() {
+                var allow = self.is_oracle_allow
+                if !self.deny_addr_hex.is_empty()
+                    && req.index_of(self.deny_addr_hex.span()).is_some() {
+                    allow = false
+                }
+                var body = MemBuffer::with_capacity(128)
+                body.extend_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x".span())
+                push_abi_u64_hex(mut body, if allow { 1 } else { 0 })
+                body.extend_from("\"}".span())
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+        }
+
+        if req.index_of("\"eth_getTransactionCount\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x5\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_feeHistory\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"baseFeePerGas\":[\"0x3b9aca00\",\"0x3b9aca00\"],\"reward\":[[\"0x3b9aca00\"]]}}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_maxPriorityFeePerGas\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":\"0x3b9aca00\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_sendRawTransaction\"").is_some() {
+            self.send_raw_count += 1
+            if self.advances_round_on_send {
+                self.onchain_round += 1
+            }
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_getTransactionReceipt\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"status\":\"0x1\",\"blockNumber\":\"0x2\"}}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        wrap_http_response("404 Not Found".span(), "{}".span(), mut out)
+        true
+    }
+}
+
+impl SocketIo for ScriptedSocketIo {
+    fn register_tcp_listener(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ listener: own TcpListener,
+    ) -> Result<Error, Token> {
+        let entry = IoEntry {
+            owner,
+            tag,
+            interest: Interest::READABLE,
+            slot: IoSlot::TcpListener(listener),
+        }
+        self.poller.add(entry, Interest::READABLE)
+    }
+
+    fn register_tcp_stream(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ stream: own TcpStream,
+        _ interest: Interest,
+    ) -> Result<Error, Token> {
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::TcpStream(stream) }
+        let tok = self.poller.add(entry, interest)?
+        let silent = self.timeout_all_http
+        self.slots
+            .push(
+                ScriptedMeta {
+                    token: tok,
+                    owner,
+                    tag,
+                    req_buf: MemBuffer::empty(),
+                    resp_buf: MemBuffer::empty(),
+                    resp_pos: 0,
+                    resp_built: false,
+                    write_ready: !silent,
+                    read_ready: false,
+                    silent,
+                },
+            )
+        Result::Ok(tok)
+    }
+
+    fn register_udp_socket(mut self, owner: TaskId, tag: u32, _ sock: own UdpSocket) -> Result<
+        Error,
+        Token,
+    > {
+        let entry = IoEntry {
+            owner,
+            tag,
+            interest: Interest::READABLE,
+            slot: IoSlot::UdpSocket(sock),
+        }
+        self.poller.add(entry, Interest::READABLE)
+    }
+
+    fn register_raw_fd(mut self, owner: TaskId, tag: u32, fd: i32, _ interest: Interest) -> Result<
+        Error,
+        Token,
+    > {
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::RawFd(fd) }
+        self.poller.add(entry, interest)
+    }
+
+    fn set_interest(mut self, _ token: Token, _ interest: Interest) -> Result<Error, ()> {
+        let Option::Some(idx) = self.find_slot(token) else {
+            return Result::Ok(())
+        }
+        var should_build = false
+        var req_copy = MemBuffer::empty()
+        if let Option::Some(mut meta) = self.slots.get(idx) {
+            if !meta.resp_built {
+                meta.resp_built = true
+                should_build = true
+                req_copy = MemBuffer::from_span(meta.req_buf.span())
+            }
+        }
+        if should_build {
+            var resp = MemBuffer::empty()
+            let ok = self.build_http_response(req_copy.span(), mut resp)
+            if ok {
+                if let Option::Some(mut meta) = self.slots.get(idx) {
+                    meta.resp_buf = resp
+                    meta.resp_pos = 0
+                    meta.read_ready = true
+                }
+            } else {
+                if let Option::Some(mut meta) = self.slots.get(idx) {
+                    meta.silent = true
+                    meta.read_ready = false
+                }
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn deregister(mut self, _ token: Token) {
+        let _ = self.poller.remove(token)
+        if let Option::Some(idx) = self.find_slot(token) {
+            let _ = self.slots.swap_remove(idx)
+        }
+        var ri: usize = 0
+        while ri < self.ready_io.len() {
+            if self.ready_io[ri].token == token {
+                let _ = self.ready_io.swap_remove(ri)
+            } else {
+                ri += 1
+            }
+        }
+    }
+
+    fn deregister_owner(mut self, _ owner: TaskId) {
+        var to_remove = MemVec<Token>::new()
+        var i: usize = 0
+        while i < self.slots.len() {
+            if self.slots[i].owner == owner {
+                to_remove.push(self.slots[i].token)
+            }
+            i += 1
+        }
+        var ri: usize = 0
+        while ri < to_remove.len() {
+            self.deregister(to_remove[ri])
+            ri += 1
+        }
+    }
+
+    fn listener_accept(mut self, _ token: Token) -> Option<Result<Error, (TcpStream, SocketAddr)>> {
+        Option::None
+    }
+
+    fn stream_read(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<Result<Error, usize>> {
+        let idx = self.find_slot(token)?
+        let Option::Some(mut meta) = self.slots.get(idx) else {
+            return Option::None
+        }
+        if meta.silent {
+            return Option::Some(Result::Err(Error::new(ErrorKind::WouldBlock)))
+        }
+        let avail = meta.resp_buf.len() - meta.resp_pos
+        if avail == 0 {
+            return Option::Some(Result::Ok(0))
+        }
+        let n = if avail < buf.len() { avail } else { buf.len() }
+        var i: usize = 0
+        while i < n {
+            buf.write_be<u8>(offset: i, value: meta.resp_buf[meta.resp_pos + i])
+            i += 1
+        }
+        meta.resp_pos += n
+        Option::Some(Result::Ok(n))
+    }
+
+    fn stream_write(mut self, _ token: Token, _ bytes: MemSpan) -> Option<Result<Error, usize>> {
+        let idx = self.find_slot(token)?
+        if let Option::Some(mut meta) = self.slots.get(idx) {
+            meta.req_buf.extend_from(bytes)
+        }
+        Option::Some(Result::Ok(bytes.len()))
+    }
+
+    fn stream_take_error(mut self, _ token: Token) -> Option<Result<Error, Option<Error>>> {
+        let _ = self.find_slot(token)?
+        Option::Some(Result::Ok(Option::None))
+    }
+
+    fn udp_recv_from(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<
+        Result<Error, (usize, SocketAddr)>,
+    > {
+        Option::None
+    }
+
+    fn udp_send_to(mut self, _ token: Token, _ bytes: MemSpan, _ to: SocketAddr) -> Option<
+        Result<Error, usize>,
+    > {
+        Option::None
+    }
+
+    fn take_events_for(mut self, _ owner: TaskId, _ out: mut MemVec<IoEvent>) {
+        out.clear()
+        var i: usize = 0
+        while i < self.slots.len() {
+            if self.slots[i].owner == owner {
+                if let Option::Some(ev) = self.take_token_event(self.slots[i].token) {
+                    out.push(ev)
+                }
+            }
+            i += 1
+        }
+    }
+
+    fn take_token_event(mut self, _ token: Token) -> Option<IoEvent> {
+        let idx = self.find_slot(token)?
+        let Option::Some(mut meta) = self.slots.get(idx) else {
+            return Option::None
+        }
+        if meta.silent {
+            return Option::None
+        }
+        if meta.write_ready {
+            meta.write_ready = false
+            return Option::Some(
+                IoEvent {
+                    token,
+                    owner: meta.owner,
+                    tag: meta.tag,
+                    readable: false,
+                    writable: true,
+                    error: false,
+                    hangup: false,
+                },
+            )
+        }
+        if meta.read_ready {
+            return Option::Some(
+                IoEvent {
+                    token,
+                    owner: meta.owner,
+                    tag: meta.tag,
+                    readable: true,
+                    writable: false,
+                    error: false,
+                    hangup: false,
+                },
+            )
+        }
+        Option::None
+    }
+
+    fn has_ready_io(self) -> bool {
+        !self.ready_io.is_empty()
+    }
+
+    fn poll_os(mut self, timeout_ms: u64, _ woken_owners: mut MemVec<TaskId>) -> usize {
+        0
+    }
+}
+
+fn make_test_node_config(
+    node_id: u64,
+    key_tag: u8,
+    addr: SocketAddr,
+    rounds: u64,
+    round_timeout_secs: u64,
+) -> NodeConfig {
+    let mock = MockCrypto {}
+    let privkey32 = make_key(key_tag)
+    let self_addr20 = mock.derive_eth_addr(privkey32: privkey32.span()).unwrap()
+    var self_addr_0x = MemBuffer::with_capacity(42)
+    self_addr_0x.extend_from("0x".span())
+    let addr_raw = fill_buf(key_tag, 20)
+    push_hex_bytes(mut self_addr_0x, addr_raw.span())
+
+    var sources = MemVec<FeedSource>::new()
+    sources.push(FeedSource { kind: FeedKind::Hyperliquid, addr })
+    sources.push(FeedSource { kind: FeedKind::Binance, addr })
+    sources.push(FeedSource { kind: FeedKind::Coinbase, addr })
+
+    NodeConfig {
+        node_id,
+        p2p_backend: PeerBackend::Tcp,
+        p2p_port: 7001,
+        lan_discovery_port: 0,
+        telemetry_port: 0,
+        bootstrap: MemBuffer::empty(),
+        sources,
+        privkey32,
+        self_addr20,
+        self_addr_0x,
+        rpc_addr: addr,
+        rpc_path: MemBuffer::from_span("/".span()),
+        chain_id: 31337,
+        contract20: make_contract20(0x11),
+        contract_0x: make_contract_0x(0x11),
+        rounds,
+        round_timeout_secs,
+    }
+}
+
+#[test]
+fn test_feeds_parsers_and_medians() {
+    var hl_prices: [u64; 20] = [0; 20]
+    let hl_json = "{\"BTC\":\"92450.50\",\"UNKNOWN\":\"999\",\"ETH\":\"0\",\"ETH\":\"3400.25\",\"BTC\":\"111.00\",\"AAVE\":\"210.5\"}"
+    let hl_n = parse_hyperliquid_body(hl_json.span(), mut hl_prices)
+    assert!(hl_n == 3)
+    assert!(hl_prices[0] == 9245050000000)
+    assert!(hl_prices[1] == 340025000000)
+    assert!(hl_prices[19] == 21050000000)
+
+    var bn_prices: [u64; 20] = [0; 20]
+    let bn_json = "[{\"symbol\":\"BTCBUSD\",\"price\":\"1.00\"},{\"symbol\":\"BTCUSDT\",\"price\":\"92455.00\"},{\"symbol\":\"SOLUSDT\",\"price\":\"185.125\"},{\"symbol\":\"ETHUSDT\",\"price\":\"bad\"}]"
+    let bn_n = parse_binance_body(bn_json.span(), mut bn_prices)
+    assert!(bn_n == 2)
+    assert!(bn_prices[0] == 9245500000000)
+    assert!(bn_prices[2] == 18512500000)
+
+    assert!(
+        parse_coinbase_price("{\"price\":\"92448.00\"}".span()) == Option::Some(9244800000000),
+    )
+    assert!(parse_coinbase_price("{\"price\":\"0\"}".span()).is_none())
+    assert!(
+        parse_coinbase_price("{\"bid\":\"92448.00\"}".span()).is_none(),
+    )
+
+    var counts: [usize; 20] = [3; 20]
+    var s0: [u64; 20] = [100; 20]
+    var s1: [u64; 20] = [200; 20]
+    var s2: [u64; 20] = [300; 20]
+    s0[0] = 9245050000000
+    s1[0] = 9245500000000
+    s2[0] = 9244800000000
+    counts[1] = 2
+    s0[1] = 300000000000
+    s1[1] = 320000000000
+    counts[2] = 1
+    s0[2] = 15000000000
+
+    let meds = compute_medians(counts, s0, s1, s2).unwrap()
+    assert!(meds[0] == 9245050000000)
+    assert!(meds[1] == 310000000000)
+    assert!(meds[2] == 15000000000)
+
+    counts[5] = 0
+    assert!(compute_medians(counts, s0, s1, s2).is_none())
+}
+
+#[test]
+fn test_fetch_feeds_coro_and_coinbase_retry_backoff() uses (net: mut Net) {
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.fail_next_cb_btc = true
+    let srv_addr = io.local_addr()
+
+    var sources = MemVec<FeedSource>::new()
+    sources.push(FeedSource { kind: FeedKind::Hyperliquid, addr: srv_addr })
+    sources.push(FeedSource { kind: FeedKind::Binance, addr: srv_addr })
+    sources.push(FeedSource { kind: FeedKind::Coinbase, addr: srv_addr })
+
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 50)
+
+    let outcome = with (Scheduler = sched, SocketIo = io) {
+        var fetcher = FetchFeedsCoro::start(sources.as_slice())
+        block_on(mut fetcher, mut driver)
+    }
+
+    let medians = outcome.medians.unwrap()
+    assert!(medians[0] == 9245050000000)
+    assert!(medians[1] == 10100000000)
+    assert!(outcome.reports.len() == 3)
+    assert!(
+        outcome.reports[0].assets_ok == 20 && outcome.reports[0].ok,
+    )
+    assert!(
+        outcome.reports[1].assets_ok == 20 && outcome.reports[1].ok,
+    )
+    assert!(
+        outcome.reports[2].assets_ok == 20 && outcome.reports[2].ok,
+    )
+    assert!(io.cb_btc_attempts == 2)
+    assert!(sched.now_ms() >= 100)
+}
+
+#[test]
+fn test_rpc_parsers_and_coros() uses (net: mut Net) {
+    assert!(flatten_http_body(Option::None).is_none())
+    assert!(flatten_http_body(Option::Some(Option::None)).is_none())
+    assert!(
+        flatten_http_body(
+            Option::Some(Option::Some(MemBuffer::from_span("ok".span()))),
+        ).is_some(),
+    )
+
+    assert!(
+        parse_eth_call_hex("{\"result\":\"0x0003\"}".span()).unwrap() == "0003",
+    )
+    assert!(
+        parse_eth_call_hex("{\"result\":\"0003\"}".span()).is_none(),
+    )
+    assert!(
+        parse_rpc_str_result("{\"result\":\"0x5\"}".span()).unwrap() == "0x5",
+    )
+
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.onchain_round = 7
+    io.last_updated = 42
+    io.is_oracle_allow = true
+    let rpc_addr = io.local_addr()
+    let contract_0x = make_contract_0x(0x11)
+
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 1000)
+
+    with (Scheduler = sched, SocketIo = io) {
+        var q_round = QueryCurrentRound::start(
+            rpc_addr,
+            rpc_path: "/".span(),
+            contract_0x: contract_0x.span(),
+        )
+        assert!(block_on(mut q_round, mut driver) == Option::Some(7))
+
+        var q_state = QueryRoundState::start(
+            rpc_addr,
+            rpc_path: "/".span(),
+            contract_0x: contract_0x.span(),
+        )
+        let rs = block_on(mut q_state, mut driver)
+        assert!(rs.round_id == Option::Some(7) && rs.last_updated == 42)
+
+        var q_auth = QueryIsOracle::start(
+            rpc_addr,
+            rpc_path: "/".span(),
+            contract_0x: contract_0x.span(),
+            addr20: make_addr20(2),
+        )
+        assert!(block_on(mut q_auth, mut driver) == Option::Some(true))
+
+        io.timeout_all_http = true
+        var q_timeout = QueryCurrentRound::start(
+            rpc_addr,
+            rpc_path: "/".span(),
+            contract_0x: contract_0x.span(),
+        )
+        assert!(block_on(mut q_timeout, mut driver).is_none())
+    }
+    assert!(sched.now_ms() >= RPC_TIMEOUT_MS)
+}
+
+#[test]
+fn test_config_and_args_parsing() {
+    let libp2p_ok = if let Result::Ok(PeerBackend::Libp2p) = PeerBackend::from_arg(
+        "libp2p".span(),
+    ) {
+        true
+    } else {
+        false
+    }
+    assert!(libp2p_ok)
+    let tcp_ok = if let Result::Ok(PeerBackend::Tcp) = PeerBackend::from_arg("tcp".span()) {
+        true
+    } else {
+        false
+    }
+    assert!(tcp_ok)
+    let udp_ok = if let Result::Ok(PeerBackend::Udp) = PeerBackend::from_arg("udp".span()) {
+        true
+    } else {
+        false
+    }
+    assert!(udp_ok)
+    assert!(PeerBackend::from_arg("quic".span()).is_err())
+
+    assert!(HexKey32::from_arg(make_key_hex(1).span()).is_ok())
+    assert!(HexKey32::from_arg("0x1234".span()).is_err())
+    assert!(HexAddr20::from_arg(make_contract_0x(0x11).span()).is_ok())
+    assert!(HexAddr20::from_arg("0x11".span()).is_err())
+
+    let ep = RpcEndpoint::from_arg("http://127.0.0.1:8545/rpc".span()).unwrap()
+    assert!(ep.path == "/rpc")
+    assert!(RpcEndpoint::from_arg("not-an-addr".span()).is_err())
+
+    let srcs = FeedSources::from_arg(
+        "hyperliquid=127.0.0.1:9001,binance=127.0.0.1:9002,coinbase=127.0.0.1:9003".span(),
+    )
+        .unwrap()
+    assert!(srcs.list.len() == 3)
+    assert!(
+        FeedSources::from_arg("bad=127.0.0.1:9001".span()).is_err(),
+    )
+
+    let valid_input = MemoryInput::new("feracle")
+        .arg("--node-id")
+        .arg("2")
+        .arg("--p2p-backend")
+        .arg("udp")
+        .arg("--p2p-port")
+        .arg("7003")
+        .arg("--sources")
+        .arg("hyperliquid=127.0.0.1:9001")
+        .arg("--rpc-url")
+        .arg("http://127.0.0.1:8545/v1")
+        .arg("--chain-id")
+        .arg("31337")
+        .arg("--contract")
+        .arg(make_contract_0x(0x11))
+        .arg("--rounds")
+        .arg("3")
+        .env("FERACLE_PRIVKEY_HEX", make_key_hex(3))
+
+    var valid_out = BufferOutput::new()
+    let valid_rc = build_cli()
+        .run_io(
+            valid_input,
+            mut valid_out,
+            |matches: Matches| -> i32 {
+                let mock_crypto = MockCrypto {}
+                if let Option::Some(ValueSource::Env) = matches.value_source("privkey-hex") {
+                    with (Cli = matches, Crypto = mock_crypto) {
+                        if let Result::Ok(cfg) = load_config() {
+                            let is_udp = if let PeerBackend::Udp = cfg.p2p_backend {
+                                true
+                            } else {
+                                false
+                            }
+                            if cfg.node_id == 2
+                                && is_udp
+                                && cfg.rpc_path == "/v1"
+                                && cfg.rounds == 3
+                                && cfg.self_addr20[0] == 3 {
+                                return 0
+                            }
+                        }
+                    }
+                }
+                1
+            },
+        )
+    assert!(valid_rc == 0)
+
+    let bad_id_input = MemoryInput::new("feracle")
+        .arg("--node-id")
+        .arg("4")
+        .arg("--p2p-port")
+        .arg("7003")
+        .arg("--sources")
+        .arg("hyperliquid=127.0.0.1:9001")
+        .arg("--rpc-url")
+        .arg("http://127.0.0.1:8545")
+        .arg("--chain-id")
+        .arg("31337")
+        .arg("--contract")
+        .arg(make_contract_0x(0x11))
+        .env("FERACLE_PRIVKEY_HEX", make_key_hex(1))
+    var bad_id_out = BufferOutput::new()
+    let bad_id_rc = build_cli()
+        .run_io(
+            bad_id_input,
+            mut bad_id_out,
+            |matches: Matches| -> i32 {
+                let mock_crypto = MockCrypto {}
+                with (Cli = matches, Crypto = mock_crypto) {
+                    if let Result::Err(err) = load_config() {
+                        return err.exit_code()
+                    }
+                }
+                0
+            },
+        )
+    assert!(bad_id_rc != 0)
+
+    let zero_key_input = MemoryInput::new("feracle")
+        .arg("--node-id")
+        .arg("0")
+        .arg("--p2p-port")
+        .arg("7001")
+        .arg("--sources")
+        .arg("hyperliquid=127.0.0.1:9001")
+        .arg("--rpc-url")
+        .arg("http://127.0.0.1:8545")
+        .arg("--chain-id")
+        .arg("31337")
+        .arg("--contract")
+        .arg(make_contract_0x(0x11))
+        .env("FERACLE_PRIVKEY_HEX", make_key_hex(0))
+    var zero_key_out = BufferOutput::new()
+    let zero_key_rc = build_cli()
+        .run_io(
+            zero_key_input,
+            mut zero_key_out,
+            |matches: Matches| -> i32 {
+                let mock_crypto = MockCrypto {}
+                with (Cli = matches, Crypto = mock_crypto) {
+                    if let Result::Err(err) = load_config() {
+                        return err.exit_code()
+                    }
+                }
+                0
+            },
+        )
+    assert!(zero_key_rc != 0)
+}
+
+#[test]
+fn test_telemetry_state_json_sse_and_ring_buffer() {
+    var st = TelemetryState::new(
+        node_id: 1,
+        peer_id: format!("fe-tcp-node1"),
+        p2p_port: 7002,
+    )
+    assert!(
+        st.update_peers(peer_count: 2, peers_csv: "peerA, peerB".span()),
+    )
+    assert!(
+        !st.update_peers(peer_count: 2, peers_csv: "peerA, peerB".span()),
+    )
+
+    let lp = make_prices(9245050000000, 10000000000)
+    let gm = make_prices(9245150000000, 10000000000)
+    st.set_phase(
+        round_id: 4,
+        phase: "phase_a_quotes".span(),
+        local_prices: lp,
+        group_medians: gm,
+        round_ts: 1700000000,
+    )
+    st.set_feed(
+        slot: 0,
+        provider: "hyperliquid".span(),
+        addr: "127.0.0.1:9001".span(),
+        price: 9245050000000,
+        assets_ok: 20,
+        ok: true,
+        latency_ms: 12,
+    )
+    assert!(st.record_event(TelemetryEvent::ToleranceBreach))
+    assert!(
+        st.record_event(TelemetryEvent::SubmitOk { duration_ms: 85 }),
+    )
+    assert!(
+        st.record_event(TelemetryEvent::SubmitErr { duration_ms: 140 }),
+    )
+
+    var q_frame = MemBuffer::new(262)
+    q_frame[0] = MSG_TYPE_QUOTE
+    let sse = st
+        .record_frame(
+            is_tx: true,
+            peer: "local".span(),
+            data: q_frame.span(),
+            ts_ms: 500,
+            format_sse: true,
+        )
+    assert!(sse.span().index_of("\"event\":\"frame\"").is_some())
+    assert!(sse.span().index_of("\"dir\":\"tx\"").is_some())
+
+    let no_frames_ev = st.encode_status_event_json(include_frames: false)
+    assert!(
+        no_frames_ev.span().index_of("\"event\":\"status\"").is_some(),
+    )
+    assert!(
+        no_frames_ev.span().index_of("\"recent_frames\"").is_none(),
+    )
+
+    let with_frames_ev = st.encode_status_event_json(include_frames: true)
+    assert!(
+        with_frames_ev.span().index_of("\"event\":\"status\"").is_some(),
+    )
+    assert!(
+        with_frames_ev.span().index_of("\"recent_frames\":[").is_some(),
+    )
+
+    // Push 134 more sig frames (total 135 > MAX_RECENT_FRAMES=128) to verify circular eviction.
+    var s_frame = MemBuffer::new(262)
+    s_frame[0] = MSG_TYPE_SIG
+    var i: usize = 0
+    while i < 134 {
+        let off: u64 = i.downcast_unchecked()
+        let _ = st
+            .record_frame(
+                is_tx: false,
+                peer: "peerA".span(),
+                data: s_frame.span(),
+                ts_ms: 600 + off,
+                format_sse: false,
+            )
+        i += 1
+    }
+
+    let status = st.encode_status_json()
+    let sp = status.span()
+    assert!(sp.index_of("\"recent_frames\":[").is_some())
+    assert!(sp.index_of("\"seq\":7,").is_none())
+    assert!(sp.index_of("\"seq\":8,").is_some())
+    assert!(sp.index_of("\"seq\":135,").is_some())
+    assert!(sp.index_of("\"quotes_tx\":1,").is_some())
+    assert!(sp.index_of("\"sigs_rx\":134,").is_some())
+
+    assert!(!st.record_event(TelemetryEvent::RoundStarted))
+    let post_reset = st.encode_status_json()
+    assert!(post_reset.span().index_of("\"feeds\":[]").is_some())
+}
+
+#[test]
+fn test_round_io_auth_cache_and_forged_rejection()
+uses (net: mut Net, clock: Clock)
+{
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.is_oracle_allow = true
+    var deny_hex = MemBuffer::with_capacity(40)
+    let deny_buf = fill_buf(9, 20)
+    push_hex_bytes(mut deny_hex, deny_buf.span())
+    io.deny_addr_hex = deny_hex
+    let rpc_addr = io.local_addr()
+
+    var sched = LocalScheduler::new(0)
+    let mock = MockCrypto {}
+    var peer = MockPeerMesh::new(3)
+    var telemetry = TelemetrySink::Disabled
+
+    let c20 = make_contract20(0x11)
+    let prices = make_prices(9245050000000, 10000000000)
+
+    let k1 = make_key(1)
+    let q_valid = mock
+        .sign_quote(
+            privkey32: k1.span(),
+            chain_id: 31337,
+            contract20: c20.span(),
+            round_id: 1,
+            timestamp: 100,
+            prices,
+        )
+        .unwrap()
+    peer.push_incoming(encode_quote_buf(q_valid).span())
+
+    var q_forged = q_valid
+    q_forged.s[1] = 0xff
+    peer.push_incoming(encode_quote_buf(q_forged).span())
+
+    let k9 = make_key(9)
+    let q_unauth = mock
+        .sign_quote(
+            privkey32: k9.span(),
+            chain_id: 31337,
+            contract20: c20.span(),
+            round_id: 1,
+            timestamp: 100,
+            prices,
+        )
+        .unwrap()
+    peer.push_incoming(encode_quote_buf(q_unauth).span())
+
+    let k2 = make_key(2)
+    let q_future = mock
+        .sign_quote(
+            privkey32: k2.span(),
+            chain_id: 31337,
+            contract20: c20.span(),
+            round_id: 2,
+            timestamp: 100,
+            prices,
+        )
+        .unwrap()
+    peer.push_incoming(encode_quote_buf(q_future).span())
+
+    var s_forged = mock
+        .sign_digest(
+            privkey32: k1.span(),
+            chain_id: 31337,
+            contract20: c20.span(),
+            round_id: 1,
+            prices,
+            timestamp: 100,
+        )
+        .unwrap()
+    s_forged.v = 99
+    peer.push_incoming(encode_sig_msg_buf(s_forged).span())
+
+    var quotes = MemVec<QuoteMsg>::new()
+    var pending_quotes = MemVec<QuoteMsg>::new()
+    var sigs = MemVec<SigMsg>::new()
+    var pending_sigs = MemVec<SigMsg>::new()
+    var scratch = MemBuffer::empty()
+
+    with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+        var cache = OracleAuthCache::new(
+            self_addr20: make_addr20(4),
+            rpc_addr,
+            rpc_path: MemBuffer::from_span("/".span()),
+            contract_0x: make_contract_0x(0x11),
+        )
+
+        var step: usize = 0
+        while step < 6 {
+            poll_all_messages(
+                mut peer,
+                mut telemetry,
+                auth_cache: mut cache,
+                round_id: 1,
+                chain_id: 31337,
+                contract20: c20.span(),
+                quote_routing: QuoteRouting::AcceptCurrent,
+                mut quotes,
+                mut pending_quotes,
+                mut sigs,
+                mut pending_sigs,
+                accept_sigs: true,
+                expected_prices: prices,
+                expected_ts: 100,
+                mut scratch,
+            )
+            step += 1
+        }
+
+        assert!(quotes.len() == 1 && quotes[0].signer_addr[0] == 1)
+        assert!(
+            pending_quotes.len() == 1 && pending_quotes[0].round_id == 2,
+        )
+        assert!(sigs.is_empty() && pending_sigs.is_empty())
+
+        add_quote_dedup(mut quotes, q_valid, max_len: 2)
+        assert!(quotes.len() == 1)
+
+        // Cached authorized oracle 1 routes under BufferPending without new RPC queries.
+        let calls_before = io.captured_reqs.len()
+        peer.push_incoming(encode_quote_buf(q_valid).span())
+        var buffered = MemVec<QuoteMsg>::new()
+        poll_all_messages(
+            mut peer,
+            mut telemetry,
+            auth_cache: mut cache,
+            round_id: 1,
+            chain_id: 31337,
+            contract20: c20.span(),
+            quote_routing: QuoteRouting::BufferPending,
+            mut quotes,
+            mut buffered,
+            mut sigs,
+            mut pending_sigs,
+            accept_sigs: false,
+            expected_prices: prices,
+            expected_ts: 100,
+            mut scratch,
+        )
+        assert!(buffered.len() == 1)
+        assert!(io.captured_reqs.len() == calls_before)
+        cache.cancel()
+    }
+}
+
+fn push_mock_quote(
+    _ peer: mut MockPeerMesh,
+    key_tag: u8,
+    contract20: MemSpan,
+    round_id: u64,
+    timestamp: u64,
+    prices: [u64; 20],
+) {
+    let mock = MockCrypto {}
+    let k = make_key(key_tag)
+    let q = mock
+        .sign_quote(
+            privkey32: k.span(),
+            chain_id: 31337,
+            contract20,
+            round_id,
+            timestamp,
+            prices,
+        )
+        .unwrap()
+    peer.push_incoming(encode_quote_buf(q).span())
+}
+
+fn push_mock_sig(
+    _ peer: mut MockPeerMesh,
+    key_tag: u8,
+    contract20: MemSpan,
+    round_id: u64,
+    prices: [u64; 20],
+    timestamp: u64,
+) {
+    let mock = MockCrypto {}
+    let k = make_key(key_tag)
+    let s = mock
+        .sign_digest(
+            privkey32: k.span(),
+            chain_id: 31337,
+            contract20,
+            round_id,
+            prices,
+            timestamp,
+        )
+        .unwrap()
+    peer.push_incoming(encode_sig_msg_buf(s).span())
+}
+
+#[test]
+fn test_consensus_coro_happy_path_submit()
+uses (net: mut Net, clock: Clock, out: mut Stdout, err: mut Stderr)
+{
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.onchain_round = 1
+    io.last_updated = 1
+    io.advances_round_on_send = true
+    let addr = io.local_addr()
+
+    let cfg = make_test_node_config(
+        node_id: 1,
+        key_tag: 2,
+        addr,
+        rounds: 1,
+        round_timeout_secs: 6,
+    )
+    let mock = MockCrypto {}
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 50)
+    var peer = MockPeerMesh::new(3)
+    var telemetry = TelemetrySink::Disabled
+
+    let c20 = make_contract20(0x11)
+    var injected_quotes = false
+    var injected_sigs = false
+    var exit_code: Option<i32> = Option::None
+
+    with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+        var cons = ConsensusCoro::new(config: cfg)
+        var ticks: usize = 0
+        while ticks < 200 {
+            driver.begin_tick()
+            let res = cons.poll(mut peer, mut telemetry)
+
+            var pi: usize = 0
+            while pi < peer.published.len() {
+                let q_opt = decode_quote(peer.published[pi].span())
+                let s_opt = decode_sig_msg(peer.published[pi].span())
+                if !injected_quotes {
+                    if let Option::Some(self_q) = q_opt {
+                        injected_quotes = true
+                        let p1 = make_prices(9245100000000, 10050000000)
+                        let p2 = make_prices(9245200000000, 10150000000)
+                        let p3 = make_prices(9245300000000, 10200000000)
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p1,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 3,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p2,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 4,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p3,
+                        )
+                    }
+                }
+                if !injected_sigs {
+                    if let Option::Some(self_s) = s_opt {
+                        injected_sigs = true
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 3,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                    }
+                }
+                pi += 1
+            }
+
+            if let Poll::Ready(code) = res {
+                exit_code = Option::Some(code)
+                assert!(cons.completed_rounds() == 1)
+                break
+            }
+            driver.wait()
+            ticks += 1
+        }
+    }
+
+    assert!(exit_code == Option::Some(0))
+    assert!(io.send_raw_count == 1)
+    assert!(io.has_captured("\"eth_feeHistory\"".span()))
+}
+
+#[test]
+fn test_consensus_coro_quorum_grace_and_backup_failover()
+uses (net: mut Net, clock: Clock, out: mut Stdout, err: mut Stderr)
+{
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.onchain_round = 1
+    io.last_updated = 1
+    io.advances_round_on_send = true
+    let addr = io.local_addr()
+
+    let cfg = make_test_node_config(
+        node_id: 2,
+        key_tag: 3,
+        addr,
+        rounds: 1,
+        round_timeout_secs: 6,
+    )
+    let mock = MockCrypto {}
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 150)
+    var peer = MockPeerMesh::new(3)
+    var telemetry = TelemetrySink::Disabled
+
+    let c20 = make_contract20(0x11)
+    var injected_quotes = false
+    var injected_sigs = false
+    var phase_a_ms: u64 = 0
+    var phase_b_ms: u64 = 0
+    var settling_ms: u64 = 0
+    var exit_code: Option<i32> = Option::None
+
+    with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+        var cons = ConsensusCoro::new(config: cfg)
+        var ticks: usize = 0
+        while ticks < 250 {
+            driver.begin_tick()
+            let res = cons.poll(mut peer, mut telemetry)
+
+            var pi: usize = 0
+            while pi < peer.published.len() {
+                let q_opt = decode_quote(peer.published[pi].span())
+                let s_opt = decode_sig_msg(peer.published[pi].span())
+                if !injected_quotes {
+                    if let Option::Some(self_q) = q_opt {
+                        injected_quotes = true
+                        phase_a_ms = sched.now_ms()
+                        let p1 = make_prices(9245100000000, 10050000000)
+                        let p2 = make_prices(9245200000000, 10150000000)
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p1,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 2,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p2,
+                        )
+                    }
+                }
+                if !injected_sigs {
+                    if let Option::Some(self_s) = s_opt {
+                        injected_sigs = true
+                        phase_b_ms = sched.now_ms()
+                        settling_ms = phase_b_ms
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 2,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                    }
+                }
+                pi += 1
+            }
+
+            if injected_sigs && sched.now_ms() < settling_ms + 3000 {
+                assert!(io.send_raw_count == 0)
+            }
+            if let Poll::Ready(code) = res {
+                exit_code = Option::Some(code)
+                assert!(cons.completed_rounds() == 1)
+                break
+            }
+            driver.wait()
+            ticks += 1
+        }
+    }
+
+    assert!(exit_code == Option::Some(0))
+    assert!(phase_b_ms >= phase_a_ms + 2000)
+    assert!(sched.now_ms() >= settling_ms + 3000)
+    assert!(io.send_raw_count == 1)
+}
+
+#[test]
+fn test_consensus_coro_tolerance_breach_no_submit()
+uses (net: mut Net, clock: Clock, out: mut Stdout, err: mut Stderr)
+{
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.onchain_round = 1
+    io.last_updated = 1
+    let addr = io.local_addr()
+
+    let cfg = make_test_node_config(
+        node_id: 1,
+        key_tag: 2,
+        addr,
+        rounds: 1,
+        round_timeout_secs: 6,
+    )
+    let mock = MockCrypto {}
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 150)
+    var peer = MockPeerMesh::new(3)
+    var telemetry = TelemetrySink::Disabled
+
+    let c20 = make_contract20(0x11)
+    var injected_quotes = false
+    var breach_started_ms: u64 = 0
+    var exit_code: Option<i32> = Option::None
+
+    with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+        var cons = ConsensusCoro::new(config: cfg)
+        var ticks: usize = 0
+        while ticks < 200 {
+            driver.begin_tick()
+            let res = cons.poll(mut peer, mut telemetry)
+
+            var pi: usize = 0
+            while pi < peer.published.len() {
+                let s_opt = decode_sig_msg(peer.published[pi].span())
+                assert!(s_opt.is_none())
+                let q_opt = decode_quote(peer.published[pi].span())
+                if !injected_quotes {
+                    if let Option::Some(self_q) = q_opt {
+                        injected_quotes = true
+                        breach_started_ms = sched.now_ms()
+                        let p_bad = make_prices(20000000000000, 10050000000)
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p_bad,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 3,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p_bad,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 4,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p_bad,
+                        )
+                    }
+                }
+                pi += 1
+            }
+
+            if injected_quotes && sched.now_ms() >= breach_started_ms + 300 {
+                io.onchain_round = 2
+            }
+            if let Poll::Ready(code) = res {
+                exit_code = Option::Some(code)
+                assert!(cons.completed_rounds() == 1)
+                break
+            }
+            driver.wait()
+            ticks += 1
+        }
+    }
+
+    assert!(exit_code == Option::Some(0))
+    assert!(io.send_raw_count == 0)
+}

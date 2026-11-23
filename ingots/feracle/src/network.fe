@@ -10,6 +10,16 @@ use super::args::PeerBackend
 use super::config::NodeConfig
 use super::telemetry::TelemetrySink
 
+pub trait PeerMesh {
+    fn publish(mut self, _ data: MemSpan, _ telemetry: mut TelemetrySink) -> bool
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+
+    fn poll_into(mut self, _ out: mut MemBuffer, _ telemetry: mut TelemetrySink) -> Option<u64>
+    uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+
+    fn peer_count(self) -> usize
+}
+
 enum EngineInner {
     Libp2p(Libp2pTransport),
     Tcp(TcpEngine),
@@ -270,5 +280,23 @@ impl PeerSession {
             EngineInner::Tcp(mut t) => engine_stop(mut t),
             EngineInner::Udp(mut u) => engine_stop(mut u),
         }
+    }
+}
+
+impl PeerMesh for PeerSession {
+    fn publish(mut self, _ data: MemSpan, _ telemetry: mut TelemetrySink) -> bool
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    {
+        PeerSession::publish(mut self, data, mut telemetry)
+    }
+
+    fn poll_into(mut self, _ out: mut MemBuffer, _ telemetry: mut TelemetrySink) -> Option<u64>
+    uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    {
+        PeerSession::poll_into(mut self, mut out, mut telemetry)
+    }
+
+    fn peer_count(self) -> usize {
+        PeerSession::peer_count(self)
     }
 }

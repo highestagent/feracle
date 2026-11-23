@@ -4,8 +4,8 @@ use std::net::SocketAddr
 use cli::{App, Arg, Cli, CliError}
 use feracle_core::push_addr20_hex
 use super::args::{FeedSources, HexAddr20, HexKey32, PeerBackend, RpcEndpoint}
+use super::crypto::Crypto
 use super::feeds::FeedSource
-use super::ffi
 
 pub struct NodeConfig {
     pub node_id: u64,
@@ -140,7 +140,9 @@ pub fn build_cli() -> App {
         )
 }
 
-pub fn load_config() -> Result<CliError, NodeConfig> uses (cli: Cli) {
+pub fn load_config() -> Result<CliError, NodeConfig>
+uses (cli: Cli, crypto: Crypto)
+{
     let node_id: u64 = cli::require("node-id")?
     if node_id >= feracle_core::NODE_COUNT {
         return Result::Err(
@@ -158,7 +160,7 @@ pub fn load_config() -> Result<CliError, NodeConfig> uses (cli: Cli) {
     let bootstrap: MemBuffer = cli::get_or("bootstrap", default: MemBuffer::empty())?
     let feed_sources: FeedSources = cli::require("sources")?
     let privkey: HexKey32 = cli::require("privkey-hex")?
-    let Option::Some(self_addr20) = ffi::derive_eth_addr(privkey32: privkey.raw.span()) else {
+    let Option::Some(self_addr20) = crypto.derive_eth_addr(privkey32: privkey.raw.span()) else {
         return Result::Err(
             CliError::InvalidValue {
                 arg: format!("--privkey-hex"),

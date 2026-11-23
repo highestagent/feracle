@@ -120,7 +120,7 @@ fn build_coinbase_request(_ addr: SocketAddr, asset_idx: usize) -> MemBuffer {
     req
 }
 
-fn parse_hyperliquid_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
+pub fn parse_hyperliquid_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
     var count: u32 = 0
     var cursor: usize = 0
     while true {
@@ -143,7 +143,7 @@ fn parse_hyperliquid_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
     count
 }
 
-fn parse_binance_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
+pub fn parse_binance_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
     var count: u32 = 0
     var cursor: usize = 0
     while true {
@@ -172,7 +172,7 @@ fn parse_binance_body(_ body: MemSpan, _ out_prices: mut [u64; 20]) -> u32 {
     count
 }
 
-fn parse_coinbase_price(_ body: MemSpan) -> Option<u64> {
+pub fn parse_coinbase_price(_ body: MemSpan) -> Option<u64> {
     let (off, len) = json_get_str_bounds(body, "price".span())?
     let val_span = body.slice(offset: off, len)
     let price = parse_decimal_1e8_span(val_span)?
@@ -183,7 +183,7 @@ fn parse_coinbase_price(_ body: MemSpan) -> Option<u64> {
     }
 }
 
-fn compute_medians(
+pub fn compute_medians(
     _ counts: [usize; 20],
     _ s0: [u64; 20],
     _ s1: [u64; 20],

@@ -1,0 +1,91 @@
+use feracle_core::{QuoteMsg, SigMsg}
+use super::ffi
+
+pub trait Crypto {
+    fn derive_eth_addr(self, privkey32: MemSpan) -> Option<[u8; 20]>
+    fn sign_digest(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        prices: [u64; 20],
+        timestamp: u64,
+    ) -> Option<SigMsg>
+    fn sign_raw_bytes(self, privkey32: MemSpan, data: MemSpan) -> Option<
+        ([u8; 20], u8, [u8; 32], [u8; 32]),
+    >
+    fn sign_quote(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        timestamp: u64,
+        prices: [u64; 20],
+    ) -> Option<QuoteMsg>
+    fn verify_sig(self, chain_id: u64, contract20: MemSpan, sig: SigMsg) -> bool
+    fn verify_quote(self, chain_id: u64, contract20: MemSpan, quote: QuoteMsg) -> bool
+}
+
+pub struct NativeCrypto {}
+
+impl Copy for NativeCrypto {}
+
+impl Crypto for NativeCrypto {
+    fn derive_eth_addr(self, privkey32: MemSpan) -> Option<[u8; 20]> {
+        ffi::derive_eth_addr(privkey32)
+    }
+
+    fn sign_digest(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        prices: [u64; 20],
+        timestamp: u64,
+    ) -> Option<SigMsg> {
+        ffi::sign_digest(
+            privkey32,
+            chain_id,
+            contract20,
+            round_id,
+            prices,
+            timestamp,
+        )
+    }
+
+    fn sign_raw_bytes(self, privkey32: MemSpan, data: MemSpan) -> Option<
+        ([u8; 20], u8, [u8; 32], [u8; 32]),
+    > {
+        ffi::sign_raw_bytes(privkey32, data)
+    }
+
+    fn sign_quote(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        timestamp: u64,
+        prices: [u64; 20],
+    ) -> Option<QuoteMsg> {
+        ffi::sign_quote(
+            privkey32,
+            chain_id,
+            contract20,
+            round_id,
+            timestamp,
+            prices,
+        )
+    }
+
+    fn verify_sig(self, chain_id: u64, contract20: MemSpan, sig: SigMsg) -> bool {
+        ffi::verify_sig(chain_id, contract20, sig)
+    }
+
+    fn verify_quote(self, chain_id: u64, contract20: MemSpan, quote: QuoteMsg) -> bool {
+        ffi::verify_quote(chain_id, contract20, quote)
+    }
+}
