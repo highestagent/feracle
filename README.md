@@ -22,21 +22,51 @@ Feracle unifies the entire oracle pipeline around one shared core and three sele
 
 ## Fe highlight
 
-Fe's **effect polymorphism (`uses E`)** and **scoped capability injection (`with (...)`)** let shared libraries abstract over host I/O, runtime config, and unit tests without mocks or global state—for example, in [`ingots/cli/`](ingots/cli/README.md) and `ingots/feracle/`:
+Fe's **associated effect polymorphism (`uses E`)** and **scoped capability injection (`with (...)`)** are what made it possible to build a single-threaded, non-blocking oracle runtime across three interchangeable P2P transports—and deterministically unit-test its 3-phase consensus state machine—without a hidden async executor, heap-boxed futures, or global state.
+
+In [`ingots/coro/`](ingots/coro/README.md) and [`ingots/p2p/`](ingots/p2p/README.md), traits declare an abstract effect row (`uses E`), combinators like `Join2` and `block_on` compose effects statically at compile time, and each driver or P2P backend requests *only* the capabilities it actually touches:
 
 ```fe
-pub trait Input {
+// ingots/coro/src/task.fe & combinators.fe — stackless concurrency with effect rows
+pub trait Coroutine {
+    type Output
     uses E
-
-    fn arg_count(self) -> usize uses E
-    fn arg_at(self, _ index: usize) -> MemBuffer uses E
-    fn env_lookup(self, _ name: MemSpan) -> Option<MemBuffer> uses E
+    fn poll(mut self) -> Poll<Self::Output> uses E
 }
 
-// Production binds HostInput (Args, Env); tests bind MemoryInput (uses E = ()).
-// Parsed values are then injected cleanly into downstream readers:
-let config = with (Cli = matches) { load_config() }
+impl<A: Coroutine, B: Coroutine> Coroutine for Join2<A, B> {
+    type Output = (A::Output, B::Output)
+    uses E = (A::E, B::E) // composed tasks union their effects statically
+    // ...
+}
+
+pub fn block_on<C: Coroutine, D: Driver>(_ coro: mut C, _ driver: mut D) -> C::Output
+uses (C::E, D::E) {
+    // ...
+}
+
+// Each driver & P2P backend declares only what it actually touches (methods elided):
+impl Driver for NetDriver          { uses E = (clock: Clock, sched: mut Scheduler, io: mut SocketIo) }
+impl Driver for VirtualClockDriver { uses E = (sched: mut Scheduler) }
+
+impl P2pEngine for Libp2pTransport { uses E = (io: mut SocketIo) }
+impl P2pEngine for UdpEngine       { uses E = (sched: mut Scheduler, io: mut SocketIo) }
+impl P2pEngine for TcpEngine       { uses E = (net: mut Net, sched: mut Scheduler, io: mut SocketIo) }
+
+// Production (ingots/feracle/src/main.fe) binds kqueue/epoll + secp256k1:
+with (Scheduler = sched, SocketIo = io, Crypto = native_crypto) {
+    // ...
+    block_on(mut node, mut driver)
+}
+
+// Deterministic tests (ingots/feracle/src/test_consensus.fe) swap in virtual time + scripted I/O:
+with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+    var cons = ConsensusCoro::new(config: cfg)
+    // ...
+}
 ```
+
+The same explicit capability model extends straight down to the EVM settlement contract ([`ingots/evm/src/lib.fe`](ingots/evm/src/lib.fe))—where `SubmitMedians` declares `uses (ctx, mut store, mut log)`, `LatestPrices` declares read-only `uses (store)`, and `Decimals` is statically pure—and to the WASM telemetry exports (`uses (clock: mut Clock)`).
 
 ## Features
 
@@ -50,7 +80,7 @@ let config = with (Cli = matches) { load_config() }
 
 ![Feracle Architecture](docs/feracle-architecture.png)
 
-> **Walkthrough:** [Watch the 80s architectural explainer video (`docs/feracle-architecture.mp4`)](docs/feracle-architecture.mp4) — steps through data ingestion, pluggable P2P consensus, on-chain settlement, design rationale, and unified WASM telemetry.
+https://github.com/user-attachments/assets/671074da-eee6-465b-aa1b-f057559ce45c
 
 ### Off-Chain Node & Networking (`[Native]`)
 
