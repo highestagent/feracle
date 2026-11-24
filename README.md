@@ -125,7 +125,7 @@ Optional installer flags: `--prefix <DIR>`, `--version <TAG>`, `--archive <PATH>
 ```bash
 feracle                      # print node CLI options (or pass flags to run)
 feracle-telemetry --help     # WASM telemetry collector options
-feracle-demo                 # local Anvil + 3 nodes + Caddy live feeds + telemetry TUI
+feracle-demo                 # local Anvil + 4 nodes + Caddy live feeds + telemetry TUI
 feracle-demo --backend udp   # switch P2P transport (libp2p | tcp | udp)
 feracle-demo --mock-feeds    # run offline with deterministic mock_feeds.py
 ```
