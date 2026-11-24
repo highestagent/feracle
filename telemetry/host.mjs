@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -300,11 +301,21 @@ async function main() {
   }
 }
 
-const isEntrypoint =
-  Boolean(process.argv[1]) &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+export function isDirectEntrypoint(argv1, moduleUrl) {
+  if (!argv1) {
+    return false;
+  }
+  const resolveCanonical = (target) => {
+    try {
+      return fs.realpathSync(target);
+    } catch {
+      return path.resolve(target);
+    }
+  };
+  return resolveCanonical(argv1) === resolveCanonical(fileURLToPath(moduleUrl));
+}
 
-if (isEntrypoint) {
+if (isDirectEntrypoint(process.argv[1], import.meta.url)) {
   main().catch((err) => {
     console.error(err);
     process.exit(1);

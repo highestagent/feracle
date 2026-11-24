@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   INITIAL_LOG_LOOKBACK,
@@ -8,6 +12,7 @@ import {
   addBoundedSet,
   createFrameDeduper,
   createSettlementIndexer,
+  isDirectEntrypoint,
   parseCliArgs,
   setBoundedMap,
   shouldSkipStatusPoll,
@@ -228,4 +233,20 @@ test("parseCliArgs parses endpoints, node list, and telemetry flags", () => {
   assert.equal(opts.once, true);
   assert.equal(opts.ansi, false);
   assert.equal(opts.metricsPort, 9200);
+});
+
+test("isDirectEntrypoint resolves symlinks and rejects indirect or empty invocations", () => {
+  const realHostPath = fs.realpathSync(fileURLToPath(new URL("./host.mjs", import.meta.url)));
+  const hostUrl = pathToFileURL(realHostPath).href;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "feracle-host-test-"));
+  try {
+    const symlinkPath = path.join(tmpDir, "host-link.mjs");
+    fs.symlinkSync(realHostPath, symlinkPath);
+    assert.equal(isDirectEntrypoint(symlinkPath, hostUrl), true);
+    assert.equal(isDirectEntrypoint(path.join(tmpDir, "other.mjs"), hostUrl), false);
+    assert.equal(isDirectEntrypoint("", hostUrl), false);
+    assert.equal(isDirectEntrypoint(undefined, hostUrl), false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

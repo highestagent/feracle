@@ -605,7 +605,7 @@ main() {
   echo "Smoke check:"
   "$PREFIX/bin/feracle" --version
   if declare -F feracle_has_node20 >/dev/null 2>&1 && feracle_has_node20; then
-    "$PREFIX/bin/feracle-telemetry" --help >/dev/null
+    "$PREFIX/bin/feracle-telemetry" --help | grep -q "Feracle WASM Telemetry Host"
     echo "feracle-telemetry OK"
   else
     echo "note: feracle-telemetry and feracle-demo will auto-install missing dependencies on first run (or pass --install-deps)"
