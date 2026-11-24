@@ -50,6 +50,8 @@ let config = with (Cli = matches) { load_config() }
 
 ![Feracle Architecture](docs/feracle-architecture.png)
 
+> **Walkthrough:** [Watch the 80s architectural explainer video (`docs/feracle-architecture.mp4`)](docs/feracle-architecture.mp4) — steps through data ingestion, pluggable P2P consensus, on-chain settlement, design rationale, and unified WASM telemetry.
+
 ### Off-Chain Node & Networking (`[Native]`)
 
 1. **`ingots/feracle/`** — Standalone oracle node executable (`out/feracle`):
