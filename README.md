@@ -26,45 +26,7 @@ Fe's **associated effect polymorphism (`uses E`)** and **scoped capability injec
 
 In [`ingots/coro/`](ingots/coro/README.md) and [`ingots/p2p/`](ingots/p2p/README.md), traits declare an abstract effect row (`uses E`), combinators like `Join2` and `block_on` compose effects statically at compile time, and each driver or P2P backend requests *only* the capabilities it actually touches:
 
-```fe
-// ingots/coro/src/task.fe & combinators.fe — stackless concurrency with effect rows
-pub trait Coroutine {
-    type Output
-    uses E
-    fn poll(mut self) -> Poll<Self::Output> uses E
-}
-
-impl<A: Coroutine, B: Coroutine> Coroutine for Join2<A, B> {
-    type Output = (A::Output, B::Output)
-    uses E = (A::E, B::E) // composed tasks union their effects statically
-    // ...
-}
-
-pub fn block_on<C: Coroutine, D: Driver>(_ coro: mut C, _ driver: mut D) -> C::Output
-uses (C::E, D::E) {
-    // ...
-}
-
-// Each driver & P2P backend declares only what it actually touches (methods elided):
-impl Driver for NetDriver          { uses E = (clock: Clock, sched: mut Scheduler, io: mut SocketIo) }
-impl Driver for VirtualClockDriver { uses E = (sched: mut Scheduler) }
-
-impl P2pEngine for Libp2pTransport { uses E = (io: mut SocketIo) }
-impl P2pEngine for UdpEngine       { uses E = (sched: mut Scheduler, io: mut SocketIo) }
-impl P2pEngine for TcpEngine       { uses E = (net: mut Net, sched: mut Scheduler, io: mut SocketIo) }
-
-// Production (ingots/feracle/src/main.fe) binds kqueue/epoll + secp256k1:
-with (Scheduler = sched, SocketIo = io, Crypto = native_crypto) {
-    // ...
-    block_on(mut node, mut driver)
-}
-
-// Deterministic tests (ingots/feracle/src/test_consensus.fe) swap in virtual time + scripted I/O:
-with (Crypto = mock, Scheduler = sched, SocketIo = io) {
-    var cons = ConsensusCoro::new(config: cfg)
-    // ...
-}
-```
+![Fe Highlight](docs/highlight.png)
 
 The same explicit capability model extends straight down to the EVM settlement contract ([`ingots/evm/src/lib.fe`](ingots/evm/src/lib.fe))—where `SubmitMedians` declares `uses (ctx, mut store, mut log)`, `LatestPrices` declares read-only `uses (store)`, and `Decimals` is statically pure—and to the WASM telemetry exports (`uses (clock: mut Clock)`).
 
