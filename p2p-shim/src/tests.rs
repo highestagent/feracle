@@ -127,10 +127,24 @@ fn test_gossipsub_three_peer_loopback_and_quote_dedup() {
     let node_b = P2pNode::start(port_b, vec![addr_a.clone()]).expect("start B");
     let node_c = P2pNode::start(port_c, vec![addr_a]).expect("start C");
 
-    // Wait up to 10s for mesh / mDNS readiness
+    let id_a = node_a.local_peer_id().to_string();
+    let id_b = node_b.local_peer_id().to_string();
+    let id_c = node_c.local_peer_id().to_string();
+
+    // Wait up to 10s for mesh / mDNS readiness and bidirectional snapshots with node_a
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        if node_a.peer_count() >= 2 && node_b.peer_count() >= 1 && node_c.peer_count() >= 1 {
+        let (_, csv_a) = node_a.peers_snapshot();
+        let (_, csv_b) = node_b.peers_snapshot();
+        let (_, csv_c) = node_c.peers_snapshot();
+        if node_a.peer_count() >= 2
+            && node_b.peer_count() >= 1
+            && node_c.peer_count() >= 1
+            && csv_a.contains(&id_b)
+            && csv_a.contains(&id_c)
+            && csv_b.contains(&id_a)
+            && csv_c.contains(&id_a)
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -152,20 +166,11 @@ fn test_gossipsub_three_peer_loopback_and_quote_dedup() {
     );
     let (ver_a, csv_a) = node_a.peers_snapshot();
     assert!(ver_a >= 2, "ver_a={ver_a}");
-    assert!(
-        csv_a.contains(&node_b.local_peer_id().to_string()),
-        "csv_a={csv_a}"
-    );
-    assert!(
-        csv_a.contains(&node_c.local_peer_id().to_string()),
-        "csv_a={csv_a}"
-    );
+    assert!(csv_a.contains(&id_b), "csv_a={csv_a}");
+    assert!(csv_a.contains(&id_c), "csv_a={csv_a}");
     let (ver_b, csv_b) = node_b.peers_snapshot();
     assert!(ver_b >= 1, "ver_b={ver_b}");
-    assert!(
-        csv_b.contains(&node_a.local_peer_id().to_string()),
-        "csv_b={csv_b}"
-    );
+    assert!(csv_b.contains(&id_a), "csv_b={csv_b}");
 
     // Single quote publish delivers once per peer (no GossipSub relay duplication);
     // explicit rebroadcast delivers again so late-joining/out-of-phase peers recover.
