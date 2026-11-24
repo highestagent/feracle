@@ -1,5 +1,8 @@
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::Duration;
+
+static SWARM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 use k256::ecdsa::VerifyingKey;
 use libp2p::Multiaddr;
@@ -112,6 +115,7 @@ fn test_crypto_keccak_and_sign_parity_with_evm_vectors() {
 
 #[test]
 fn test_gossipsub_three_peer_loopback_and_quote_dedup() {
+    let _guard = SWARM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let port_a = 17101;
     let port_b = 17102;
     let port_c = 17103;
@@ -534,6 +538,7 @@ fn test_crypto_verify_keccak_bytes_sig_and_domain_sep() {
 
 #[test]
 fn test_opaque_handle_concurrent_nodes_and_wakeup_fd() {
+    let _guard = SWARM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut h_a_be = [0u8; 8];
     let mut h_b_be = [0u8; 8];
     assert_eq!(
