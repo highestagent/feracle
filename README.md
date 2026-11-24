@@ -2,6 +2,8 @@
 
 Feracle is a decentralized price oracle with both on-chain settlement and off-chain consensus facilities built end-to-end in **Fe**. A single target-independent core compiles across Native, EVM, and WASM targets, powering an off-chain node runtime with three selectable peer-to-peer networking backends (`libp2p` GossipSub, TCP mesh with PEX, and UDP SWIM gossip).
 
+[Approach](#approach) | [Fe Highlight](#fe-highlight) | [Features](#features) | [Architecture](#architecture) | [Quickstart](#quickstart-prebuilt-binaries) | [Build & Test](#build--test) | [Sample Output](#sample-output) | [Limitations](#limitations)
+
 ![Fe 26.7.0](https://img.shields.io/badge/Fe-26.7.0-4A6FA5?style=flat&labelColor=2A2D36)
 
 > [!IMPORTANT]
@@ -212,6 +214,18 @@ One-shot TUI query inspecting on-chain state, per-node feed latencies, and recen
 ![Feracle Prometheus Metrics](docs/metrics.png)
 
 Prometheus exposition metrics served by `telemetry/host.mjs --metrics-port 9200` from `telemetry_wasm`.
+
+## Limitations
+
+- **No cryptoeconomic security or HSMs:** Oracle membership is a single-owner allowlist with no staking, slashing, or timelocks, and nodes load raw hex signing keys (`FERACLE_PRIVKEY_HEX`).
+- **Fixed compile-time protocol parameters:** `ASSET_COUNT = 20`, `NODE_COUNT = 4`, `QUORUM = 3`, and `MAX_TOLERANCE_BPS = 100` are compiled constants; changing the committee, quorum, or asset basket requires redeploying.
+- **Best-effort `3-of-4` gossip without BFT quote agreement:** Consensus tolerates at most one offline or outlier node, and asymmetric delays across 3-of-4 quote subsets can cause digest mismatches until round timeout.
+- **No native TLS, DNS, or NAT traversal:** `ingots/http` requires literal `IP:PORT` addresses and a loopback TLS proxy (Caddy) for HTTPS feeds/RPCs, while `p2p_tcp` and `p2p_udp` send unencrypted frames without hole-punching.
+- **Rust FFI shim & in-memory submission state:** The native node links `p2p-shim` for secp256k1/Keccak, `libp2p`, and OS signal pipes, and keeps tx nonces and telemetry state in memory without crash recovery or reorg handling.
+
+## Declaration
+
+This project was developed with AI assistance, including **Gemini 4 Neon** with **Antigravity**, for the code, diagrams, and video assets.
 
 ## License
 
