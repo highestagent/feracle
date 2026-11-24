@@ -1,0 +1,489 @@
+use std::io::{Error, ErrorKind}
+use std::net::{Interest, Net, Poller, SocketAddr, TcpListener, TcpStream, Token, UdpSocket}
+use coro::{TaskId}
+use feracle_core::{
+    ASSET_COUNT,
+    SEL_CURRENT_ROUND,
+    SEL_IS_ORACLE,
+    SEL_LATEST_PRICES,
+    push_hex_bytes,
+    write_asset_symbol,
+}
+use net_reactor::{IoEntry, IoEvent, IoSlot, SocketIo}
+
+pub(ingot) struct ScriptedMeta {
+    pub(ingot) token: Token,
+    pub(ingot) owner: TaskId,
+    pub(ingot) tag: u32,
+    pub(ingot) req_buf: MemBuffer,
+    pub(ingot) resp_buf: MemBuffer,
+    pub(ingot) resp_pos: usize,
+    pub(ingot) resp_built: bool,
+    pub(ingot) write_ready: bool,
+    pub(ingot) read_ready: bool,
+    pub(ingot) silent: bool,
+}
+
+pub(ingot) struct ScriptedSocketIo {
+    pub(ingot) poller: Poller<IoEntry>,
+    pub(ingot) listener: TcpListener,
+    pub(ingot) slots: MemVec<ScriptedMeta>,
+    pub(ingot) ready_io: MemVec<IoEvent>,
+    pub(ingot) onchain_round: u64,
+    pub(ingot) last_updated: u64,
+    pub(ingot) is_oracle_allow: bool,
+    pub(ingot) deny_addr_hex: MemBuffer,
+    pub(ingot) fail_next_cb_btc: bool,
+    pub(ingot) cb_btc_attempts: usize,
+    pub(ingot) advances_round_on_send: bool,
+    pub(ingot) send_raw_count: usize,
+    pub(ingot) timeout_all_http: bool,
+    pub(ingot) captured_reqs: MemVec<MemBuffer>,
+}
+
+pub(ingot) fn push_abi_u64_hex(_ out: mut MemBuffer, _ val: u64) {
+    var word = MemBuffer::new(32)
+    word.write_be<u64>(offset: 24, value: val)
+    push_hex_bytes(mut out, word.span())
+}
+
+pub(ingot) fn wrap_http_response(_ status: MemSpan, _ body: MemSpan, _ out: mut MemBuffer) {
+    out.clear()
+    write!(
+        mut out,
+        "HTTP/1.1 ",
+        status,
+        "\r\nContent-Length: ",
+        body.len(),
+        "\r\nConnection: close\r\n\r\n",
+        body,
+    )
+}
+
+impl ScriptedSocketIo {
+    pub(ingot) fn new(listen_addr: SocketAddr) -> Self uses (net: mut Net) {
+        var listener = net.listen(listen_addr).unwrap()
+        listener.set_nonblocking(true).unwrap()
+        ScriptedSocketIo {
+            poller: Poller<IoEntry>::new().unwrap(),
+            listener,
+            slots: MemVec::new(),
+            ready_io: MemVec::new(),
+            onchain_round: 1,
+            last_updated: 1,
+            is_oracle_allow: true,
+            deny_addr_hex: MemBuffer::empty(),
+            fail_next_cb_btc: false,
+            cb_btc_attempts: 0,
+            advances_round_on_send: false,
+            send_raw_count: 0,
+            timeout_all_http: false,
+            captured_reqs: MemVec::new(),
+        }
+    }
+
+    pub(ingot) fn local_addr(self) -> SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
+
+    pub(ingot) fn has_captured(self, _ needle: MemSpan) -> bool {
+        var i: usize = 0
+        while i < self.captured_reqs.len() {
+            if self.captured_reqs[i].span().index_of(needle).is_some() {
+                return true
+            }
+            i += 1
+        }
+        false
+    }
+
+    pub(ingot) fn find_slot(self, _ token: Token) -> Option<usize> {
+        var i: usize = 0
+        while i < self.slots.len() {
+            if self.slots[i].token == token {
+                return Option::Some(i)
+            }
+            i += 1
+        }
+        Option::None
+    }
+
+    pub(ingot) fn build_http_response(mut self, _ req: MemSpan, _ out: mut MemBuffer) -> bool {
+        self.captured_reqs.push(MemBuffer::from_span(req))
+        if self.timeout_all_http {
+            return false
+        }
+
+        if req.index_of("POST /info").is_some() {
+            var body = MemBuffer::with_capacity(512)
+            body.push(b'{')
+            var i: usize = 0
+            while i < ASSET_COUNT {
+                if i > 0 { body.push(b',') }
+                body.push(b'"')
+                write_asset_symbol(i, mut body)
+                body.extend_from("\":\"".span())
+                if i == 0 {
+                    body.extend_from("92450.50".span())
+                } else {
+                    write!(mut body, 100 + i, ".00")
+                }
+                body.push(b'"')
+                i += 1
+            }
+            body.push(b'}')
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        if req.index_of("GET /api/v3/ticker/price").is_some() {
+            var body = MemBuffer::with_capacity(1024)
+            body.push(b'[')
+            var i: usize = 0
+            while i < ASSET_COUNT {
+                if i > 0 { body.push(b',') }
+                body.extend_from("{\"symbol\":\"".span())
+                write_asset_symbol(i, mut body)
+                body.extend_from("USDT\",\"price\":\"".span())
+                if i == 0 {
+                    body.extend_from("92455.00".span())
+                } else {
+                    write!(mut body, 102 + i, ".00")
+                }
+                body.extend_from("\"}".span())
+                i += 1
+            }
+            body.push(b']')
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        if req.index_of("GET /products/").is_some() {
+            if req.index_of("/products/BTC-USD/").is_some() {
+                self.cb_btc_attempts += 1
+                if self.fail_next_cb_btc && self.cb_btc_attempts == 1 {
+                    wrap_http_response("500 Internal Server Error".span(), "err".span(), mut out)
+                    return true
+                }
+                let body = "{\"price\":\"92448.00\"}"
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+            let body = "{\"price\":\"101.00\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        if req.index_of("\"eth_call\"").is_some() {
+            let sel_round = format!(SEL_CURRENT_ROUND)
+            if req.index_of(sel_round.span()).is_some() {
+                var body = MemBuffer::with_capacity(128)
+                body.extend_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x".span())
+                push_abi_u64_hex(mut body, self.onchain_round)
+                body.extend_from("\"}".span())
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+            let sel_prices = format!(SEL_LATEST_PRICES)
+            if req.index_of(sel_prices.span()).is_some() {
+                var body = MemBuffer::with_capacity(1450)
+                body.extend_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x".span())
+                var w: usize = 0
+                while w < ASSET_COUNT {
+                    push_abi_u64_hex(mut body, 0)
+                    w += 1
+                }
+                push_abi_u64_hex(mut body, self.last_updated)
+                body.extend_from("\"}".span())
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+            let sel_oracle = format!(SEL_IS_ORACLE)
+            if req.index_of(sel_oracle.span()).is_some() {
+                var allow = self.is_oracle_allow
+                if !self.deny_addr_hex.is_empty()
+                    && req.index_of(self.deny_addr_hex.span()).is_some() {
+                    allow = false
+                }
+                var body = MemBuffer::with_capacity(128)
+                body.extend_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x".span())
+                push_abi_u64_hex(mut body, if allow { 1 } else { 0 })
+                body.extend_from("\"}".span())
+                wrap_http_response("200 OK".span(), body.span(), mut out)
+                return true
+            }
+        }
+
+        if req.index_of("\"eth_getTransactionCount\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x5\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_feeHistory\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"baseFeePerGas\":[\"0x3b9aca00\",\"0x3b9aca00\"],\"reward\":[[\"0x3b9aca00\"]]}}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_maxPriorityFeePerGas\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":\"0x3b9aca00\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_sendRawTransaction\"").is_some() {
+            self.send_raw_count += 1
+            if self.advances_round_on_send {
+                self.onchain_round += 1
+            }
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+        if req.index_of("\"eth_getTransactionReceipt\"").is_some() {
+            let body = "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"status\":\"0x1\",\"blockNumber\":\"0x2\"}}"
+            wrap_http_response("200 OK".span(), body.span(), mut out)
+            return true
+        }
+
+        wrap_http_response("404 Not Found".span(), "{}".span(), mut out)
+        true
+    }
+}
+
+impl SocketIo for ScriptedSocketIo {
+    fn register_tcp_listener(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ listener: own TcpListener,
+    ) -> Result<Error, Token> {
+        let entry = IoEntry {
+            owner,
+            tag,
+            interest: Interest::READABLE,
+            slot: IoSlot::TcpListener(listener),
+        }
+        self.poller.add(entry, Interest::READABLE)
+    }
+
+    fn register_tcp_stream(
+        mut self,
+        owner: TaskId,
+        tag: u32,
+        _ stream: own TcpStream,
+        _ interest: Interest,
+    ) -> Result<Error, Token> {
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::TcpStream(stream) }
+        let tok = self.poller.add(entry, interest)?
+        let silent = self.timeout_all_http
+        self.slots
+            .push(
+                ScriptedMeta {
+                    token: tok,
+                    owner,
+                    tag,
+                    req_buf: MemBuffer::empty(),
+                    resp_buf: MemBuffer::empty(),
+                    resp_pos: 0,
+                    resp_built: false,
+                    write_ready: !silent,
+                    read_ready: false,
+                    silent,
+                },
+            )
+        Result::Ok(tok)
+    }
+
+    fn register_udp_socket(mut self, owner: TaskId, tag: u32, _ sock: own UdpSocket) -> Result<
+        Error,
+        Token,
+    > {
+        let entry = IoEntry {
+            owner,
+            tag,
+            interest: Interest::READABLE,
+            slot: IoSlot::UdpSocket(sock),
+        }
+        self.poller.add(entry, Interest::READABLE)
+    }
+
+    fn register_raw_fd(mut self, owner: TaskId, tag: u32, fd: i32, _ interest: Interest) -> Result<
+        Error,
+        Token,
+    > {
+        let entry = IoEntry { owner, tag, interest, slot: IoSlot::RawFd(fd) }
+        self.poller.add(entry, interest)
+    }
+
+    fn set_interest(mut self, _ token: Token, _ interest: Interest) -> Result<Error, ()> {
+        let Option::Some(idx) = self.find_slot(token) else {
+            return Result::Ok(())
+        }
+        var should_build = false
+        var req_copy = MemBuffer::empty()
+        if let Option::Some(mut meta) = self.slots.get(idx) {
+            if !meta.resp_built {
+                meta.resp_built = true
+                should_build = true
+                req_copy = MemBuffer::from_span(meta.req_buf.span())
+            }
+        }
+        if should_build {
+            var resp = MemBuffer::empty()
+            let ok = self.build_http_response(req_copy.span(), mut resp)
+            if ok {
+                if let Option::Some(mut meta) = self.slots.get(idx) {
+                    meta.resp_buf = resp
+                    meta.resp_pos = 0
+                    meta.read_ready = true
+                }
+            } else {
+                if let Option::Some(mut meta) = self.slots.get(idx) {
+                    meta.silent = true
+                    meta.read_ready = false
+                }
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn deregister(mut self, _ token: Token) {
+        let _ = self.poller.remove(token)
+        if let Option::Some(idx) = self.find_slot(token) {
+            let _ = self.slots.swap_remove(idx)
+        }
+        var ri: usize = 0
+        while ri < self.ready_io.len() {
+            if self.ready_io[ri].token == token {
+                let _ = self.ready_io.swap_remove(ri)
+            } else {
+                ri += 1
+            }
+        }
+    }
+
+    fn deregister_owner(mut self, _ owner: TaskId) {
+        var to_remove = MemVec<Token>::new()
+        var i: usize = 0
+        while i < self.slots.len() {
+            if self.slots[i].owner == owner {
+                to_remove.push(self.slots[i].token)
+            }
+            i += 1
+        }
+        var ri: usize = 0
+        while ri < to_remove.len() {
+            self.deregister(to_remove[ri])
+            ri += 1
+        }
+    }
+
+    fn listener_accept(mut self, _ token: Token) -> Option<Result<Error, (TcpStream, SocketAddr)>> {
+        Option::None
+    }
+
+    fn stream_read(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<Result<Error, usize>> {
+        let idx = self.find_slot(token)?
+        let Option::Some(mut meta) = self.slots.get(idx) else {
+            return Option::None
+        }
+        if meta.silent {
+            return Option::Some(Result::Err(Error::new(ErrorKind::WouldBlock)))
+        }
+        let avail = meta.resp_buf.len() - meta.resp_pos
+        if avail == 0 {
+            return Option::Some(Result::Ok(0))
+        }
+        let n = if avail < buf.len() { avail } else { buf.len() }
+        var i: usize = 0
+        while i < n {
+            buf.write_be<u8>(offset: i, value: meta.resp_buf[meta.resp_pos + i])
+            i += 1
+        }
+        meta.resp_pos += n
+        Option::Some(Result::Ok(n))
+    }
+
+    fn stream_write(mut self, _ token: Token, _ bytes: MemSpan) -> Option<Result<Error, usize>> {
+        let idx = self.find_slot(token)?
+        if let Option::Some(mut meta) = self.slots.get(idx) {
+            meta.req_buf.extend_from(bytes)
+        }
+        Option::Some(Result::Ok(bytes.len()))
+    }
+
+    fn stream_take_error(mut self, _ token: Token) -> Option<Result<Error, Option<Error>>> {
+        let _ = self.find_slot(token)?
+        Option::Some(Result::Ok(Option::None))
+    }
+
+    fn udp_recv_from(mut self, _ token: Token, _ buf: mut MemSpan) -> Option<
+        Result<Error, (usize, SocketAddr)>,
+    > {
+        Option::None
+    }
+
+    fn udp_send_to(mut self, _ token: Token, _ bytes: MemSpan, _ to: SocketAddr) -> Option<
+        Result<Error, usize>,
+    > {
+        Option::None
+    }
+
+    fn take_events_for(mut self, _ owner: TaskId, _ out: mut MemVec<IoEvent>) {
+        out.clear()
+        var i: usize = 0
+        while i < self.slots.len() {
+            if self.slots[i].owner == owner {
+                if let Option::Some(ev) = self.take_token_event(self.slots[i].token) {
+                    out.push(ev)
+                }
+            }
+            i += 1
+        }
+    }
+
+    fn take_token_event(mut self, _ token: Token) -> Option<IoEvent> {
+        let idx = self.find_slot(token)?
+        let Option::Some(mut meta) = self.slots.get(idx) else {
+            return Option::None
+        }
+        if meta.silent {
+            return Option::None
+        }
+        if meta.write_ready {
+            meta.write_ready = false
+            return Option::Some(
+                IoEvent {
+                    token,
+                    owner: meta.owner,
+                    tag: meta.tag,
+                    readable: false,
+                    writable: true,
+                    error: false,
+                    hangup: false,
+                },
+            )
+        }
+        if meta.read_ready {
+            return Option::Some(
+                IoEvent {
+                    token,
+                    owner: meta.owner,
+                    tag: meta.tag,
+                    readable: true,
+                    writable: false,
+                    error: false,
+                    hangup: false,
+                },
+            )
+        }
+        Option::None
+    }
+
+    fn has_ready_io(self) -> bool {
+        !self.ready_io.is_empty()
+    }
+
+    fn poll_os(mut self, timeout_ms: u64, _ woken_owners: mut MemVec<TaskId>) -> usize {
+        0
+    }
+}

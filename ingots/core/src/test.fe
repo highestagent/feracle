@@ -1,4 +1,3 @@
-use core::num::Bounded
 use super::{
     ASSET_COUNT,
     QUOTE_PREIMAGE_LEN,
@@ -11,26 +10,19 @@ use super::{
     addr20_eq,
     all_prices_nonzero,
     asset_id_from_symbol,
-    bump_fee_wei,
     compare_addr20,
-    compute_eip1559_fees,
     decode_hex_bytes,
     decode_latest_prices_abi_hex,
     decode_quote,
     decode_quote_array,
     decode_sig_msg,
     decode_sig_msg_array,
-    encode_eip1559_signed_tx,
-    encode_eip1559_unsigned_tx,
-    encode_eip155_signed_tx,
-    encode_eip155_unsigned_tx,
     encode_prices_be160,
     encode_quote,
     encode_quote_buf,
     encode_quote_sign_preimage,
     encode_sig_msg,
     encode_sig_msg_buf,
-    encode_submit_medians_calldata,
     first_tolerance_breach_asset,
     format_hex_addr,
     json_get_bool,
@@ -49,18 +41,11 @@ use super::{
     parse_abi_word_bool,
     parse_abi_word_u64,
     parse_decimal_1e8,
-    parse_fee_history_result,
     parse_fixed_hex,
     parse_hex_addr20,
-    parse_hex_u128,
     parse_hex_u64,
     prices_eq,
     push_hex_32,
-    rlp_encode_be32_uint,
-    rlp_encode_bytes,
-    rlp_encode_u128,
-    rlp_encode_u64,
-    rlp_wrap_list,
     signed_bps_diff,
     sort_three_sigs,
     to_ascii_lower,
@@ -415,294 +400,4 @@ fn test_json_object_field_iteration() {
     assert!(obj.slice(offset: v2, len: vl2) == "true")
 
     assert!(json_next_object_field(obj, mut cursor).is_none())
-}
-
-#[test]
-fn test_submit_medians_calldata_and_rlp_eip155() {
-    var prices: [u64; 20] = [100; 20]
-    prices[0] = 9_245_025_000_000
-    prices[19] = 31_850_000_000
-
-    let sig0 = SigMsg {
-        round_id: 42,
-        timestamp: 1_795_250_000,
-        median_prices: prices,
-        signer_addr: [0x11; 20],
-        v: 27,
-        r: [0x22; 32],
-        s: [0x33; 32],
-    }
-    let sig1 = SigMsg {
-        round_id: 42,
-        timestamp: 1_795_250_000,
-        median_prices: prices,
-        signer_addr: [0x44; 20],
-        v: 28,
-        r: [0x55; 32],
-        s: [0x66; 32],
-    }
-    let sig2 = SigMsg {
-        round_id: 42,
-        timestamp: 1_795_250_000,
-        median_prices: prices,
-        signer_addr: [0x77; 20],
-        v: 27,
-        r: [0x88; 32],
-        s: [0x99; 32],
-    }
-
-    var calldata = MemBuffer::empty()
-    encode_submit_medians_calldata(
-        round_id: 42,
-        prices,
-        timestamp: 1_795_250_000,
-        sigs: [sig0, sig1, sig2],
-        mut calldata,
-    )
-    assert!(calldata.len() == 996)
-    assert!(
-        calldata[0] == 0x6d && calldata[1] == 0x2b && calldata[2] == 0x8b && calldata[3] == 0x3f,
-    )
-    assert!(calldata.read_be<u64>(4 + 24) == 42)
-    assert!(calldata.read_be<u64>(4 + 32 + 24) == 9_245_025_000_000)
-    assert!(calldata.read_be<u64>(4 + 20 * 32 + 24) == 31_850_000_000)
-    assert!(calldata.read_be<u64>(4 + 21 * 32 + 24) == 1_795_250_000)
-    assert!(calldata[4 + 22 * 32 + 31] == 27)
-    assert!(
-        calldata[4 + 23 * 32] == 0x22 && calldata[4 + 24 * 32] == 0x33,
-    )
-    assert!(calldata[4 + 25 * 32 + 31] == 28)
-    assert!(calldata[4 + 28 * 32 + 31] == 27)
-
-    assert!(
-        parse_hex_u128("0x04a817c800".span()) == Option::Some(20_000_000_000 as u128),
-    )
-
-    var out = MemBuffer::empty()
-    rlp_encode_u64(0, mut out)
-    rlp_encode_u64(1, mut out)
-    rlp_encode_u64(127, mut out)
-    rlp_encode_u64(128, mut out)
-    rlp_encode_u64(0x0400, mut out)
-    assert!(
-        out.len() == 8
-            && out[0] == 0x80
-            && out[1] == 0x01
-            && out[2] == 0x7f
-            && out[3] == 0x81
-            && out[4] == 0x80
-            && out[5] == 0x82
-            && out[6] == 0x04
-            && out[7] == 0x00,
-    )
-
-    out.clear()
-    rlp_encode_u128(0 as u128, mut out)
-    assert!(out.len() == 1 && out[0] == 0x80)
-
-    out.clear()
-    rlp_encode_bytes("dog".span(), mut out)
-    assert!(
-        out.len() == 4 && out[0] == 0x83 && out[1] == b'd' && out[2] == b'o' && out[3] == b'g',
-    )
-
-    out.clear()
-    var long_str = MemBuffer::new(56)
-    long_str[0] = 0xaa
-    long_str[55] = 0xbb
-    rlp_encode_bytes(long_str.span(), mut out)
-    assert!(
-        out.len() == 58 && out[0] == 0xb8 && out[1] == 56 && out[2] == 0xaa && out[57] == 0xbb,
-    )
-
-    out.clear()
-    rlp_wrap_list(long_str.span(), mut out)
-    assert!(out.len() == 58 && out[0] == 0xf8 && out[1] == 56)
-
-    out.clear()
-    rlp_encode_be32_uint([0; 32], mut out)
-    assert!(out.len() == 1 && out[0] == 0x80)
-
-    var lead_zero_7f: [u8; 32] = [0; 32]
-    lead_zero_7f[31] = 0x7f
-    out.clear()
-    rlp_encode_be32_uint(lead_zero_7f, mut out)
-    assert!(out.len() == 1 && out[0] == 0x7f)
-
-    var lead_zero_hi: [u8; 32] = [0; 32]
-    lead_zero_hi[30] = 0x80
-    lead_zero_hi[31] = 0x01
-    out.clear()
-    rlp_encode_be32_uint(lead_zero_hi, mut out)
-    assert!(
-        out.len() == 3 && out[0] == 0x82 && out[1] == 0x80 && out[2] == 0x01,
-    )
-
-    var to_buf = MemBuffer::new(20)
-    var ti: usize = 0
-    while ti < 20 {
-        to_buf[ti] = 0x35
-        ti += 1
-    }
-    var raw_unsigned = MemBuffer::empty()
-    encode_eip155_unsigned_tx(
-        nonce: 9,
-        gas_price: 20_000_000_000 as u128,
-        gas_limit: 21000,
-        to20: to_buf.span(),
-        calldata: MemBuffer::empty().span(),
-        chain_id: 1,
-        mut raw_unsigned,
-    )
-    assert!(
-        raw_unsigned.len() == 37
-            && raw_unsigned[0] == 0xe4
-            && raw_unsigned[1] == 0x09
-            && raw_unsigned[2] == 0x85
-            && raw_unsigned[3] == 0x04
-            && raw_unsigned[8] == 0x82
-            && raw_unsigned[9] == 0x52
-            && raw_unsigned[10] == 0x08
-            && raw_unsigned[11] == 0x94
-            && raw_unsigned[32] == 0x80
-            && raw_unsigned[33] == 0x80
-            && raw_unsigned[34] == 0x01
-            && raw_unsigned[35] == 0x80
-            && raw_unsigned[36] == 0x80,
-    )
-
-    var raw_signed = MemBuffer::empty()
-    encode_eip155_signed_tx(
-        nonce: 9,
-        gas_price: 20_000_000_000 as u128,
-        gas_limit: 21000,
-        to20: to_buf.span(),
-        calldata: calldata.span(),
-        v: 37 as u128,
-        r: lead_zero_hi,
-        s: lead_zero_7f,
-        mut raw_signed,
-    )
-    assert!(raw_signed[0] == 0xf9 && raw_signed.len() > 1000)
-
-    var eip1559_unsigned = MemBuffer::empty()
-    encode_eip1559_unsigned_tx(
-        chain_id: 31337,
-        nonce: 9,
-        max_priority_fee_per_gas: 1_000_000_000 as u128,
-        max_fee_per_gas: 20_000_000_000 as u128,
-        gas_limit: 21000,
-        to20: to_buf.span(),
-        calldata: MemBuffer::empty().span(),
-        mut eip1559_unsigned,
-    )
-    assert!(
-        eip1559_unsigned.len() == 44
-            && eip1559_unsigned[0] == 0x02
-            && eip1559_unsigned[1] == 0xea
-            && eip1559_unsigned[2] == 0x82
-            && eip1559_unsigned[3] == 0x7a
-            && eip1559_unsigned[4] == 0x69
-            && eip1559_unsigned[5] == 0x09
-            && eip1559_unsigned[6] == 0x84
-            && eip1559_unsigned[11] == 0x85
-            && eip1559_unsigned[17] == 0x82
-            && eip1559_unsigned[20] == 0x94
-            && eip1559_unsigned[41] == 0x80
-            && eip1559_unsigned[42] == 0x80
-            && eip1559_unsigned[43] == 0xc0,
-    )
-
-    var eip1559_signed_empty = MemBuffer::empty()
-    encode_eip1559_signed_tx(
-        chain_id: 31337,
-        nonce: 9,
-        max_priority_fee_per_gas: 1_000_000_000 as u128,
-        max_fee_per_gas: 20_000_000_000 as u128,
-        gas_limit: 21000,
-        to20: to_buf.span(),
-        calldata: MemBuffer::empty().span(),
-        y_parity: 0,
-        r: lead_zero_hi,
-        s: lead_zero_7f,
-        mut eip1559_signed_empty,
-    )
-    assert!(
-        eip1559_signed_empty.len() == 49
-            && eip1559_signed_empty[0] == 0x02
-            && eip1559_signed_empty[1] == 0xef
-            && eip1559_signed_empty[43] == 0xc0
-            && eip1559_signed_empty[44] == 0x80
-            && eip1559_signed_empty[45] == 0x82
-            && eip1559_signed_empty[48] == 0x7f,
-    )
-
-    var eip1559_signed_call = MemBuffer::empty()
-    encode_eip1559_signed_tx(
-        chain_id: 31337,
-        nonce: 9,
-        max_priority_fee_per_gas: 1_000_000_000 as u128,
-        max_fee_per_gas: 20_000_000_000 as u128,
-        gas_limit: 21000,
-        to20: to_buf.span(),
-        calldata: calldata.span(),
-        y_parity: 1,
-        r: lead_zero_hi,
-        s: lead_zero_7f,
-        mut eip1559_signed_call,
-    )
-    assert!(
-        eip1559_signed_call[0] == 0x02
-            && eip1559_signed_call[1] == 0xf9
-            && eip1559_signed_call.len() > 1000
-            && eip1559_signed_call[eip1559_signed_call.len() - 5] == 0x01,
-    )
-}
-
-#[test]
-fn test_eip1559_fee_history_and_bump_math() {
-    let fh_json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"oldestBlock\":\"0x1\",\"baseFeePerGas\":[\"0x3b9aca00\",\"0x77359400\"],\"gasUsedRatio\":[0.5],\"reward\":[[\"0x1dcd6500\"],[\"0x59682f00\"]]}}"
-        .span()
-    let (next_base, max_rew) = parse_fee_history_result(fh_json).unwrap()
-    assert!(
-        next_base == (2_000_000_000 as u128) && max_rew == (1_500_000_000 as u128),
-    )
-
-    let fh_no_reward = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"baseFeePerGas\":[\"0x3b9aca00\"]}}"
-        .span()
-    let (nb2, mr2) = parse_fee_history_result(fh_no_reward).unwrap()
-    assert!(nb2 == (1_000_000_000 as u128) && mr2 == (0 as u128))
-
-    assert!(
-        parse_fee_history_result(
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601}}".span(),
-        )
-            .is_none(),
-    )
-    assert!(
-        parse_fee_history_result("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}".span()).is_none(),
-    )
-
-    let (prio, max_f) = compute_eip1559_fees(
-        next_base_fee: 2_000_000_000 as u128,
-        reward_tip: 1_500_000_000 as u128,
-        rpc_tip: 2_000_000_000 as u128,
-        min_priority_fee: 1_000_000_000 as u128,
-        min_max_fee: 2_000_000_000 as u128,
-    )
-    assert!(
-        prio == (2_000_000_000 as u128) && max_f == (6_000_000_000 as u128),
-    )
-
-    assert!(
-        bump_fee_wei(2_000_000_000 as u128, min_bump_wei: 500_000_000 as u128)
-            == (2_500_000_000 as u128),
-    )
-    assert!(
-        bump_fee_wei(100_000_000 as u128, min_bump_wei: 500_000_000 as u128)
-            == (600_000_000 as u128),
-    )
-    assert!(
-        bump_fee_wei(100 as u128, min_bump_wei: 0 as u128) == (125 as u128),
-    )
 }

@@ -1,0 +1,454 @@
+use feracle_core::{
+    ASSET_COUNT,
+    MAX_TOLERANCE_BPS,
+    NODE_COUNT,
+    QUORUM,
+    first_tolerance_breach_asset,
+    leader_index,
+    worst_quote_deviation,
+    write_asset_symbol,
+}
+use super::codec::{format_age, format_asset_price_usd, format_signed_bps, write_padded_col}
+use super::render::{
+    push_ansi_clear,
+    push_ansi_code,
+    compute_age_secs,
+    format_asset_cell,
+    render_sparkline,
+}
+use super::state::{MAX_ORACLES, TelemetryEngine}
+
+pub fn render_tui_into(_ st: TelemetryEngine, now_ms: u64, ansi: bool, _ out: mut MemBuffer) {
+    out.clear()
+    if ansi {
+        push_ansi_clear(mut out)
+    }
+
+    push_ansi_code(ansi, "[1;36m".span(), mut out)
+    writeln!(
+        mut out,
+        "================================================================================",
+    )
+    writeln!(
+        mut out,
+        "  FERACLE  |  Decentralized Price Oracle  |  WASM Telemetry",
+    )
+    writeln!(
+        mut out,
+        "================================================================================",
+    )
+    push_ansi_code(ansi, "[0m".span(), mut out)
+
+    let conn_str = if st.onchain.connected {
+        "CONNECTED"
+    } else {
+        "WAITING"
+    }
+    write!(
+        mut out,
+        "  Chain ID: ",
+        st.onchain.chain_id,
+        "   Block: #",
+        st.onchain.block_number,
+        "   RPC Latency: ",
+        st.onchain.rpc_latency_ms,
+        "ms   Status: ",
+        conn_str,
+        " (polls=",
+        st.onchain.total_rpc_polls,
+        " err=",
+        st.onchain.rpc_errors,
+        ")\n",
+    )
+
+    out.extend_from("  Contract: ".span())
+    if st.onchain.contract_addr.is_empty() {
+        out.extend_from("<unconfigured>".span())
+    } else {
+        st.onchain.contract_addr.write_to(mut out)
+    }
+    out.extend_from("   Owner: ".span())
+    if st.onchain.owner.is_empty() {
+        out.extend_from("...".span())
+    } else {
+        st.onchain.owner.write_short_addr(mut out)
+    }
+    out.push(b'\n')
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+
+    // --- Live Resolved 20-Asset Price Board ---
+    var age_buf = MemBuffer::empty()
+    format_age(now_ms, ts_sec: st.onchain.last_updated, mut age_buf)
+    let age_secs = compute_age_secs(now_ms, ts_sec: st.onchain.last_updated)
+    let health = if st.onchain.last_updated == 0 {
+        "PENDING"
+    } else if age_secs <= 60 { "FRESH" } else { "STALE" }
+
+    push_ansi_code(ansi, "[1;32m".span(), mut out)
+    write!(
+        mut out,
+        "  LIVE TOP-20 BASKET (Updated: ",
+        age_buf,
+        " [",
+        health,
+        "])   BTC Trend: ",
+    )
+    render_sparkline(st, mut out)
+    out.push(b'\n')
+    push_ansi_code(ansi, "[0m".span(), mut out)
+
+    var row: usize = 0
+    while row < 10 {
+        var left = MemBuffer::empty()
+        format_asset_cell(
+            asset_id: row,
+            price_1e8: st.onchain.latest_prices[row],
+            delta_bps: st.onchain.last_deltas_bps[row],
+            mut left,
+        )
+        out.extend_from("  ".span())
+        write_padded_col(left.span(), width: 36, right_align: false, mut out)
+        out.extend_from(" | ".span())
+        var right = MemBuffer::empty()
+        format_asset_cell(
+            asset_id: row + 10,
+            price_1e8: st.onchain.latest_prices[row + 10],
+            delta_bps: st.onchain.last_deltas_bps[row + 10],
+            mut right,
+        )
+        out.extend_from(right.span())
+        out.push(b'\n')
+        row += 1
+    }
+
+    // --- Consensus & Protocol Invariants ---
+    let cur_round = if st.onchain.current_round > 0 {
+        st.onchain.current_round
+    } else {
+        1
+    }
+    let primary_leader = leader_index(round_id: cur_round, node_count: NODE_COUNT)
+    let backup_leader = leader_index(round_id: cur_round + 1, node_count: NODE_COUNT)
+    let inv_str = if st.onchain.tx_invariant_ok {
+        "OK (1 tx/round)"
+    } else {
+        "VIOLATED (>1 tx/round)"
+    }
+    let failover_str = if st.onchain.last_tx_failover {
+        "YES"
+    } else {
+        "NO"
+    }
+
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    write!(
+        mut out,
+        "  Round: ",
+        st.onchain.current_round,
+        " (settled=",
+        if st.onchain.current_round > 1 {
+            st.onchain.current_round - 1
+        } else {
+            0
+        },
+        ")   Assets: ",
+        ASSET_COUNT,
+        "   Primary: Node ",
+        primary_leader,
+        "   Backup: Node ",
+        backup_leader,
+        "\n",
+    )
+    write!(
+        mut out,
+        "  Quorum: ",
+        QUORUM,
+        "/",
+        NODE_COUNT,
+        "   Tolerance: +-",
+        MAX_TOLERANCE_BPS,
+        " bps   Invariant: ",
+        inv_str,
+        "   Gas: ",
+        st.onchain.last_tx_gas,
+        "   Failover: ",
+        failover_str,
+        "\n",
+    )
+
+    // --- Off-Chain GossipSub Wire Telemetry ---
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    out.extend_from("  OFF-CHAIN P2P WIRE (feracle_core): round=".span())
+    write!(
+        mut out,
+        st.active_wire_round,
+        " q=",
+        st.wire_quote_count,
+        "/",
+        NODE_COUNT,
+        " s=",
+        st.wire_sig_count,
+        "/",
+        QUORUM,
+        " guard=[",
+    )
+    if st.wire_breach_detected {
+        out.extend_from("BREACH".span())
+        if st.wire_breach_asset >= 0 {
+            let bad_id: usize = st.wire_breach_asset.downcast_unchecked()
+            out.extend_from(" on ".span())
+            write_asset_symbol(bad_id, mut out)
+        }
+        out.extend_from(" >100bps".span())
+    } else {
+        out.extend_from("OK".span())
+    }
+    write!(
+        mut out,
+        "] (seen q=",
+        st.total_wire_quotes_seen,
+        " s=",
+        st.total_wire_sigs_seen,
+        " err=",
+        st.total_wire_decode_errors,
+        ")\n",
+    )
+    if st.wire_group_medians[0] > 0 {
+        var btc_med = MemBuffer::empty()
+        var eth_med = MemBuffer::empty()
+        format_asset_price_usd(st.wire_group_medians[0], mut btc_med)
+        format_asset_price_usd(st.wire_group_medians[1], mut eth_med)
+        writeln!(
+            mut out,
+            "    Proposed Median Basket: BTC=",
+            btc_med,
+            "  ETH=",
+            eth_med,
+            " (ts=",
+            st.wire_round_ts,
+            ")",
+        )
+    }
+
+    var qi: usize = 0
+    while qi < st.wire_quote_count {
+        let q = st.wire_quotes[qi]
+        var qp = MemBuffer::empty()
+        format_asset_price_usd(q.prices[0], mut qp)
+        out.extend_from("    Quote[".span())
+        write!(mut out, qi, "] peer=")
+        if q.peer_tag.is_empty() {
+            out.extend_from("unknown".span())
+        } else {
+            q.peer_tag.write_short_addr(mut out)
+        }
+        write!(mut out, "  btc=", qp, "  rx=", q.rx_count)
+        if st.wire_group_medians[0] > 0 {
+            let (worst_idx, worst_bps) = worst_quote_deviation(q.prices, st.wire_group_medians)
+            var dbuf = MemBuffer::empty()
+            format_signed_bps(worst_bps, mut dbuf)
+            var wsym = MemBuffer::empty()
+            write_asset_symbol(worst_idx, mut wsym)
+            let ok = first_tolerance_breach_asset(
+                local: q.prices,
+                proposed: st.wire_group_medians,
+                max_bps: MAX_TOLERANCE_BPS,
+            )
+                .is_none()
+            let tag = if ok { "OK" } else { "BREACH" }
+            write!(mut out, "  max_diff=", dbuf, "(", wsym, ") [", tag, "]")
+        }
+        out.push(b'\n')
+        qi += 1
+    }
+
+    var si: usize = 0
+    while si < st.wire_sig_count {
+        let s = st.wire_sigs[si]
+        var sp = MemBuffer::empty()
+        format_asset_price_usd(s.median_prices[0], mut sp)
+        out.extend_from("    Sig[".span())
+        write!(mut out, si, "] signer=")
+        s.signer_hex.write_short_addr(mut out)
+        write!(
+            mut out,
+            "  v=",
+            s.v,
+            "  btc=",
+            sp,
+            "  rx=",
+            s.rx_count,
+            "\n",
+        )
+        si += 1
+    }
+
+    // --- Oracle Nodes & Per-Exchange Feeds ---
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    writeln!(mut out, "  ORACLE NODES & EXCHANGE FEEDS:")
+    var ni: usize = 0
+    while ni < MAX_ORACLES {
+        let node = st.nodes[ni]
+        let auth_tag = if !node.auth_known {
+            "AUTH?"
+        } else if node.is_authorized_onchain {
+            "AUTH"
+        } else {
+            "UNAUTH"
+        }
+        let live_tag = if node.online {
+            "ONLINE"
+        } else if node.seen { "OFFLINE" } else { "NO_TAP" }
+        write!(
+            mut out,
+            "  Node ",
+            ni,
+            " [",
+            auth_tag,
+            "][",
+            live_tag,
+            "] addr=",
+        )
+        if node.evm_addr.is_empty() {
+            out.extend_from("-".span())
+        } else {
+            node.evm_addr.write_short_addr(mut out)
+        }
+        write!(
+            mut out,
+            "  peers=",
+            node.peer_count,
+            "  r=",
+            node.round_id,
+            "  phase=",
+        )
+        if node.phase.is_empty() {
+            out.extend_from("-".span())
+        } else {
+            node.phase.write_to(mut out)
+        }
+        if node.local_price > 0 {
+            var lp = MemBuffer::empty()
+            format_asset_price_usd(node.local_price, mut lp)
+            write!(mut out, "  btc=", lp)
+        }
+        write!(
+            mut out,
+            "  q=",
+            node.quotes_tx,
+            "/",
+            node.quotes_rx,
+            "  s=",
+            node.sigs_tx,
+            "/",
+            node.sigs_rx,
+            "  breach=",
+            node.tolerance_breaches,
+            "  sub=",
+            node.submissions_ok,
+            "/",
+            node.submissions_err,
+            "\n",
+        )
+        if node.feed_count > 0 {
+            out.extend_from("    feeds: ".span())
+            var fi: usize = 0
+            while fi < node.feed_count {
+                if fi > 0 {
+                    out.extend_from(" | ".span())
+                }
+                let f = node.feeds[fi]
+                f.provider.write_to(mut out)
+                out.push(b'@')
+                f.addr.write_to(mut out)
+                out.push(b'=')
+                if f.ok {
+                    var fp = MemBuffer::empty()
+                    format_asset_price_usd(f.price, mut fp)
+                    write!(mut out, f.assets_ok, "/20 ", fp, "(", f.latency_ms, "ms)")
+                } else {
+                    write!(mut out, "ERR(", f.latency_ms, "ms)")
+                }
+                fi += 1
+            }
+            out.push(b'\n')
+        }
+        ni += 1
+    }
+
+    // --- Recent Settled Rounds History ---
+    writeln!(
+        mut out,
+        "--------------------------------------------------------------------------------",
+    )
+    writeln!(mut out, "  RECENT SETTLED ROUNDS (newest first):")
+    if st.rounds_len == 0 {
+        writeln!(mut out, "    (no settled rounds observed yet)")
+    } else {
+        let show = if st.rounds_len > 8 { 8 } else { st.rounds_len }
+        var step: usize = 0
+        while step < show {
+            let l_idx = st.rounds_len - 1 - step
+            let rs = st.round_at(l_idx)
+            var rbtc = MemBuffer::empty()
+            if rs.prices[0] > 0 {
+                format_asset_price_usd(rs.prices[0], mut rbtc)
+            } else {
+                rbtc.extend_from("-".span())
+            }
+            var reth = MemBuffer::empty()
+            if rs.prices[1] > 0 {
+                format_asset_price_usd(rs.prices[1], mut reth)
+            } else {
+                reth.extend_from("-".span())
+            }
+            var rdelta = MemBuffer::empty()
+            format_signed_bps(rs.delta_bps, mut rdelta)
+            var rage = MemBuffer::empty()
+            format_age(now_ms, ts_sec: rs.timestamp, mut rage)
+
+            write!(
+                mut out,
+                "    Round ",
+                rs.round_id,
+                "  | BTC=",
+                rbtc,
+                " ETH=",
+                reth,
+                " (",
+                rdelta,
+                ") | ",
+                rage,
+                " | exp=",
+                rs.expected_leader_idx,
+            )
+            if rs.actual_leader_idx >= 0 {
+                write!(mut out, " act=", rs.actual_leader_idx)
+            }
+            if rs.failover {
+                out.extend_from(" [FAILOVER]".span())
+            }
+            if rs.gas_used > 0 || rs.tx_count > 0 {
+                write!(mut out, " | gas=", rs.gas_used, " txs=", rs.tx_count)
+            }
+            out.push(b'\n')
+            step += 1
+        }
+    }
+    writeln!(
+        mut out,
+        "================================================================================",
+    )
+}

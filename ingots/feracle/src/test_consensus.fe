@@ -1,0 +1,378 @@
+use std::io::{Stderr, Stdout}
+use std::net::{IpAddr, Ipv4Addr, Net, SocketAddr}
+use std::time::Clock
+use coro::{LocalScheduler, Poll, Scheduler, VirtualClockDriver}
+use feracle_core::{decode_quote, decode_sig_msg, encode_quote_buf, encode_sig_msg_buf}
+use net_reactor::{SocketIo}
+use super::consensus::ConsensusCoro
+use super::crypto::Crypto
+use super::telemetry::{TelemetrySink}
+use super::test_mocks::{
+    MockCrypto,
+    MockPeerMesh,
+    make_contract20,
+    make_key,
+    make_prices,
+    make_test_node_config,
+}
+use super::test_socket::{ScriptedSocketIo}
+
+fn push_mock_quote(
+    _ peer: mut MockPeerMesh,
+    key_tag: u8,
+    contract20: MemSpan,
+    round_id: u64,
+    timestamp: u64,
+    prices: [u64; 20],
+) {
+    let mock = MockCrypto {}
+    let k = make_key(key_tag)
+    let q = mock
+        .sign_quote(
+            privkey32: k.span(),
+            chain_id: 31337,
+            contract20,
+            round_id,
+            timestamp,
+            prices,
+        )
+        .unwrap()
+    peer.push_incoming(encode_quote_buf(q).span())
+}
+
+fn push_mock_sig(
+    _ peer: mut MockPeerMesh,
+    key_tag: u8,
+    contract20: MemSpan,
+    round_id: u64,
+    prices: [u64; 20],
+    timestamp: u64,
+) {
+    let mock = MockCrypto {}
+    let k = make_key(key_tag)
+    let s = mock
+        .sign_digest(
+            privkey32: k.span(),
+            chain_id: 31337,
+            contract20,
+            round_id,
+            prices,
+            timestamp,
+        )
+        .unwrap()
+    peer.push_incoming(encode_sig_msg_buf(s).span())
+}
+
+#[test]
+fn test_consensus_coro_happy_path_submit()
+uses (net: mut Net, clock: Clock, out: mut Stdout, err: mut Stderr)
+{
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.onchain_round = 1
+    io.last_updated = 1
+    io.advances_round_on_send = true
+    let addr = io.local_addr()
+
+    let cfg = make_test_node_config(
+        node_id: 1,
+        key_tag: 2,
+        addr,
+        rounds: 1,
+        round_timeout_secs: 6,
+    )
+    let mock = MockCrypto {}
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 50)
+    var peer = MockPeerMesh::new(3)
+    var telemetry = TelemetrySink::Disabled
+
+    let c20 = make_contract20(0x11)
+    var injected_quotes = false
+    var injected_sigs = false
+    var exit_code: Option<i32> = Option::None
+
+    with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+        var cons = ConsensusCoro::new(config: cfg)
+        var ticks: usize = 0
+        while ticks < 200 {
+            driver.begin_tick()
+            let res = cons.poll(mut peer, mut telemetry)
+
+            var pi: usize = 0
+            while pi < peer.published.len() {
+                let q_opt = decode_quote(peer.published[pi].span())
+                let s_opt = decode_sig_msg(peer.published[pi].span())
+                if !injected_quotes {
+                    if let Option::Some(self_q) = q_opt {
+                        injected_quotes = true
+                        let p1 = make_prices(9245100000000, 10050000000)
+                        let p2 = make_prices(9245200000000, 10150000000)
+                        let p3 = make_prices(9245300000000, 10200000000)
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p1,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 3,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p2,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 4,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p3,
+                        )
+                    }
+                }
+                if !injected_sigs {
+                    if let Option::Some(self_s) = s_opt {
+                        injected_sigs = true
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 3,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                    }
+                }
+                pi += 1
+            }
+
+            if let Poll::Ready(code) = res {
+                exit_code = Option::Some(code)
+                assert!(cons.completed_rounds() == 1)
+                break
+            }
+            driver.wait()
+            ticks += 1
+        }
+    }
+
+    assert!(exit_code == Option::Some(0))
+    assert!(io.send_raw_count == 1)
+    assert!(io.has_captured("\"eth_feeHistory\"".span()))
+}
+
+#[test]
+fn test_consensus_coro_quorum_grace_and_backup_failover()
+uses (net: mut Net, clock: Clock, out: mut Stdout, err: mut Stderr)
+{
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.onchain_round = 1
+    io.last_updated = 1
+    io.advances_round_on_send = true
+    let addr = io.local_addr()
+
+    let cfg = make_test_node_config(
+        node_id: 2,
+        key_tag: 3,
+        addr,
+        rounds: 1,
+        round_timeout_secs: 6,
+    )
+    let mock = MockCrypto {}
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 150)
+    var peer = MockPeerMesh::new(3)
+    var telemetry = TelemetrySink::Disabled
+
+    let c20 = make_contract20(0x11)
+    var injected_quotes = false
+    var injected_sigs = false
+    var phase_a_ms: u64 = 0
+    var phase_b_ms: u64 = 0
+    var settling_ms: u64 = 0
+    var exit_code: Option<i32> = Option::None
+
+    with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+        var cons = ConsensusCoro::new(config: cfg)
+        var ticks: usize = 0
+        while ticks < 250 {
+            driver.begin_tick()
+            let res = cons.poll(mut peer, mut telemetry)
+
+            var pi: usize = 0
+            while pi < peer.published.len() {
+                let q_opt = decode_quote(peer.published[pi].span())
+                let s_opt = decode_sig_msg(peer.published[pi].span())
+                if !injected_quotes {
+                    if let Option::Some(self_q) = q_opt {
+                        injected_quotes = true
+                        phase_a_ms = sched.now_ms()
+                        let p1 = make_prices(9245100000000, 10050000000)
+                        let p2 = make_prices(9245200000000, 10150000000)
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p1,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 2,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p2,
+                        )
+                    }
+                }
+                if !injected_sigs {
+                    if let Option::Some(self_s) = s_opt {
+                        injected_sigs = true
+                        phase_b_ms = sched.now_ms()
+                        settling_ms = phase_b_ms
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                        push_mock_sig(
+                            mut peer,
+                            key_tag: 2,
+                            contract20: c20.span(),
+                            round_id: self_s.round_id,
+                            prices: self_s.median_prices,
+                            timestamp: self_s.timestamp,
+                        )
+                    }
+                }
+                pi += 1
+            }
+
+            if injected_sigs && sched.now_ms() < settling_ms + 3000 {
+                assert!(io.send_raw_count == 0)
+            }
+            if let Poll::Ready(code) = res {
+                exit_code = Option::Some(code)
+                assert!(cons.completed_rounds() == 1)
+                break
+            }
+            driver.wait()
+            ticks += 1
+        }
+    }
+
+    assert!(exit_code == Option::Some(0))
+    assert!(phase_b_ms >= phase_a_ms + 2000)
+    assert!(sched.now_ms() >= settling_ms + 3000)
+    assert!(io.send_raw_count == 1)
+}
+
+#[test]
+fn test_consensus_coro_tolerance_breach_no_submit()
+uses (net: mut Net, clock: Clock, out: mut Stdout, err: mut Stderr)
+{
+    let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    var io = ScriptedSocketIo::new(listen_addr: lo)
+    io.onchain_round = 1
+    io.last_updated = 1
+    let addr = io.local_addr()
+
+    let cfg = make_test_node_config(
+        node_id: 1,
+        key_tag: 2,
+        addr,
+        rounds: 1,
+        round_timeout_secs: 6,
+    )
+    let mock = MockCrypto {}
+    var sched = LocalScheduler::new(0)
+    var driver = VirtualClockDriver::new(step_ms: 150)
+    var peer = MockPeerMesh::new(3)
+    var telemetry = TelemetrySink::Disabled
+
+    let c20 = make_contract20(0x11)
+    var injected_quotes = false
+    var breach_started_ms: u64 = 0
+    var exit_code: Option<i32> = Option::None
+
+    with (Crypto = mock, Scheduler = sched, SocketIo = io) {
+        var cons = ConsensusCoro::new(config: cfg)
+        var ticks: usize = 0
+        while ticks < 200 {
+            driver.begin_tick()
+            let res = cons.poll(mut peer, mut telemetry)
+
+            var pi: usize = 0
+            while pi < peer.published.len() {
+                let s_opt = decode_sig_msg(peer.published[pi].span())
+                assert!(s_opt.is_none())
+                let q_opt = decode_quote(peer.published[pi].span())
+                if !injected_quotes {
+                    if let Option::Some(self_q) = q_opt {
+                        injected_quotes = true
+                        breach_started_ms = sched.now_ms()
+                        let p_bad = make_prices(20000000000000, 10050000000)
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 1,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p_bad,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 3,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p_bad,
+                        )
+                        push_mock_quote(
+                            mut peer,
+                            key_tag: 4,
+                            contract20: c20.span(),
+                            round_id: self_q.round_id,
+                            timestamp: self_q.timestamp,
+                            prices: p_bad,
+                        )
+                    }
+                }
+                pi += 1
+            }
+
+            if injected_quotes && sched.now_ms() >= breach_started_ms + 300 {
+                io.onchain_round = 2
+            }
+            if let Poll::Ready(code) = res {
+                exit_code = Option::Some(code)
+                assert!(cons.completed_rounds() == 1)
+                break
+            }
+            driver.wait()
+            ticks += 1
+        }
+    }
+
+    assert!(exit_code == Option::Some(0))
+    assert!(io.send_raw_count == 0)
+}

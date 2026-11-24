@@ -1,0 +1,225 @@
+use super::error::{CliError, closest_match}
+use super::matches::MatchedArg
+use super::spec::{App, Arg, ArgKind}
+use super::value::ValueSource
+
+pub(ingot) fn arg_display_name(_ arg: Arg) -> MemBuffer {
+    match arg.long {
+        Option::Some(ref long_name) => format!("--", long_name),
+        Option::None => match arg.short {
+            Option::Some(ch) => {
+                var b = MemBuffer::with_capacity(2)
+                b.push(b'-')
+                b.push(ch)
+                b
+            },
+            Option::None => format!("<", arg.id, ">"),
+        },
+    }
+}
+
+pub(ingot) fn find_arg_by_id(_ app: App, _ id: MemSpan) -> Option<usize> {
+    var i: usize = 0
+    while i < app.args.len() {
+        if app.args[i].id.span() == id {
+            return Option::Some(i)
+        }
+        i += 1
+    }
+    Option::None
+}
+
+pub(ingot) fn find_arg_by_long(_ app: App, _ name: MemSpan) -> Option<usize> {
+    var i: usize = 0
+    while i < app.args.len() {
+        if let Option::Some(ref long_name) = app.args[i].long {
+            if long_name.span() == name {
+                return Option::Some(i)
+            }
+        }
+        i += 1
+    }
+    Option::None
+}
+
+pub(ingot) fn find_arg_by_short(_ app: App, _ ch: u8) -> Option<usize> {
+    var i: usize = 0
+    while i < app.args.len() {
+        if let Option::Some(s) = app.args[i].short {
+            if s == ch {
+                return Option::Some(i)
+            }
+        }
+        i += 1
+    }
+    Option::None
+}
+
+pub(ingot) fn find_subcommand(_ app: App, _ name: MemSpan) -> Option<usize> {
+    var i: usize = 0
+    while i < app.subcommands.len() {
+        if app.subcommands[i].name.span() == name {
+            return Option::Some(i)
+        }
+        i += 1
+    }
+    Option::None
+}
+
+pub(ingot) fn app_has_positional(_ app: App) -> bool {
+    var i: usize = 0
+    while i < app.args.len() {
+        if app.args[i].kind == ArgKind::Positional {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+pub(ingot) fn suggest_long_flag(_ app: App, _ flag_name: MemSpan) -> Option<MemBuffer> {
+    var candidates = MemVec<MemBuffer>::new()
+    candidates.push(format!("help"))
+    if app.version.is_some() {
+        candidates.push(format!("version"))
+    }
+    var i: usize = 0
+    while i < app.args.len() {
+        if let Option::Some(ref long_name) = app.args[i].long {
+            candidates.push(MemBuffer::from_span(long_name.span()))
+        }
+        i += 1
+    }
+    let max_d: usize = if flag_name.len() <= 3 { 1 } else { 3 }
+    let best = closest_match(flag_name, candidates.as_slice(), max_dist: max_d)?
+    Option::Some(format!("--", best))
+}
+
+pub(ingot) fn suggest_subcommand(_ app: App, _ name: MemSpan) -> Option<MemBuffer> {
+    var candidates = MemVec<MemBuffer>::new()
+    candidates.push(format!("help"))
+    var i: usize = 0
+    while i < app.subcommands.len() {
+        candidates.push(MemBuffer::from_span(app.subcommands[i].name.span()))
+        i += 1
+    }
+    let max_d: usize = if name.len() <= 3 { 1 } else { 3 }
+    closest_match(name, candidates.as_slice(), max_dist: max_d)
+}
+
+fn append_split_value(_ values: mut MemVec<MemBuffer>, _ raw: MemSpan, _ delim: Option<u8>) {
+    match delim {
+        Option::Some(sep) => {
+            for part in raw.split(sep) {
+                values.push(MemBuffer::from_span(part))
+            }
+        },
+        Option::None => {
+            values.push(MemBuffer::from_span(raw))
+        },
+    }
+}
+
+pub(ingot) fn record_value(
+    _ state: mut MemVec<Option<MatchedArg>>,
+    _ app: App,
+    arg_idx: usize,
+    _ raw: MemSpan,
+    source: ValueSource,
+    from_cli: bool,
+) -> Result<CliError, ()> {
+    let arg = ref app.args[arg_idx]
+    match state[arg_idx] {
+        Option::Some(mut existing) => {
+            if arg.kind == ArgKind::Multi {
+                append_split_value(mut existing.values, raw, arg.delimiter)
+                existing.occurrences += 1
+                existing.source = source
+                return Result::Ok(())
+            }
+            if from_cli && !arg.allow_override {
+                return Result::Err(CliError::DuplicateArg { arg: arg_display_name(arg) })
+            }
+            existing.values.clear()
+            existing.values.push(MemBuffer::from_span(raw))
+            existing.occurrences += 1
+            existing.source = source
+        },
+        Option::None => {
+            var vals = MemVec<MemBuffer>::new()
+            if arg.kind == ArgKind::Multi {
+                append_split_value(mut vals, raw, arg.delimiter)
+            } else {
+                vals.push(MemBuffer::from_span(raw))
+            }
+            state[arg_idx] = Option::Some(
+                MatchedArg {
+                    display_name: arg_display_name(arg),
+                    values: vals,
+                    occurrences: 1,
+                    source,
+                    sensitive: arg.sensitive,
+                },
+            )
+        },
+    }
+    Result::Ok(())
+}
+
+pub(ingot) fn record_flag(
+    _ state: mut MemVec<Option<MatchedArg>>,
+    _ app: App,
+    arg_idx: usize,
+    source: ValueSource,
+) {
+    let arg = ref app.args[arg_idx]
+    match state[arg_idx] {
+        Option::Some(mut existing) => {
+            existing.occurrences += 1
+            existing.source = source
+        },
+        Option::None => {
+            state[arg_idx] = Option::Some(
+                MatchedArg {
+                    display_name: arg_display_name(arg),
+                    values: MemVec<MemBuffer>::new(),
+                    occurrences: 1,
+                    source,
+                    sensitive: arg.sensitive,
+                },
+            )
+        },
+    }
+}
+
+pub(ingot) fn is_truthy_flag_str(_ s: MemSpan) -> bool {
+    s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES" || s == "on" || s == "ON"
+}
+
+pub(ingot) fn is_falsy_flag_str(_ s: MemSpan) -> bool {
+    s == "0" || s == "false" || s == "FALSE" || s == "no" || s == "NO" || s == "off" || s == "OFF"
+}
+
+pub(ingot) fn format_allowed_choices(_ choices: MemSlice<MemBuffer>) -> MemBuffer {
+    var out = MemBuffer::empty()
+    var i: usize = 0
+    while i < choices.len() {
+        if i > 0 {
+            out.extend_from(", ".span())
+        }
+        out.extend_from(choices.at(i).span())
+        i += 1
+    }
+    out
+}
+
+pub(ingot) fn value_in_choices(_ val: MemSpan, _ choices: MemSlice<MemBuffer>) -> bool {
+    var i: usize = 0
+    while i < choices.len() {
+        if val == choices.at(i).span() {
+            return true
+        }
+        i += 1
+    }
+    false
+}

@@ -1,0 +1,460 @@
+use std::evm::{Address, Evm, Wei, encode_error}
+use super::{NotPaused, OracleMsg, Paused, Sig, Unauthorized, ZeroAddress}
+use super::test_helpers::{
+    ADDR_0,
+    ADDR_1,
+    ADDR_2,
+    ADDR_3,
+    TEST_TS,
+    test_prices,
+    sig0,
+    sig1,
+    sig2,
+    sig3,
+    HelperMsg,
+    NonOwnerCaller,
+    deploy_and_register,
+    assert_reverted_with,
+}
+
+#[test]
+fn test_two_step_ownership_transfer() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let helper1 = evm.create2<NonOwnerCaller>(value: Wei::zero(), args: (), salt: 1)
+    let helper2 = evm.create2<NonOwnerCaller>(value: Wei::zero(), args: (), salt: 2)
+
+    let initial_owner: Address = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::Owner {},
+        )
+    let initial_pending: Address = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::PendingOwner {},
+        )
+    assert!(
+        initial_owner != Address::zero() && initial_pending == Address::zero(),
+    )
+
+    // Zero address rejected for addOracle and transferOwnership
+    let out_zero_oracle = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::AddOracle { node: Address::zero() },
+        )
+    assert_reverted_with(out_zero_oracle, encode_error(ZeroAddress {}).span())
+
+    let out_zero_owner = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::TransferOwnership { new_owner: Address::zero() },
+        )
+    assert_reverted_with(out_zero_owner, encode_error(ZeroAddress {}).span())
+
+    // Non-owner cannot initiate ownership transfer; acceptOwnership reverts when pending == 0
+    assert!(
+        !evm.call(
+            addr: helper1,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardTransferOwnership { target: addr, new_owner: helper1 },
+        ),
+    )
+    assert!(
+        evm.call(
+                addr: addr,
+                gas: 100000,
+                value: Wei::zero(),
+                message: OracleMsg::PendingOwner {},
+            )
+            == Address::zero(),
+    )
+    let out_no_pending = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::AcceptOwnership {},
+        )
+    assert_reverted_with(out_no_pending, encode_error(Unauthorized {}).span())
+
+    // Step 1: initiate transfer to helper1 -> owner stays unchanged until accepted
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::TransferOwnership { new_owner: helper1 },
+    )
+    assert!(
+        evm.call(
+                addr: addr,
+                gas: 100000,
+                value: Wei::zero(),
+                message: OracleMsg::Owner {},
+            )
+            == initial_owner,
+    )
+    assert!(
+        evm.call(
+                addr: addr,
+                gas: 100000,
+                value: Wei::zero(),
+                message: OracleMsg::PendingOwner {},
+            )
+            == helper1,
+    )
+
+    // Wrong caller (helper2 or old owner) cannot accept ownership
+    assert!(
+        !evm.call(
+            addr: helper2,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardAcceptOwnership { target: addr },
+        ),
+    )
+    let out_wrong_accept = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::AcceptOwnership {},
+        )
+    assert_reverted_with(out_wrong_accept, encode_error(Unauthorized {}).span())
+
+    // Step 2: helper1 accepts ownership -> owner updates and pendingOwner clears
+    assert!(
+        evm.call(
+            addr: helper1,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardAcceptOwnership { target: addr },
+        ),
+    )
+    assert!(
+        evm.call(
+                addr: addr,
+                gas: 100000,
+                value: Wei::zero(),
+                message: OracleMsg::Owner {},
+            )
+            == helper1,
+    )
+    assert!(
+        evm.call(
+                addr: addr,
+                gas: 100000,
+                value: Wei::zero(),
+                message: OracleMsg::PendingOwner {},
+            )
+            == Address::zero(),
+    )
+
+    // Previous owner is now unauthorized for owner-only calls
+    let out_old_owner_add = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::AddOracle { node: ADDR_3 },
+        )
+    assert_reverted_with(out_old_owner_add, encode_error(Unauthorized {}).span())
+    let out_old_owner_pause = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::Pause {},
+        )
+    assert_reverted_with(out_old_owner_pause, encode_error(Unauthorized {}).span())
+
+    // New owner helper1 can add ADDR_3 and transfer ownership onward to helper2
+    assert!(
+        evm.call(
+            addr: helper1,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardAdd { target: addr, node: ADDR_3 },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_3 },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: helper1,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardTransferOwnership { target: addr, new_owner: helper2 },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: helper2,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardAcceptOwnership { target: addr },
+        ),
+    )
+    assert!(
+        evm.call(
+                addr: addr,
+                gas: 100000,
+                value: Wei::zero(),
+                message: OracleMsg::Owner {},
+            )
+            == helper2,
+    )
+}
+
+#[test]
+fn test_pause_unpause_and_submit_guard() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let helper = evm.create2<NonOwnerCaller>(value: Wei::zero(), args: (), salt: 1)
+    let prices = test_prices()
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+
+    assert!(
+        !evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsPaused {},
+        ),
+    )
+    // Non-owner cannot pause
+    assert!(
+        !evm.call(
+            addr: helper,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardPause { target: addr },
+        ),
+    )
+    // Unpause while not paused reverts NotPaused
+    let out_unpause_early = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::Unpause {},
+        )
+    assert_reverted_with(out_unpause_early, encode_error(NotPaused {}).span())
+
+    // Owner pauses oracle
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::Pause {},
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsPaused {},
+        ),
+    )
+
+    // Double pause reverts Paused
+    let out_double_pause = evm
+        .try_call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::Pause {},
+        )
+    assert_reverted_with(out_double_pause, encode_error(Paused {}).span())
+
+    // SubmitMedians reverts Paused while paused
+    let out_paused_submit = evm
+        .try_call(
+            addr: addr,
+            gas: 1500000,
+            value: Wei::zero(),
+            message: OracleMsg::SubmitMedians { round_id: 1, prices, timestamp: TEST_TS, sigs },
+        )
+    assert_reverted_with(out_paused_submit, encode_error(Paused {}).span())
+
+    // Read views remain available while paused
+    let cr_while_paused: u256 = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::CurrentRound {},
+        )
+    assert!(cr_while_paused == 1)
+    let (r0, ans0, _, _, _): (u256, i256, u256, u256, u256) = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestRoundData {},
+        )
+    assert!(r0 == 0 && ans0 == (0 as i256))
+
+    // Non-owner cannot unpause
+    assert!(
+        !evm.call(
+            addr: helper,
+            gas: 300000,
+            value: Wei::zero(),
+            message: HelperMsg::ForwardUnpause { target: addr },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsPaused {},
+        ),
+    )
+
+    // Owner unpauses -> submitMedians succeeds
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::Unpause {},
+    )
+    assert!(
+        !evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsPaused {},
+        ),
+    )
+    evm.call(
+        addr: addr,
+        gas: 1500000,
+        value: Wei::zero(),
+        message: OracleMsg::SubmitMedians { round_id: 1, prices, timestamp: TEST_TS, sigs },
+    )
+    let cr_after: u256 = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::CurrentRound {},
+        )
+    assert!(cr_after == 2)
+}
+
+#[test]
+fn test_latest_round_data_and_decimals() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    let expected = test_prices()
+
+    let dec: u8 = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::Decimals {},
+        )
+    assert!(dec == 8)
+
+    let (r0, ans0, sa0, ua0, air0): (u256, i256, u256, u256, u256) = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestRoundData {},
+        )
+    assert!(
+        r0 == 0 && ans0 == (0 as i256) && sa0 == 0 && ua0 == 0 && air0 == 0,
+    )
+
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig0()]
+    evm.call(
+        addr: addr,
+        gas: 1500000,
+        value: Wei::zero(),
+        message: OracleMsg::SubmitMedians {
+            round_id: 1,
+            prices: expected,
+            timestamp: TEST_TS,
+            sigs,
+        },
+    )
+
+    let (r1, ans1, sa1, ua1, air1): (u256, i256, u256, u256, u256) = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestRoundData {},
+        )
+    let expected_ans: i256 = expected[0].downcast_unchecked()
+    assert!(
+        r1 == 1 && ans1 == expected_ans && sa1 == TEST_TS && ua1 == TEST_TS && air1 == 1,
+    )
+}
+
+#[test]
+fn test_three_of_four_quorum_subset() uses (evm: mut Evm) {
+    let addr = deploy_and_register(evm: mut evm)
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::AddOracle { node: ADDR_3 },
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_3 },
+        ),
+    )
+
+    let expected = test_prices()
+    // 3-of-4 sorted subset omitting ADDR_0: ADDR_2 < ADDR_1 < ADDR_3
+    let sigs: [Sig; 3] = [sig2(), sig1(), sig3()]
+    evm.call(
+        addr: addr,
+        gas: 1500000,
+        value: Wei::zero(),
+        message: OracleMsg::SubmitMedians {
+            round_id: 1,
+            prices: expected,
+            timestamp: TEST_TS,
+            sigs,
+        },
+    )
+    let cr: u256 = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::CurrentRound {},
+        )
+    assert!(cr == 2)
+    let (btc, ts): (u256, u256) = evm
+        .call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::LatestPrice { asset_id: 0 },
+        )
+    assert!(btc == expected[0] && ts == TEST_TS)
+}

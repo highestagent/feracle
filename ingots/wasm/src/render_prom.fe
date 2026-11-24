@@ -1,0 +1,166 @@
+use feracle_core::{ASSET_COUNT, write_asset_symbol}
+use super::render::{compute_age_secs}
+use super::state::{MAX_ORACLES, TelemetryEngine}
+
+pub fn render_prometheus_into(_ st: TelemetryEngine, now_ms: u64, _ out: mut MemBuffer) {
+    out.clear()
+    let age_secs = compute_age_secs(now_ms, ts_sec: st.onchain.last_updated)
+    let tx_ok: u64 = if st.onchain.tx_invariant_ok { 1 } else { 0 }
+    let breach_num: u64 = if st.wire_breach_detected { 1 } else { 0 }
+
+    writeln!(mut out, "# TYPE feracle_asset_count gauge")
+    writeln!(mut out, "feracle_asset_count ", ASSET_COUNT)
+    writeln!(mut out, "# TYPE feracle_latest_price_1e8 gauge")
+    writeln!(
+        mut out,
+        "feracle_latest_price_1e8 ",
+        st.onchain.latest_prices[0],
+    )
+    writeln!(mut out, "# TYPE feracle_asset_price_1e8 gauge")
+    var ai: usize = 0
+    while ai < ASSET_COUNT {
+        var sym = MemBuffer::empty()
+        write_asset_symbol(ai, mut sym)
+        writeln!(
+            mut out,
+            "feracle_asset_price_1e8{asset=\"",
+            sym,
+            "\"} ",
+            st.onchain.latest_prices[ai],
+        )
+        ai += 1
+    }
+
+    writeln!(mut out, "# TYPE feracle_current_round gauge")
+    writeln!(
+        mut out,
+        "feracle_current_round ",
+        st.onchain.current_round,
+    )
+    writeln!(mut out, "# TYPE feracle_price_age_seconds gauge")
+    writeln!(mut out, "feracle_price_age_seconds ", age_secs)
+    writeln!(mut out, "# TYPE feracle_block_number gauge")
+    writeln!(mut out, "feracle_block_number ", st.onchain.block_number)
+    writeln!(mut out, "# TYPE feracle_rpc_latency_ms gauge")
+    writeln!(
+        mut out,
+        "feracle_rpc_latency_ms ",
+        st.onchain.rpc_latency_ms,
+    )
+    writeln!(mut out, "# TYPE feracle_last_settlement_gas gauge")
+    writeln!(
+        mut out,
+        "feracle_last_settlement_gas ",
+        st.onchain.last_tx_gas,
+    )
+    writeln!(mut out, "# TYPE feracle_tx_per_round_ok gauge")
+    writeln!(mut out, "feracle_tx_per_round_ok ", tx_ok)
+    writeln!(mut out, "# TYPE feracle_wire_round gauge")
+    writeln!(mut out, "feracle_wire_round ", st.active_wire_round)
+    writeln!(mut out, "# TYPE feracle_wire_quotes_count gauge")
+    writeln!(mut out, "feracle_wire_quotes_count ", st.wire_quote_count)
+    writeln!(mut out, "# TYPE feracle_wire_sigs_count gauge")
+    writeln!(mut out, "feracle_wire_sigs_count ", st.wire_sig_count)
+    writeln!(mut out, "# TYPE feracle_wire_breach_detected gauge")
+    writeln!(mut out, "feracle_wire_breach_detected ", breach_num)
+    writeln!(mut out, "# TYPE feracle_wire_breach_asset gauge")
+    writeln!(
+        mut out,
+        "feracle_wire_breach_asset ",
+        st.wire_breach_asset,
+    )
+
+    writeln!(mut out, "# TYPE feracle_node_online gauge")
+    writeln!(mut out, "# TYPE feracle_node_authorized gauge")
+    writeln!(mut out, "# TYPE feracle_node_peers gauge")
+    writeln!(mut out, "# TYPE feracle_node_local_price_1e8 gauge")
+    writeln!(
+        mut out,
+        "# TYPE feracle_node_tolerance_breaches_total counter",
+    )
+    var ni: usize = 0
+    while ni < MAX_ORACLES {
+        let node = st.nodes[ni]
+        let online_v: u64 = if node.online { 1 } else { 0 }
+        let auth_v: u64 = if node.is_authorized_onchain { 1 } else { 0 }
+        writeln!(
+            mut out,
+            "feracle_node_online{node=\"",
+            ni,
+            "\"} ",
+            online_v,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_authorized{node=\"",
+            ni,
+            "\"} ",
+            auth_v,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_peers{node=\"",
+            ni,
+            "\"} ",
+            node.peer_count,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_local_price_1e8{node=\"",
+            ni,
+            "\"} ",
+            node.local_price,
+        )
+        writeln!(
+            mut out,
+            "feracle_node_tolerance_breaches_total{node=\"",
+            ni,
+            "\"} ",
+            node.tolerance_breaches,
+        )
+        ni += 1
+    }
+
+    writeln!(mut out, "# TYPE feracle_feed_price_1e8 gauge")
+    writeln!(mut out, "# TYPE feracle_feed_assets_ok gauge")
+    writeln!(mut out, "# TYPE feracle_feed_latency_ms gauge")
+    var n2: usize = 0
+    while n2 < MAX_ORACLES {
+        let node = st.nodes[n2]
+        var fi: usize = 0
+        while fi < node.feed_count {
+            let f = node.feeds[fi]
+            var pname = MemBuffer::empty()
+            f.provider.write_to(mut pname)
+            writeln!(
+                mut out,
+                "feracle_feed_price_1e8{node=\"",
+                n2,
+                "\",provider=\"",
+                pname,
+                "\"} ",
+                f.price,
+            )
+            writeln!(
+                mut out,
+                "feracle_feed_assets_ok{node=\"",
+                n2,
+                "\",provider=\"",
+                pname,
+                "\"} ",
+                f.assets_ok,
+            )
+            writeln!(
+                mut out,
+                "feracle_feed_latency_ms{node=\"",
+                n2,
+                "\",provider=\"",
+                pname,
+                "\"} ",
+                f.latency_ms,
+            )
+            fi += 1
+        }
+        n2 += 1
+    }
+}

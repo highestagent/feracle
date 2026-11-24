@@ -1,0 +1,181 @@
+use feracle_core::{ASSET_COUNT, hex_char}
+use super::telemetry::{MAX_FEED_SLOTS, MAX_RECENT_FRAMES, TelemetryState}
+
+pub(ingot) fn push_json_escaped(_ out: mut MemBuffer, _ s: MemSpan) {
+    out.push(b'"')
+    var i: usize = 0
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if b == b'"' {
+            out.extend_from("\\\"".span())
+        } else if b == b'\\' {
+            out.extend_from("\\\\".span())
+        } else if b == b'\n' {
+            out.extend_from("\\n".span())
+        } else if b == b'\r' {
+            out.extend_from("\\r".span())
+        } else if b == b'\t' {
+            out.extend_from("\\t".span())
+        } else if b < 0x20 {
+            out.extend_from("\\u00".span())
+            out.push(hex_char(b >> 4))
+            out.push(hex_char(b & 0x0f))
+        } else {
+            out.push(b)
+        }
+        i += 1
+    }
+    out.push(b'"')
+}
+
+fn push_u64_array_json(_ out: mut MemBuffer, _ vals: [u64; 20]) {
+    out.push(b'[')
+    var i: usize = 0
+    while i < ASSET_COUNT {
+        if i > 0 { out.push(b',') }
+        write!(mut out, vals[i])
+        i += 1
+    }
+    out.push(b']')
+}
+
+impl TelemetryState {
+    fn append_status_fields(self, _ out: mut MemBuffer, include_frames: bool) {
+        write!(mut out, "\"node_id\":", self.node_id, ",\"peer_id\":")
+        push_json_escaped(mut out, self.peer_id.span())
+        write!(
+            mut out,
+            ",\"p2p_port\":",
+            self.p2p_port,
+            ",\"peer_count\":",
+            self.peer_count,
+            ",\"peers\":[",
+        )
+        var first_peer = true
+        for part in self.peers_csv.span().split(b',') {
+            let p = part.trim()
+            if p.is_empty() { continue }
+            if !first_peer {
+                out.push(b',')
+            }
+            first_peer = false
+            push_json_escaped(mut out, p)
+        }
+        write!(mut out, "],\"round_id\":", self.round_id, ",\"phase\":")
+        push_json_escaped(mut out, self.phase.span())
+        write!(
+            mut out,
+            ",\"local_price\":",
+            self.local_prices[0],
+            ",\"group_median\":",
+            self.group_medians[0],
+            ",\"local_prices\":",
+        )
+        push_u64_array_json(mut out, self.local_prices)
+        out.extend_from(",\"group_medians\":".span())
+        push_u64_array_json(mut out, self.group_medians)
+        write!(
+            mut out,
+            ",\"round_ts\":",
+            self.round_ts,
+            ",\"counters\":{\"quotes_tx\":",
+            self.quotes_tx,
+            ",\"quotes_rx\":",
+            self.quotes_rx,
+            ",\"sigs_tx\":",
+            self.sigs_tx,
+            ",\"sigs_rx\":",
+            self.sigs_rx,
+            ",\"tolerance_breaches\":",
+            self.tolerance_breaches,
+            ",\"submissions_ok\":",
+            self.submissions_ok,
+            ",\"submissions_err\":",
+            self.submissions_err,
+            ",\"last_submit_ms\":",
+            self.last_submit_ms,
+            "},\"feeds\":[",
+        )
+
+        var first_feed = true
+        var fi: usize = 0
+        while fi < MAX_FEED_SLOTS {
+            let f = ref self.feeds[fi]
+            if f.present {
+                if !first_feed {
+                    out.push(b',')
+                }
+                first_feed = false
+                out.extend_from("{\"provider\":".span())
+                push_json_escaped(mut out, f.provider.span())
+                out.extend_from(",\"addr\":".span())
+                push_json_escaped(mut out, f.addr.span())
+                write!(
+                    mut out,
+                    ",\"price\":",
+                    f.price,
+                    ",\"assets_ok\":",
+                    f.assets_ok,
+                    ",\"ok\":",
+                    if f.ok { "true" } else { "false" },
+                    ",\"latency_ms\":",
+                    f.latency_ms,
+                    "}",
+                )
+            }
+            fi += 1
+        }
+        out.push(b']')
+        if !include_frames { return }
+        out.extend_from(",\"recent_frames\":[".span())
+
+        let n_frames = self.recent_frames.len()
+        let start = if n_frames == MAX_RECENT_FRAMES {
+            self.frames_head
+        } else {
+            0
+        }
+        var k: usize = 0
+        while k < n_frames {
+            if k > 0 { out.push(b',') }
+            let idx = (start + k) % MAX_RECENT_FRAMES
+            let fr = ref self.recent_frames[idx]
+            write!(
+                mut out,
+                "{\"seq\":",
+                fr.seq,
+                ",\"ts_ms\":",
+                fr.ts_ms,
+                ",\"dir\":",
+            )
+            if fr.is_tx {
+                out.extend_from("\"tx\"".span())
+            } else {
+                out.extend_from("\"rx\"".span())
+            }
+            out.extend_from(",\"peer\":".span())
+            push_json_escaped(mut out, fr.peer.span())
+            out.extend_from(",\"hex\":".span())
+            push_json_escaped(mut out, fr.hex.span())
+            out.push(b'}')
+            k += 1
+        }
+        out.push(b']')
+    }
+
+    pub fn encode_status_json(self) -> MemBuffer {
+        var out = MemBuffer::with_capacity(1024)
+        out.push(b'{')
+        self.append_status_fields(mut out, include_frames: true)
+        out.push(b'}')
+        out
+    }
+
+    pub fn encode_status_event_json(self, include_frames: bool) -> MemBuffer {
+        var out = MemBuffer::with_capacity(1040)
+        out.extend_from("{\"event\":\"status\",".span())
+        self.append_status_fields(mut out, include_frames)
+        out.push(b'}')
+        out
+    }
+}

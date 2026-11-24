@@ -1,0 +1,203 @@
+use std::abi::sol
+use std::evm::{Address, Call, CallOutcome, Evm, Wei}
+use super::{OffchainMedianOracle, OracleMsg, Sig}
+
+pub(ingot) const ADDR_0: Address = Address::new(0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266)
+pub(ingot) const ADDR_1: Address = Address::new(0x70997970C51812dc3A010C7d01b50e0d17dc79C8)
+pub(ingot) const ADDR_2: Address = Address::new(0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC)
+pub(ingot) const ADDR_3: Address = Address::new(0x90F79bf6EB2c4f870365E785982E1f101E93b906)
+
+pub(ingot) const TEST_TS: u256 = 1
+
+pub(ingot) fn test_prices() -> [u256; 20] {
+    [
+        9_245_025_000_000,
+        342_050_000_000,
+        21_840_000_000,
+        245_200_000,
+        68_520_000_000,
+        38_400_000,
+        104_500_000,
+        26_100_000,
+        4_480_000_000,
+        2_360_000_000,
+        415_200_000,
+        892_000_000,
+        29_500_000,
+        51_230_000_000,
+        11_460_000_000,
+        1_475_000_000,
+        648_000_000,
+        1_235_000_000,
+        94_500_000,
+        31_850_000_000,
+    ]
+}
+
+pub(ingot) fn sig0() -> Sig {
+    Sig {
+        v: 27,
+        r: 0x8fb3578b213cfd20336dec0e1df25e5fe2a2ea85914adc38a87fb04f443272ab,
+        s: 0x39e1141d077d876e3208636f9dec8512b75e11b340aa2fdb500fcb066283ddac,
+    }
+}
+
+pub(ingot) fn sig1() -> Sig {
+    Sig {
+        v: 27,
+        r: 0x1252fec6ccb619a260d25045b4b056837afdcf4ed74a0ec224ff8b1e7df0d14c,
+        s: 0x03cddf661b239ef6cafd7241260bdc79835cd6479f55abde79b52b128d0be31f,
+    }
+}
+
+pub(ingot) fn sig2() -> Sig {
+    Sig {
+        v: 27,
+        r: 0xd7592587ed444568ec7afd6f2f77dded4db88022ceb0cb5990d32a37fa0521e6,
+        s: 0x5e36724cfa5c06ef0e178f48f3e28f944c6df4c1b491358c92c507a93c51781b,
+    }
+}
+
+pub(ingot) fn sig3() -> Sig {
+    Sig {
+        v: 28,
+        r: 0xfe9222d7b093943e74cddf2965d1e857c4f943d0fb26267571a45b2161eba37a,
+        s: 0x3132791caf95372bb15802d78404e22346011899bad7891e1ea9d678dd4cdb64,
+    }
+}
+
+pub(ingot) msg HelperMsg {
+    #[selector = sol("forwardAdd(address,address)")]
+    ForwardAdd { target: Address, node: Address } -> bool,
+    #[selector = sol("forwardTransferOwnership(address,address)")]
+    ForwardTransferOwnership { target: Address, new_owner: Address } -> bool,
+    #[selector = sol("forwardAcceptOwnership(address)")]
+    ForwardAcceptOwnership { target: Address } -> bool,
+    #[selector = sol("forwardPause(address)")]
+    ForwardPause { target: Address } -> bool,
+    #[selector = sol("forwardUnpause(address)")]
+    ForwardUnpause { target: Address } -> bool,
+}
+
+pub(ingot) contract NonOwnerCaller uses (call: mut Call) {
+    init() {}
+
+    recv HelperMsg {
+        ForwardAdd { target, node } -> bool uses (mut call) {
+            call.try_call(
+                addr: target,
+                gas: 200000,
+                value: Wei::zero(),
+                message: OracleMsg::AddOracle { node },
+            )
+                .success()
+        }
+
+        ForwardTransferOwnership { target, new_owner } -> bool
+        uses (mut call)
+        {
+            call.try_call(
+                addr: target,
+                gas: 200000,
+                value: Wei::zero(),
+                message: OracleMsg::TransferOwnership { new_owner },
+            )
+                .success()
+        }
+
+        ForwardAcceptOwnership { target } -> bool
+        uses (mut call)
+        {
+            call.try_call(
+                addr: target,
+                gas: 200000,
+                value: Wei::zero(),
+                message: OracleMsg::AcceptOwnership {},
+            )
+                .success()
+        }
+
+        ForwardPause { target } -> bool uses (mut call) {
+            call.try_call(
+                addr: target,
+                gas: 200000,
+                value: Wei::zero(),
+                message: OracleMsg::Pause {},
+            )
+                .success()
+        }
+
+        ForwardUnpause { target } -> bool uses (mut call) {
+            call.try_call(
+                addr: target,
+                gas: 200000,
+                value: Wei::zero(),
+                message: OracleMsg::Unpause {},
+            )
+                .success()
+        }
+    }
+}
+
+pub(ingot) fn deploy_and_register(evm: mut Evm) -> Address {
+    let addr = evm.create2<OffchainMedianOracle>(value: Wei::zero(), args: (), salt: 0)
+    assert!(addr.word() == 0x184a05ae4c04d7c42175b96c3faca8084d8ae4e8)
+
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::AddOracle { node: ADDR_0 },
+    )
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::AddOracle { node: ADDR_1 },
+    )
+    evm.call(
+        addr: addr,
+        gas: 100000,
+        value: Wei::zero(),
+        message: OracleMsg::AddOracle { node: ADDR_2 },
+    )
+
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_0 },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_1 },
+        ),
+    )
+    assert!(
+        evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_2 },
+        ),
+    )
+    assert!(
+        !evm.call(
+            addr: addr,
+            gas: 100000,
+            value: Wei::zero(),
+            message: OracleMsg::IsOracle { node: ADDR_3 },
+        ),
+    )
+    addr
+}
+
+pub(ingot) fn assert_reverted_with(_ outcome: CallOutcome, _ expected: MemSpan) {
+    assert!(!outcome.success())
+    assert!(outcome.returndata() == expected)
+}

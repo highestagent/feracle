@@ -1,0 +1,360 @@
+use core::num::IntDowncast
+use feracle_core::{
+    MAX_TOLERANCE_BPS,
+    addr20_eq,
+    decode_quote,
+    decode_sig_msg,
+    first_tolerance_breach_asset,
+    median_prices_3,
+    median_prices_4,
+    median_u64,
+    median_u64_4,
+    prices_eq,
+}
+use super::codec::{
+    FixedStr,
+    decode_hex_bytes,
+    json_get_bool,
+    json_get_raw,
+    json_get_str_bounds,
+    json_get_u64,
+    json_next_array_elem,
+    push_addr20_hex,
+}
+use super::state::{
+    FeedSnap,
+    MAX_FEEDS_PER_NODE,
+    MAX_ORACLES,
+    MAX_WIRE_SLOTS,
+    TelemetryEngine,
+    WireQuoteSlot,
+    WireSigSlot,
+}
+
+impl TelemetryEngine {
+    fn reset_wire_round(mut self, new_round: u64) {
+        self.active_wire_round = new_round
+        self.wire_quote_count = 0
+        self.wire_sig_count = 0
+        self.wire_group_medians = [0; 20]
+        self.wire_round_ts = 0
+        self.wire_breach_detected = false
+        self.wire_breach_asset = -1
+        var i: usize = 0
+        while i < MAX_WIRE_SLOTS {
+            self.wire_quotes[i].used = false
+            self.wire_sigs[i].used = false
+            i += 1
+        }
+    }
+
+    fn recompute_wire_metrics(mut self) {
+        if self.wire_quote_count >= 4 {
+            self.wire_group_medians = median_prices_4(
+                self.wire_quotes[0].prices,
+                self.wire_quotes[1].prices,
+                self.wire_quotes[2].prices,
+                self.wire_quotes[3].prices,
+            )
+            self.wire_round_ts = median_u64_4(
+                [
+                    self.wire_quotes[0].timestamp,
+                    self.wire_quotes[1].timestamp,
+                    self.wire_quotes[2].timestamp,
+                    self.wire_quotes[3].timestamp,
+                ],
+            )
+        } else if self.wire_quote_count >= 3 {
+            self.wire_group_medians = median_prices_3(
+                self.wire_quotes[0].prices,
+                self.wire_quotes[1].prices,
+                self.wire_quotes[2].prices,
+            )
+            self.wire_round_ts = median_u64(
+                [
+                    self.wire_quotes[0].timestamp,
+                    self.wire_quotes[1].timestamp,
+                    self.wire_quotes[2].timestamp,
+                ],
+            )
+        } else {
+            self.wire_group_medians = [0; 20]
+            self.wire_round_ts = 0
+            self.wire_breach_detected = false
+            self.wire_breach_asset = -1
+            return
+        }
+
+        var breach = false
+        var breach_asset: i64 = -1
+        var i: usize = 0
+        while i < self.wire_quote_count && i < MAX_WIRE_SLOTS {
+            if let Option::Some(bad_idx) = first_tolerance_breach_asset(
+                local: self.wire_quotes[i].prices,
+                proposed: self.wire_group_medians,
+                max_bps: MAX_TOLERANCE_BPS,
+            ) {
+                breach = true
+                if breach_asset < 0 {
+                    breach_asset = bad_idx.downcast_unchecked()
+                }
+            }
+            i += 1
+        }
+        self.wire_breach_detected = breach
+        self.wire_breach_asset = breach_asset
+    }
+
+    pub fn ingest_wire_frame(
+        mut self,
+        frame_hex: MemSpan,
+        peer_tag: MemSpan,
+        is_tx: bool,
+        now_ms: u64,
+    ) -> bool {
+        var raw = MemBuffer::empty()
+        if !decode_hex_bytes(frame_hex, mut raw) {
+            self.total_wire_decode_errors += 1
+            return false
+        }
+
+        if let Option::Some(q) = decode_quote(raw.span()) {
+            self.total_wire_quotes_seen += 1
+            if q.round_id < self.active_wire_round {
+                return true
+            }
+            if q.round_id > self.active_wire_round {
+                self.reset_wire_round(new_round: q.round_id)
+            }
+
+            let trimmed_peer = peer_tag.trim()
+            let peer_key = FixedStr<64>::from_span(trimmed_peer)
+            var has_signer = false
+            var si: usize = 0
+            while si < 20 {
+                if q.signer_addr[si] != 0 {
+                    has_signer = true
+                    break
+                }
+                si += 1
+            }
+
+            var existing_idx: Option<usize> = Option::None
+            var i: usize = 0
+            while i < self.wire_quote_count {
+                let slot = self.wire_quotes[i]
+                let match_slot = if has_signer {
+                    addr20_eq(slot.signer_addr, q.signer_addr)
+                } else if !peer_key.is_empty() && !slot.peer_tag.is_empty() {
+                    slot.peer_tag.equals(peer_key)
+                } else {
+                    prices_eq(slot.prices, q.prices) && slot.timestamp == q.timestamp
+                }
+                if match_slot {
+                    existing_idx = Option::Some(i)
+                    break
+                }
+                i += 1
+            }
+
+            match existing_idx {
+                Option::Some(idx) => {
+                    self.wire_quotes[idx].rx_count += 1
+                    self.wire_quotes[idx].last_seen_ms = now_ms
+                    self.wire_quotes[idx].last_is_tx = is_tx
+                },
+                Option::None => {
+                    if self.wire_quote_count < MAX_WIRE_SLOTS {
+                        let idx = self.wire_quote_count
+                        var qhex = MemBuffer::empty()
+                        push_addr20_hex(q.signer_addr, mut qhex)
+                        self.wire_quotes[idx] = WireQuoteSlot {
+                            used: true,
+                            round_id: q.round_id,
+                            prices: q.prices,
+                            timestamp: q.timestamp,
+                            signer_addr: q.signer_addr,
+                            signer_hex: FixedStr<48>::from_span(qhex.span()),
+                            rx_count: 1,
+                            first_seen_ms: now_ms,
+                            last_seen_ms: now_ms,
+                            peer_tag: peer_key,
+                            last_is_tx: is_tx,
+                        }
+                        self.wire_quote_count += 1
+                    }
+                },
+            }
+            self.recompute_wire_metrics()
+            return true
+        }
+
+        if let Option::Some(sig_m) = decode_sig_msg(raw.span()) {
+            self.total_wire_sigs_seen += 1
+            if sig_m.round_id < self.active_wire_round {
+                return true
+            }
+            if sig_m.round_id > self.active_wire_round {
+                self.reset_wire_round(new_round: sig_m.round_id)
+            }
+
+            let trimmed_peer = peer_tag.trim()
+            var existing_idx: Option<usize> = Option::None
+            var i: usize = 0
+            while i < self.wire_sig_count {
+                if addr20_eq(self.wire_sigs[i].signer_addr, sig_m.signer_addr) {
+                    existing_idx = Option::Some(i)
+                    break
+                }
+                i += 1
+            }
+
+            match existing_idx {
+                Option::Some(idx) => {
+                    self.wire_sigs[idx].rx_count += 1
+                },
+                Option::None => {
+                    if self.wire_sig_count < MAX_WIRE_SLOTS {
+                        let idx = self.wire_sig_count
+                        var hex_buf = MemBuffer::empty()
+                        push_addr20_hex(sig_m.signer_addr, mut hex_buf)
+                        self.wire_sigs[idx] = WireSigSlot {
+                            used: true,
+                            round_id: sig_m.round_id,
+                            median_prices: sig_m.median_prices,
+                            timestamp: sig_m.timestamp,
+                            signer_addr: sig_m.signer_addr,
+                            signer_hex: FixedStr<48>::from_span(hex_buf.span()),
+                            v: sig_m.v,
+                            rx_count: 1,
+                            first_seen_ms: now_ms,
+                            peer_tag: FixedStr<64>::from_span(trimmed_peer),
+                        }
+                        self.wire_sig_count += 1
+                    }
+                },
+            }
+            return true
+        }
+
+        self.total_wire_decode_errors += 1
+        false
+    }
+
+    pub fn ingest_node_status(mut self, node_id: usize, payload: MemSpan, now_ms: u64) -> bool {
+        if node_id >= MAX_ORACLES {
+            return false
+        }
+        let trimmed = payload.trim()
+        if trimmed.is_empty() || trimmed.byte_at(0) != b'{' {
+            return false
+        }
+
+        self.nodes[node_id].online = true
+        self.nodes[node_id].seen = true
+        self.nodes[node_id].last_seen_ms = now_ms
+
+        if let Option::Some(port) = json_get_u64(trimmed, "p2p_port".span()) {
+            if let Option::Some(p16) = port.downcast() {
+                self.nodes[node_id].p2p_port = p16
+            }
+        }
+        if let Option::Some(pc) = json_get_u64(trimmed, "peer_count".span()) {
+            self.nodes[node_id].peer_count = pc.downcast_saturate()
+        }
+        if let Option::Some(rid) = json_get_u64(trimmed, "round_id".span()) {
+            self.nodes[node_id].round_id = rid
+        }
+        if let Option::Some((poff, plen)) = json_get_str_bounds(trimmed, "phase".span()) {
+            self.nodes[node_id].phase.set_from_span(trimmed.slice(offset: poff, len: plen))
+        }
+        if let Option::Some(lp) = json_get_u64(trimmed, "local_price".span()) {
+            self.nodes[node_id].local_price = lp
+        }
+        if let Option::Some(gm) = json_get_u64(trimmed, "group_median".span()) {
+            self.nodes[node_id].group_median = gm
+        }
+        if let Option::Some(rts) = json_get_u64(trimmed, "round_ts".span()) {
+            self.nodes[node_id].round_ts = rts
+        }
+
+        if let Option::Some((coff, clen)) = json_get_raw(trimmed, "counters".span()) {
+            let ctr = trimmed.slice(offset: coff, len: clen)
+            if let Option::Some(v) = json_get_u64(ctr, "quotes_tx".span()) {
+                self.nodes[node_id].quotes_tx = v
+            }
+            if let Option::Some(v) = json_get_u64(ctr, "quotes_rx".span()) {
+                self.nodes[node_id].quotes_rx = v
+            }
+            if let Option::Some(v) = json_get_u64(ctr, "sigs_tx".span()) {
+                self.nodes[node_id].sigs_tx = v
+            }
+            if let Option::Some(v) = json_get_u64(ctr, "sigs_rx".span()) {
+                self.nodes[node_id].sigs_rx = v
+            }
+            if let Option::Some(v) = json_get_u64(ctr, "tolerance_breaches".span()) {
+                self.nodes[node_id].tolerance_breaches = v
+            }
+            if let Option::Some(v) = json_get_u64(ctr, "submissions_ok".span()) {
+                self.nodes[node_id].submissions_ok = v
+            }
+            if let Option::Some(v) = json_get_u64(ctr, "submissions_err".span()) {
+                self.nodes[node_id].submissions_err = v
+            }
+            if let Option::Some(v) = json_get_u64(ctr, "last_submit_ms".span()) {
+                self.nodes[node_id].last_submit_ms = v
+            }
+        }
+
+        if let Option::Some((foff, flen)) = json_get_raw(trimmed, "feeds".span()) {
+            let arr = trimmed.slice(offset: foff, len: flen)
+            var cursor: usize = 0
+            var f_idx: usize = 0
+            while f_idx < MAX_FEEDS_PER_NODE {
+                let Option::Some((eoff, elen)) = json_next_array_elem(arr, mut cursor) else {
+                    break
+                }
+                let obj = arr.slice(offset: eoff, len: elen)
+                var feed = FeedSnap {
+                    used: true,
+                    provider: FixedStr<24>::empty(),
+                    addr: FixedStr<32>::empty(),
+                    price: 0,
+                    assets_ok: 0,
+                    ok: false,
+                    latency_ms: 0,
+                }
+                if let Option::Some((proff, prlen)) = json_get_str_bounds(obj, "provider".span()) {
+                    feed.provider.set_from_span(obj.slice(offset: proff, len: prlen))
+                }
+                if let Option::Some((aoff, alen)) = json_get_str_bounds(obj, "addr".span()) {
+                    feed.addr.set_from_span(obj.slice(offset: aoff, len: alen))
+                }
+                if let Option::Some(pr) = json_get_u64(obj, "price".span()) {
+                    feed.price = pr
+                }
+                if let Option::Some(aok) = json_get_u64(obj, "assets_ok".span()) {
+                    feed.assets_ok = aok.downcast_saturate()
+                }
+                if let Option::Some(ok_v) = json_get_bool(obj, "ok".span()) {
+                    feed.ok = ok_v
+                }
+                if let Option::Some(lat) = json_get_u64(obj, "latency_ms".span()) {
+                    feed.latency_ms = lat
+                }
+                self.nodes[node_id].feeds[f_idx] = feed
+                f_idx += 1
+            }
+            self.nodes[node_id].feed_count = f_idx
+        }
+        true
+    }
+
+    pub fn mark_node_offline(mut self, node_id: usize) -> bool {
+        if node_id >= MAX_ORACLES {
+            return false
+        }
+        self.nodes[node_id].online = false
+        true
+    }
+}

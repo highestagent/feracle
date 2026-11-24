@@ -1,0 +1,351 @@
+use feracle_core::{ASSET_COUNT, NODE_COUNT, leader_index, prices_eq}
+use super::codec::{
+    FixedStr,
+    build_rpc_batch_into,
+    json_get_raw,
+    json_get_str_bounds,
+    json_get_u64,
+    json_next_array_elem,
+    normalize_addr20_hex,
+    parse_abi_word_addr20,
+    parse_abi_word_bool,
+    parse_abi_word_u64,
+    parse_hex_u64,
+    signed_bps_diff,
+    strip_0x_offset,
+}
+use super::state::{MAX_ORACLES, RoundSample, TelemetryEngine}
+
+impl TelemetryEngine {
+    pub fn build_rpc_batch(self, _ out: mut MemBuffer) {
+        var contract_buf = MemBuffer::empty()
+        self.onchain.contract_addr.write_to(mut contract_buf)
+        let addrs: [FixedStr<48>; 4] = [
+            self.nodes[0].evm_addr,
+            self.nodes[1].evm_addr,
+            self.nodes[2].evm_addr,
+            self.nodes[3].evm_addr,
+        ]
+        build_rpc_batch_into(
+            target_addr: contract_buf.span(),
+            oracle_addrs: addrs,
+            oracle_count: self.oracle_count,
+            mut out,
+        )
+    }
+
+    pub fn ingest_rpc_batch(mut self, payload: MemSpan, latency_ms: u64, now_ms: u64) -> bool {
+        self.onchain.total_rpc_polls += 1
+        self.onchain.rpc_latency_ms = latency_ms
+        self.onchain.last_poll_ms = now_ms
+
+        var got_any = false
+        var saw_latest_prices = false
+        var new_prices: [u64; 20] = [0; 20]
+        var new_ts: u64 = 0
+
+        let trimmed = payload.trim()
+        if trimmed.is_empty() {
+            self.onchain.rpc_errors += 1
+            return false
+        }
+
+        if trimmed.byte_at(0) == b'[' {
+            var cursor: usize = 0
+            while true {
+                let Option::Some((off, len)) = json_next_array_elem(trimmed, mut cursor) else {
+                    break
+                }
+                let item = trimmed.slice(offset: off, len)
+                let _ = self
+                    .process_rpc_item(
+                        item,
+                        mut got_any,
+                        mut saw_latest_prices,
+                        mut new_prices,
+                        mut new_ts,
+                    )
+            }
+        } else if trimmed.byte_at(0) == b'{' {
+            let _ = self
+                .process_rpc_item(
+                    item: trimmed,
+                    mut got_any,
+                    mut saw_latest_prices,
+                    mut new_prices,
+                    mut new_ts,
+                )
+        } else {
+            self.onchain.rpc_errors += 1
+            return false
+        }
+
+        if saw_latest_prices {
+            let changed = new_ts != self.onchain.last_updated
+                || !prices_eq(new_prices, self.onchain.latest_prices)
+            if changed {
+                var a: usize = 0
+                while a < ASSET_COUNT {
+                    let prev_p = self.onchain.latest_prices[a]
+                    if prev_p > 0 {
+                        self.onchain.previous_prices[a] = prev_p
+                        self.onchain.last_deltas_bps[a] = signed_bps_diff(
+                            val: new_prices[a],
+                            base: prev_p,
+                        )
+                    }
+                    a += 1
+                }
+            }
+            self.onchain.latest_prices = new_prices
+            self.onchain.last_updated = new_ts
+
+            if new_ts > 0 && new_prices[0] > 0 {
+                let settled_round = if self.onchain.current_round > 1 {
+                    self.onchain.current_round - 1
+                } else {
+                    1
+                }
+                self.upsert_settled_round_price(
+                    round_id: settled_round,
+                    prices: new_prices,
+                    ts: new_ts,
+                )
+            }
+        }
+
+        if got_any {
+            self.onchain.connected = true
+        }
+        got_any
+    }
+
+    fn process_rpc_item(
+        mut self,
+        item: MemSpan,
+        _ got_any: mut bool,
+        _ saw_latest_prices: mut bool,
+        _ new_prices: mut [u64; 20],
+        _ new_ts: mut u64,
+    ) -> bool {
+        let Option::Some(id) = json_get_u64(item, "id".span()) else {
+            return false
+        }
+        if json_get_raw(item, "error".span()).is_some() {
+            self.onchain.rpc_errors += 1
+            return false
+        }
+        if id == 1 {
+            if let Option::Some((off, len)) = json_get_str_bounds(item, "result".span()) {
+                if let Option::Some(cid) = parse_hex_u64(item.slice(offset: off, len)) {
+                    self.onchain.chain_id = cid
+                    got_any = true
+                    return true
+                }
+            }
+            return false
+        }
+        if id == 2 {
+            if let Option::Some((off, len)) = json_get_str_bounds(item, "result".span()) {
+                if let Option::Some(bn) = parse_hex_u64(item.slice(offset: off, len)) {
+                    self.onchain.block_number = bn
+                    got_any = true
+                    return true
+                }
+            }
+            return false
+        }
+        if id == 3 {
+            if let Option::Some((off, len)) = json_get_raw(item, "result".span()) {
+                let blk = item.slice(offset: off, len)
+                if let Option::Some((toff, tlen)) = json_get_str_bounds(blk, "timestamp".span()) {
+                    if let Option::Some(bts) = parse_hex_u64(blk.slice(offset: toff, len: tlen)) {
+                        self.onchain.block_timestamp = bts
+                        got_any = true
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+        if id == 4 {
+            if let Option::Some((off, len)) = json_get_str_bounds(item, "result".span()) {
+                let s = item.slice(offset: off, len).trim()
+                let raw = s.tail(strip_0x_offset(s))
+                if raw.len() < 1344 {
+                    return false
+                }
+                var a: usize = 0
+                while a < ASSET_COUNT {
+                    let Option::Some(p) = parse_abi_word_u64(raw, word_idx: a) else {
+                        return false
+                    }
+                    new_prices[a] = p
+                    a += 1
+                }
+                let Option::Some(ts) = parse_abi_word_u64(raw, word_idx: 20) else {
+                    return false
+                }
+                saw_latest_prices = true
+                new_ts = ts
+                got_any = true
+                return true
+            }
+            return false
+        }
+        if id == 5 {
+            if let Option::Some((off, len)) = json_get_str_bounds(item, "result".span()) {
+                let s = item.slice(offset: off, len).trim()
+                let raw = s.tail(strip_0x_offset(s))
+                if let Option::Some(cr) = parse_abi_word_u64(raw, word_idx: 0) {
+                    self.onchain.current_round = cr
+                    got_any = true
+                    return true
+                }
+            }
+            return false
+        }
+        if id == 6 {
+            if let Option::Some((off, len)) = json_get_str_bounds(item, "result".span()) {
+                let s = item.slice(offset: off, len).trim()
+                let raw = s.tail(strip_0x_offset(s))
+                var addr_buf = MemBuffer::empty()
+                if parse_abi_word_addr20(raw, word_idx: 0, mut addr_buf) {
+                    self.onchain.owner.set_from_span(addr_buf.span())
+                    got_any = true
+                    return true
+                }
+            }
+            return false
+        }
+        let max_oracles_u64: u64 = MAX_ORACLES.downcast_unchecked()
+        if id >= 7 && id < 7 + max_oracles_u64 {
+            let idx: usize = (id - 7).downcast_unchecked()
+            if idx < MAX_ORACLES {
+                if let Option::Some((off, len)) = json_get_str_bounds(item, "result".span()) {
+                    let s = item.slice(offset: off, len).trim()
+                    let raw = s.tail(strip_0x_offset(s))
+                    if let Option::Some(auth) = parse_abi_word_bool(raw, word_idx: 0) {
+                        self.nodes[idx].is_authorized_onchain = auth
+                        self.nodes[idx].auth_known = true
+                        got_any = true
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+        false
+    }
+
+    fn upsert_settled_round_price(mut self, round_id: u64, prices: [u64; 20], ts: u64) {
+        if let Option::Some(l_idx) = self.find_round_logical_index(round_id) {
+            let s_idx = self.round_storage_index(l_idx)
+            self.rounds[s_idx].prices = prices
+            self.rounds[s_idx].timestamp = ts
+            if l_idx > 0 {
+                let prev = self.round_at(l_idx - 1)
+                if prev.prices[0] > 0 {
+                    self.rounds[s_idx].delta_bps = signed_bps_diff(
+                        val: prices[0],
+                        base: prev.prices[0],
+                    )
+                }
+            }
+            return
+        }
+
+        if self.rounds_len > 0 {
+            let last = self.round_at(self.rounds_len - 1)
+            if last.round_id >= round_id && last.timestamp >= ts {
+                return
+            }
+        }
+
+        var delta: i64 = 0
+        if self.rounds_len > 0 {
+            let last = self.round_at(self.rounds_len - 1)
+            if last.prices[0] > 0 {
+                delta = signed_bps_diff(val: prices[0], base: last.prices[0])
+            }
+        }
+        let sample = RoundSample {
+            valid: true,
+            round_id,
+            prices,
+            timestamp: ts,
+            block_number: 0,
+            gas_used: 0,
+            tx_count: 0,
+            expected_leader_idx: leader_index(round_id, node_count: NODE_COUNT),
+            actual_leader_idx: -1,
+            failover: false,
+            submitter: FixedStr<48>::empty(),
+            delta_bps: delta,
+        }
+        let _ = self.append_round_slot(sample)
+    }
+
+    pub fn ingest_tx(
+        mut self,
+        round_id: u64,
+        block_num: u64,
+        gas_used: u64,
+        tx_count: u32,
+        submitter_hex: MemSpan,
+    ) {
+        let expected = leader_index(round_id, node_count: NODE_COUNT)
+        let actual_idx = self.match_node_by_addr(submitter_hex)
+        let failover = if actual_idx >= 0 {
+            let actual_u64: u64 = actual_idx.downcast_unchecked()
+            actual_u64 != expected
+        } else {
+            false
+        }
+
+        var norm_sub = MemBuffer::empty()
+        var sub_str = FixedStr<48>::empty()
+        if normalize_addr20_hex(submitter_hex, mut norm_sub) {
+            sub_str.set_from_span(norm_sub.span())
+        } else {
+            sub_str.set_from_span(submitter_hex.trim())
+        }
+
+        self.onchain.has_tx_data = true
+        self.onchain.last_tx_gas = gas_used
+        self.onchain.last_tx_failover = failover
+        if tx_count > 1 {
+            self.onchain.tx_invariant_ok = false
+        }
+
+        let zero_prices: [u64; 20] = [0; 20]
+        let s_idx = match self.find_round_logical_index(round_id) {
+            Option::Some(l_idx) => self.round_storage_index(l_idx),
+            Option::None => {
+                let sample = RoundSample {
+                    valid: true,
+                    round_id,
+                    prices: zero_prices,
+                    timestamp: 0,
+                    block_number: block_num,
+                    gas_used,
+                    tx_count,
+                    expected_leader_idx: expected,
+                    actual_leader_idx: actual_idx,
+                    failover,
+                    submitter: sub_str,
+                    delta_bps: 0,
+                }
+                let new_l_idx = self.append_round_slot(sample)
+                self.round_storage_index(new_l_idx)
+            },
+        }
+        self.rounds[s_idx].block_number = block_num
+        self.rounds[s_idx].gas_used = gas_used
+        self.rounds[s_idx].tx_count = tx_count
+        self.rounds[s_idx].expected_leader_idx = expected
+        self.rounds[s_idx].actual_leader_idx = actual_idx
+        self.rounds[s_idx].failover = failover
+        self.rounds[s_idx].submitter = sub_str
+    }
+}

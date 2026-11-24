@@ -1,0 +1,275 @@
+use std::net::{Net, SocketAddr}
+use std::time::Clock
+use coro::{Scheduler}
+use feracle_core::{ASSET_COUNT, QuoteMsg, SigMsg, push_hex_bytes}
+use net_reactor::{SocketIo}
+use super::args::{PeerBackend}
+use super::config::{NodeConfig}
+use super::crypto::Crypto
+use super::feeds::{FeedKind, FeedSource}
+use super::network::PeerMesh
+use super::telemetry::{TelemetrySink}
+
+pub(ingot) fn fill_buf(_ tag: u8, _ len: usize) -> MemBuffer {
+    var buf = MemBuffer::new(len)
+    var i: usize = 0
+    while i < len {
+        buf[i] = tag
+        i += 1
+    }
+    buf
+}
+
+pub(ingot) fn make_key(_ tag: u8) -> MemBuffer {
+    fill_buf(tag, 32)
+}
+
+pub(ingot) fn make_key_hex(_ tag: u8) -> MemBuffer {
+    let raw = make_key(tag)
+    var hex = MemBuffer::with_capacity(66)
+    hex.extend_from("0x".span())
+    push_hex_bytes(mut hex, raw.span())
+    hex
+}
+
+pub(ingot) fn make_contract20(_ tag: u8) -> MemBuffer {
+    fill_buf(tag, 20)
+}
+
+pub(ingot) fn make_contract_0x(_ tag: u8) -> MemBuffer {
+    let raw = make_contract20(tag)
+    var hex = MemBuffer::with_capacity(42)
+    hex.extend_from("0x".span())
+    push_hex_bytes(mut hex, raw.span())
+    hex
+}
+
+pub(ingot) fn make_addr20(_ tag: u8) -> [u8; 20] {
+    [tag; 20]
+}
+
+pub(ingot) fn make_prices(_ btc_price: u64, _ other_base: u64) -> [u64; 20] {
+    var out: [u64; 20] = [0; 20]
+    out[0] = btc_price
+    var i: usize = 1
+    while i < ASSET_COUNT {
+        let idx_u64: u64 = i.downcast_unchecked()
+        out[i] = other_base + idx_u64 * 100_000_000
+        i += 1
+    }
+    out
+}
+
+pub(ingot) fn is_all_zero32(_ s: MemSpan) -> bool {
+    var i: usize = 0
+    while i < 32 {
+        if s.byte_at(i) != 0 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+pub(ingot) fn low_byte_u64(_ v: u64) -> u8 {
+    (v & 0xff).downcast_unchecked()
+}
+
+pub(ingot) struct MockCrypto {}
+
+impl Copy for MockCrypto {}
+
+impl Crypto for MockCrypto {
+    fn derive_eth_addr(self, privkey32: MemSpan) -> Option<[u8; 20]> {
+        if privkey32.len() != 32 || is_all_zero32(privkey32) {
+            return Option::None
+        }
+        let tag = privkey32.byte_at(31)
+        if tag == 0 {
+            return Option::None
+        }
+        Option::Some([tag; 20])
+    }
+
+    fn sign_digest(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        prices: [u64; 20],
+        timestamp: u64,
+    ) -> Option<SigMsg> {
+        if contract20.len() != 20 {
+            return Option::None
+        }
+        let signer_addr = self.derive_eth_addr(privkey32: privkey32)?
+        var s: [u8; 32] = [0; 32]
+        s[0] = low_byte_u64(round_id) ^ 0x5A
+        s[1] = 0xAA
+        s[2] = low_byte_u64(chain_id)
+        Option::Some(
+            SigMsg {
+                round_id,
+                timestamp,
+                median_prices: prices,
+                signer_addr,
+                v: 27,
+                r: [signer_addr[0]; 32],
+                s,
+            },
+        )
+    }
+
+    fn sign_raw_bytes(self, privkey32: MemSpan, data: MemSpan) -> Option<
+        ([u8; 20], u8, [u8; 32], [u8; 32]),
+    > {
+        if data.is_empty() {
+            return Option::None
+        }
+        let addr = self.derive_eth_addr(privkey32: privkey32)?
+        Option::Some((addr, 0, [0x11; 32], [0x22; 32]))
+    }
+
+    fn sign_quote(
+        self,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        timestamp: u64,
+        prices: [u64; 20],
+    ) -> Option<QuoteMsg> {
+        if contract20.len() != 20 {
+            return Option::None
+        }
+        let signer_addr = self.derive_eth_addr(privkey32: privkey32)?
+        var s: [u8; 32] = [0; 32]
+        s[0] = low_byte_u64(round_id) ^ 0x5A
+        s[1] = 0xAA
+        s[2] = low_byte_u64(chain_id)
+        Option::Some(
+            QuoteMsg {
+                round_id,
+                timestamp,
+                prices,
+                signer_addr,
+                v: 27,
+                r: [signer_addr[0]; 32],
+                s,
+            },
+        )
+    }
+
+    fn verify_sig(self, chain_id: u64, contract20: MemSpan, sig: SigMsg) -> bool {
+        if contract20.len() != 20 || sig.signer_addr[0] == 0 {
+            return false
+        }
+        sig.v == 27
+            && sig.r[0] == sig.signer_addr[0]
+            && sig.s[0] == (low_byte_u64(sig.round_id) ^ 0x5A)
+            && sig.s[1] == 0xAA
+            && sig.s[2] == low_byte_u64(chain_id)
+    }
+
+    fn verify_quote(self, chain_id: u64, contract20: MemSpan, quote: QuoteMsg) -> bool {
+        if contract20.len() != 20 || quote.signer_addr[0] == 0 {
+            return false
+        }
+        quote.v == 27
+            && quote.r[0] == quote.signer_addr[0]
+            && quote.s[0] == (low_byte_u64(quote.round_id) ^ 0x5A)
+            && quote.s[1] == 0xAA
+            && quote.s[2] == low_byte_u64(chain_id)
+    }
+}
+
+pub(ingot) struct MockPeerMesh {
+    pub(ingot) inbox: MemVec<MemBuffer>,
+    pub(ingot) published: MemVec<MemBuffer>,
+    pub(ingot) peers: usize,
+}
+
+impl MockPeerMesh {
+    pub(ingot) fn new(_ peers: usize) -> Self {
+        MockPeerMesh { inbox: MemVec::new(), published: MemVec::new(), peers }
+    }
+
+    pub(ingot) fn push_incoming(mut self, _ frame: MemSpan) {
+        self.inbox.push(MemBuffer::from_span(frame))
+    }
+}
+
+impl PeerMesh for MockPeerMesh {
+    fn publish(mut self, _ data: MemSpan, _ telemetry: mut TelemetrySink) -> bool
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    {
+        self.published.push(MemBuffer::from_span(data))
+        telemetry.record_frame(is_tx: true, peer: "local".span(), data)
+        true
+    }
+
+    fn poll_into(mut self, _ out: mut MemBuffer, _ telemetry: mut TelemetrySink) -> Option<u64>
+    uses (clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    {
+        if self.inbox.is_empty() {
+            return Option::None
+        }
+        let first = MemBuffer::from_span(self.inbox[0].span())
+        var i: usize = 1
+        while i < self.inbox.len() {
+            self.inbox[i - 1] = MemBuffer::from_span(self.inbox[i].span())
+            i += 1
+        }
+        let _ = self.inbox.pop()
+        out.clear()
+        out.extend_from(first.span())
+        telemetry.record_frame(is_tx: false, peer: "peer-mock".span(), data: out.span())
+        Option::Some(1)
+    }
+
+    fn peer_count(self) -> usize {
+        self.peers
+    }
+}
+
+pub(ingot) fn make_test_node_config(
+    node_id: u64,
+    key_tag: u8,
+    addr: SocketAddr,
+    rounds: u64,
+    round_timeout_secs: u64,
+) -> NodeConfig {
+    let mock = MockCrypto {}
+    let privkey32 = make_key(key_tag)
+    let self_addr20 = mock.derive_eth_addr(privkey32: privkey32.span()).unwrap()
+    var self_addr_0x = MemBuffer::with_capacity(42)
+    self_addr_0x.extend_from("0x".span())
+    let addr_raw = fill_buf(key_tag, 20)
+    push_hex_bytes(mut self_addr_0x, addr_raw.span())
+
+    var sources = MemVec<FeedSource>::new()
+    sources.push(FeedSource { kind: FeedKind::Hyperliquid, addr })
+    sources.push(FeedSource { kind: FeedKind::Binance, addr })
+    sources.push(FeedSource { kind: FeedKind::Coinbase, addr })
+
+    NodeConfig {
+        node_id,
+        p2p_backend: PeerBackend::Tcp,
+        p2p_port: 7001,
+        lan_discovery_port: 0,
+        telemetry_port: 0,
+        bootstrap: MemBuffer::empty(),
+        sources,
+        privkey32,
+        self_addr20,
+        self_addr_0x,
+        rpc_addr: addr,
+        rpc_path: MemBuffer::from_span("/".span()),
+        chain_id: 31337,
+        contract20: make_contract20(0x11),
+        contract_0x: make_contract_0x(0x11),
+        rounds,
+        round_timeout_secs,
+    }
+}

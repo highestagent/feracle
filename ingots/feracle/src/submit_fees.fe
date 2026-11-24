@@ -1,0 +1,394 @@
+use std::net::{Net, SocketAddr}
+use coro::{Poll, Scheduler, TaskId}
+use feracle_core::{
+    SigMsg,
+    bump_fee_wei,
+    encode_eip1559_signed_tx,
+    encode_eip1559_unsigned_tx,
+    encode_eip155_signed_tx,
+    encode_eip155_unsigned_tx,
+    encode_submit_medians_calldata,
+    push_hex_bytes,
+    to_ascii_lower,
+}
+use net_reactor::SocketIo
+use super::crypto::Crypto
+use super::rpc::{RPC_TIMEOUT_MS, start_rpc_request}
+use super::submit::{
+    MAX_REPLACEMENTS,
+    MIN_FEE_BUMP_WEI,
+    SubmitMediansCoro,
+    SubmitOutcome,
+    SubmitPhase,
+    TX_GAS_LIMIT,
+    TxFeeMode,
+}
+
+pub(ingot) fn contains_ascii_ci(_ haystack: MemSpan, _ needle_lower: MemSpan) -> bool {
+    if needle_lower.is_empty() {
+        return true
+    }
+    if needle_lower.len() > haystack.len() {
+        return false
+    }
+    let limit = haystack.len() - needle_lower.len()
+    var i: usize = 0
+    while i <= limit {
+        var j: usize = 0
+        var matched = true
+        while j < needle_lower.len() {
+            if to_ascii_lower(haystack.byte_at(i + j)) != needle_lower.byte_at(j) {
+                matched = false
+                break
+            }
+            j += 1
+        }
+        if matched { return true }
+        i += 1
+    }
+    false
+}
+
+pub(ingot) fn is_eip1559_unsupported_error(_ body: MemSpan) -> bool {
+    contains_ascii_ci(body, "not supported".span())
+        || contains_ascii_ci(body, "unsupported".span())
+        || contains_ascii_ci(body, "transaction type".span())
+        || contains_ascii_ci(body, "tx type".span())
+}
+
+pub(ingot) fn max_u128(_ a: u128, _ b: u128) -> u128 {
+    if a >= b { a } else { b }
+}
+
+impl SubmitMediansCoro {
+    pub fn start(
+        rpc_addr: SocketAddr,
+        rpc_path: MemSpan,
+        privkey32: MemSpan,
+        from_0x: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        prices: [u64; 20],
+        timestamp: u64,
+        sigs: [SigMsg; 3],
+    ) -> Self
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let owner = sched.alloc_task()
+        let started_ms = sched.now_ms()
+
+        if privkey32.len() != 32 || from_0x.len() != 42 {
+            sched.wake(owner)
+            return Self::failed(
+                owner,
+                rpc_addr,
+                rpc_path,
+                privkey32,
+                chain_id,
+                contract20,
+                round_id,
+                btc_price: prices[0],
+                timestamp,
+                started_ms,
+                err: format!("eth_sendRawTransaction: invalid signing key"),
+            )
+        }
+        if contract20.len() != 20 {
+            sched.wake(owner)
+            return Self::failed(
+                owner,
+                rpc_addr,
+                rpc_path,
+                privkey32,
+                chain_id,
+                contract20,
+                round_id,
+                btc_price: prices[0],
+                timestamp,
+                started_ms,
+                err: format!("eth_sendRawTransaction: invalid contract address length"),
+            )
+        }
+
+        var calldata = MemBuffer::with_capacity(996)
+        encode_submit_medians_calldata(round_id, prices, timestamp, sigs, mut calldata)
+
+        let nonce_body = format!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionCount\",\"params\":[\"",
+            from_0x,
+            "\",\"pending\"]}",
+        )
+        let fee_hist_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_feeHistory\",\"params\":[\"0x4\",\"latest\",[50]]}"
+        let tip_body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"eth_maxPriorityFeePerGas\",\"params\":[]}"
+
+        let nonce_req = start_rpc_request(
+            owner,
+            rpc_addr,
+            rpc_path,
+            rpc_body: nonce_body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+        let fee_hist_req = start_rpc_request(
+            owner,
+            rpc_addr,
+            rpc_path,
+            rpc_body: fee_hist_body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+        let tip_req = start_rpc_request(
+            owner,
+            rpc_addr,
+            rpc_path,
+            rpc_body: tip_body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+
+        SubmitMediansCoro {
+            owner,
+            phase: SubmitPhase::FetchingNonceAndFees {
+                nonce_req: Option::Some(nonce_req),
+                fee_hist_req: Option::Some(fee_hist_req),
+                tip_req: Option::Some(tip_req),
+                nonce_out: Option::None,
+                fee_hist_out: Option::None,
+                tip_out: Option::None,
+                nonce_done: false,
+                fee_hist_done: false,
+                tip_done: false,
+            },
+            rpc_addr,
+            rpc_path: MemBuffer::from_span(rpc_path),
+            privkey32: MemBuffer::from_span(privkey32),
+            chain_id,
+            contract20: MemBuffer::from_span(contract20),
+            round_id,
+            btc_price: prices[0],
+            timestamp,
+            calldata,
+            started_ms,
+            attempt_started_ms: 0,
+            nonce: 0,
+            fee_mode: TxFeeMode::Unset,
+            replacement_count: 0,
+            tx_hashes: MemVec::new(),
+            poll_hash_idx: 0,
+            outcome: Option::None,
+        }
+    }
+
+    pub(ingot) fn failed(
+        owner: TaskId,
+        rpc_addr: SocketAddr,
+        rpc_path: MemSpan,
+        privkey32: MemSpan,
+        chain_id: u64,
+        contract20: MemSpan,
+        round_id: u64,
+        btc_price: u64,
+        timestamp: u64,
+        started_ms: u64,
+        err: own MemBuffer,
+    ) -> Self {
+        SubmitMediansCoro {
+            owner,
+            phase: SubmitPhase::Done,
+            rpc_addr,
+            rpc_path: MemBuffer::from_span(rpc_path),
+            privkey32: MemBuffer::from_span(privkey32),
+            chain_id,
+            contract20: MemBuffer::from_span(contract20),
+            round_id,
+            btc_price,
+            timestamp,
+            calldata: MemBuffer::empty(),
+            started_ms,
+            attempt_started_ms: 0,
+            nonce: 0,
+            fee_mode: TxFeeMode::Unset,
+            replacement_count: 0,
+            tx_hashes: MemVec::new(),
+            poll_hash_idx: 0,
+            outcome: Option::Some(SubmitOutcome::Failed(err)),
+        }
+    }
+
+    pub(ingot) fn finish(mut self, _ result: own SubmitOutcome) -> Poll<SubmitOutcome>
+    uses (sched: mut Scheduler, io: mut SocketIo)
+    {
+        self.phase = SubmitPhase::Done
+        sched.cancel_owner_timers(self.owner)
+        io.deregister_owner(self.owner)
+        Poll::Ready(result)
+    }
+
+    pub(ingot) fn start_legacy_gas_query(mut self)
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let gas_body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"eth_gasPrice\",\"params\":[]}"
+        let req = start_rpc_request(
+            owner: self.owner,
+            rpc_addr: self.rpc_addr,
+            rpc_path: self.rpc_path.span(),
+            rpc_body: gas_body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+        self.phase = SubmitPhase::FetchingLegacyGas(req)
+    }
+
+    pub(ingot) fn begin_signed_broadcast(mut self) -> Poll<SubmitOutcome>
+    uses (net: mut Net, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
+    {
+        var unsigned_tx = MemBuffer::with_capacity(1150)
+        match self.fee_mode {
+            TxFeeMode::Eip1559 { max_priority_fee, max_fee } => {
+                encode_eip1559_unsigned_tx(
+                    chain_id: self.chain_id,
+                    nonce: self.nonce,
+                    max_priority_fee_per_gas: max_priority_fee,
+                    max_fee_per_gas: max_fee,
+                    gas_limit: TX_GAS_LIMIT,
+                    to20: self.contract20.span(),
+                    calldata: self.calldata.span(),
+                    mut unsigned_tx,
+                )
+            },
+            TxFeeMode::Legacy { gas_price } => {
+                encode_eip155_unsigned_tx(
+                    nonce: self.nonce,
+                    gas_price,
+                    gas_limit: TX_GAS_LIMIT,
+                    to20: self.contract20.span(),
+                    calldata: self.calldata.span(),
+                    chain_id: self.chain_id,
+                    mut unsigned_tx,
+                )
+            },
+            TxFeeMode::Unset => {
+                return self.finish(
+                    SubmitOutcome::Failed(format!("tx fee mode unset for round ", self.round_id)),
+                )
+            },
+        }
+
+        let Option::Some((_, rec_id, r, s)) = crypto
+            .sign_raw_bytes(
+                privkey32: self.privkey32.span(),
+                data: unsigned_tx.span(),
+            ) else {
+            return self.finish(
+                SubmitOutcome::Failed(
+                    format!("failed to sign raw tx for round ", self.round_id),
+                ),
+            )
+        }
+
+        var signed_tx = MemBuffer::with_capacity(1250)
+        match self.fee_mode {
+            TxFeeMode::Eip1559 { max_priority_fee, max_fee } => {
+                encode_eip1559_signed_tx(
+                    chain_id: self.chain_id,
+                    nonce: self.nonce,
+                    max_priority_fee_per_gas: max_priority_fee,
+                    max_fee_per_gas: max_fee,
+                    gas_limit: TX_GAS_LIMIT,
+                    to20: self.contract20.span(),
+                    calldata: self.calldata.span(),
+                    y_parity: rec_id,
+                    r,
+                    s,
+                    mut signed_tx,
+                )
+            },
+            TxFeeMode::Legacy { gas_price } => {
+                let v: u128 = (self.chain_id as u128) * (2 as u128)
+                    + (35 as u128)
+                    + (rec_id as u128)
+                encode_eip155_signed_tx(
+                    nonce: self.nonce,
+                    gas_price,
+                    gas_limit: TX_GAS_LIMIT,
+                    to20: self.contract20.span(),
+                    calldata: self.calldata.span(),
+                    v,
+                    r,
+                    s,
+                    mut signed_tx,
+                )
+            },
+            TxFeeMode::Unset => {},
+        }
+
+        var raw_hex = MemBuffer::with_capacity(2 + signed_tx.len() * 2)
+        raw_hex.extend_from("0x".span())
+        push_hex_bytes(mut raw_hex, signed_tx.span())
+        let send_body = format!(
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"eth_sendRawTransaction\",\"params\":[\"",
+            raw_hex,
+            "\"]}",
+        )
+        let req = start_rpc_request(
+            owner: self.owner,
+            rpc_addr: self.rpc_addr,
+            rpc_path: self.rpc_path.span(),
+            rpc_body: send_body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+        self.phase = SubmitPhase::SendingRawTx(req)
+        Poll::Pending
+    }
+
+    pub(ingot) fn bump_current_fees(mut self) {
+        self.fee_mode = match self.fee_mode {
+            TxFeeMode::Eip1559 { max_priority_fee, max_fee } => {
+                let next_prio = bump_fee_wei(max_priority_fee, min_bump_wei: MIN_FEE_BUMP_WEI)
+                let next_max = max_u128(
+                    bump_fee_wei(max_fee, min_bump_wei: MIN_FEE_BUMP_WEI),
+                    next_prio,
+                )
+                TxFeeMode::Eip1559 { max_priority_fee: next_prio, max_fee: next_max }
+            },
+            TxFeeMode::Legacy { gas_price } => TxFeeMode::Legacy {
+                gas_price: bump_fee_wei(gas_price, min_bump_wei: MIN_FEE_BUMP_WEI),
+            },
+            TxFeeMode::Unset => TxFeeMode::Unset,
+        }
+    }
+
+    pub(ingot) fn start_receipt_poll(mut self)
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let idx = if self.poll_hash_idx < self.tx_hashes.len() {
+            self.poll_hash_idx
+        } else {
+            0
+        }
+        self.poll_hash_idx = if self.tx_hashes.is_empty() {
+            0
+        } else {
+            (idx + 1) % self.tx_hashes.len()
+        }
+        let body = format!(
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"eth_getTransactionReceipt\",\"params\":[\"",
+            self.tx_hashes[idx],
+            "\"]}",
+        )
+        let req = start_rpc_request(
+            owner: self.owner,
+            rpc_addr: self.rpc_addr,
+            rpc_path: self.rpc_path.span(),
+            rpc_body: body.span(),
+            timeout_ms: RPC_TIMEOUT_MS,
+        )
+        self.phase = SubmitPhase::PollingReceipt(req)
+    }
+
+    pub(ingot) fn resume_existing_receipt_poll(mut self)
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        // A prior tx with this nonce may already be confirming; keep polling existing hashes.
+        self.replacement_count = MAX_REPLACEMENTS
+        self.attempt_started_ms = sched.now_ms()
+        self.start_receipt_poll()
+    }
+}

@@ -1,0 +1,329 @@
+use std::io::{Stderr, Stdout}
+use std::net::Net
+use std::time::Clock
+use coro::{Poll, Scheduler, Sleep, TaskId}
+use feracle_core::{QuoteMsg, SigMsg}
+use net_reactor::SocketIo
+use super::config::NodeConfig
+use super::feeds::{FeedReport, FetchFeedsCoro, feed_kind_name}
+use super::crypto::Crypto
+use super::network::PeerMesh
+use super::round_io::{OracleAuthCache, QuoteRouting, poll_all_messages}
+use super::rpc::{QueryCurrentRound, QueryRoundState}
+use super::submit::{SubmitMediansCoro}
+use super::telemetry::{TelemetryEvent, TelemetrySink}
+
+pub(ingot) enum ConsensusState {
+    MeshWarmup {
+        pub(ingot) started_ms: u64,
+        pub(ingot) tick: Sleep,
+    },
+    QueryRoundState {
+        pub(ingot) query: QueryRoundState,
+    },
+    WaitNextSec { pub(ingot) sleep: Sleep },
+    FetchingFeeds {
+        pub(ingot) try_idx: usize,
+        pub(ingot) fetcher: FetchFeedsCoro,
+    },
+    FeedRetryDelay {
+        pub(ingot) next_try_idx: usize,
+        pub(ingot) sleep: Sleep,
+    },
+    FeedErrorCooldown { pub(ingot) sleep: Sleep },
+    PhaseAQuotes {
+        pub(ingot) started_ms: u64,
+        pub(ingot) deadline: Sleep,
+        pub(ingot) pub_sleep: Sleep,
+        pub(ingot) quorum_grace: Option<Sleep>,
+    },
+    ToleranceBreachWait {
+        pub(ingot) deadline: Sleep,
+        pub(ingot) rpc_sleep: Option<Sleep>,
+        pub(ingot) round_query: Option<QueryCurrentRound>,
+    },
+    PhaseCSigs {
+        pub(ingot) started_ms: u64,
+        pub(ingot) deadline: Sleep,
+        pub(ingot) pub_sleep: Sleep,
+    },
+    PrimarySubmitting {
+        pub(ingot) started_ms: u64,
+        pub(ingot) submit_started_ms: u64,
+        pub(ingot) submit: SubmitMediansCoro,
+        pub(ingot) pub_sleep: Sleep,
+    },
+    Settling {
+        pub(ingot) started_ms: u64,
+        pub(ingot) deadline: Sleep,
+        pub(ingot) pub_sleep: Sleep,
+        pub(ingot) rpc_sleep: Option<Sleep>,
+        pub(ingot) round_query: Option<QueryCurrentRound>,
+        pub(ingot) failover_submit: Option<SubmitMediansCoro>,
+        pub(ingot) submit_started_ms: u64,
+        pub(ingot) failover_started: bool,
+        pub(ingot) backup_leader: u64,
+    },
+    Done(i32),
+}
+
+pub(ingot) enum StepAction {
+    Stay,
+    Transition(ConsensusState),
+    Finish(i32),
+}
+
+pub(ingot) struct RoundContext {
+    pub(ingot) owner: TaskId,
+    pub(ingot) config: NodeConfig,
+    pub(ingot) auth_cache: OracleAuthCache,
+    pub(ingot) pending_quotes: MemVec<QuoteMsg>,
+    pub(ingot) pending_sigs: MemVec<SigMsg>,
+    pub(ingot) scratch: MemBuffer,
+    pub(ingot) completed_rounds: u64,
+    pub(ingot) fallback_round: u64,
+    pub(ingot) round_id: u64,
+    pub(ingot) last_updated: u64,
+    pub(ingot) local_prices: [u64; 20],
+    pub(ingot) local_ts: u64,
+    pub(ingot) group_medians: [u64; 20],
+    pub(ingot) round_ts: u64,
+    pub(ingot) quotes: MemVec<QuoteMsg>,
+    pub(ingot) quote_frame: MemBuffer,
+    pub(ingot) sigs: MemVec<SigMsg>,
+    pub(ingot) sorted_sigs: [SigMsg; 3],
+    pub(ingot) sig_frame: MemBuffer,
+    pub(ingot) submitted: bool,
+}
+
+pub struct ConsensusCoro { ctx: RoundContext, state: ConsensusState }
+
+pub(ingot) fn zero_sig() -> SigMsg {
+    SigMsg {
+        round_id: 0,
+        timestamp: 0,
+        median_prices: [0; 20],
+        signer_addr: [0; 20],
+        v: 0,
+        r: [0; 32],
+        s: [0; 32],
+    }
+}
+
+pub(ingot) fn emit_feed_reports(_ reports: MemVec<FeedReport>, _ telemetry: mut TelemetrySink)
+uses (err: mut Stderr)
+{
+    var i: usize = 0
+    while i < reports.len() {
+        let rep = reports[i]
+        if !rep.ok {
+            eprintln!(
+                "warning: failed to fetch feed source index=",
+                i,
+                " addr=",
+                rep.addr,
+            )
+        }
+        if i < 8 {
+            let provider_buf = feed_kind_name(rep.kind)
+            let addr_buf = format!(rep.addr)
+            telemetry
+                .set_feed(
+                    slot: i.downcast_unchecked(),
+                    provider: provider_buf.span(),
+                    addr: addr_buf.span(),
+                    price: rep.price,
+                    assets_ok: rep.assets_ok,
+                    ok: rep.ok,
+                    latency_ms: rep.latency_ms,
+                )
+        }
+        i += 1
+    }
+}
+
+pub(ingot) fn opt_sleep_ready(_ slot: mut Option<Sleep>) -> bool
+uses (sched: mut Scheduler)
+{
+    if let Option::Some(mut s) = slot {
+        if let Poll::Ready(_) = s.poll() {
+            slot = Option::None
+            return true
+        }
+    }
+    false
+}
+
+pub(ingot) fn cancel_opt_sleep(_ slot: mut Option<Sleep>) uses (sched: mut Scheduler) {
+    if let Option::Some(mut s) = slot {
+        s.cancel()
+        slot = Option::None
+    }
+}
+
+pub(ingot) fn cancel_state(_ state: mut ConsensusState)
+uses (net: mut Net, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
+{
+    match state {
+        ConsensusState::MeshWarmup { started_ms: _, mut tick } => tick.cancel(),
+        ConsensusState::QueryRoundState { mut query } => query.cancel(),
+        ConsensusState::WaitNextSec { mut sleep } => sleep.cancel(),
+        ConsensusState::FetchingFeeds { try_idx: _, mut fetcher } => fetcher.cancel(),
+        ConsensusState::FeedRetryDelay { next_try_idx: _, mut sleep } => sleep.cancel(),
+        ConsensusState::FeedErrorCooldown { mut sleep } => sleep.cancel(),
+        ConsensusState::PhaseAQuotes {
+            started_ms: _,
+            mut deadline,
+            mut pub_sleep,
+            mut quorum_grace,
+        } => {
+            deadline.cancel()
+            pub_sleep.cancel()
+            cancel_opt_sleep(mut quorum_grace)
+        },
+        ConsensusState::ToleranceBreachWait { mut deadline, mut rpc_sleep, mut round_query } => {
+            deadline.cancel()
+            cancel_opt_sleep(mut rpc_sleep)
+            if let Option::Some(mut q) = round_query {
+                q.cancel()
+            }
+        },
+        ConsensusState::PhaseCSigs { started_ms: _, mut deadline, mut pub_sleep } => {
+            deadline.cancel()
+            pub_sleep.cancel()
+        },
+        ConsensusState::PrimarySubmitting {
+            started_ms: _,
+            submit_started_ms: _,
+            mut submit,
+            mut pub_sleep,
+        } => {
+            submit.cancel()
+            pub_sleep.cancel()
+        },
+        ConsensusState::Settling {
+            started_ms: _,
+            mut deadline,
+            mut pub_sleep,
+            mut rpc_sleep,
+            mut round_query,
+            mut failover_submit,
+            submit_started_ms: _,
+            failover_started: _,
+            backup_leader: _,
+        } => {
+            deadline.cancel()
+            pub_sleep.cancel()
+            cancel_opt_sleep(mut rpc_sleep)
+            if let Option::Some(mut q) = round_query {
+                q.cancel()
+            }
+            if let Option::Some(mut s) = failover_submit {
+                s.cancel()
+            }
+        },
+        ConsensusState::Done(_) => {},
+    }
+}
+
+pub(ingot) fn quote_routing_for(_ state: ref ConsensusState) -> (QuoteRouting, bool) {
+    match state {
+        ConsensusState::PhaseAQuotes { .. } => (QuoteRouting::AcceptCurrent, false),
+        ConsensusState::ToleranceBreachWait { .. } => (QuoteRouting::IgnoreCurrent, false),
+        ConsensusState::PhaseCSigs { .. } => (QuoteRouting::IgnoreCurrent, true),
+        ConsensusState::PrimarySubmitting { .. } => (QuoteRouting::IgnoreCurrent, true),
+        ConsensusState::Settling { .. } => (QuoteRouting::IgnoreCurrent, true),
+        _ => (QuoteRouting::BufferPending, false),
+    }
+}
+
+impl RoundContext {
+    pub(ingot) fn drain_inbox<M: PeerMesh>(
+        mut self,
+        _ quote_routing: QuoteRouting,
+        _ accept_sigs: bool,
+        _ peer: mut M,
+        _ telemetry: mut TelemetrySink,
+    )
+    uses (net: mut Net, clock: Clock, crypto: Crypto, sched: mut Scheduler, io: mut SocketIo)
+    {
+        poll_all_messages(
+            mut peer,
+            mut telemetry,
+            auth_cache: mut self.auth_cache,
+            round_id: self.round_id,
+            chain_id: self.config.chain_id,
+            contract20: self.config.contract20.span(),
+            quote_routing,
+            mut self.quotes,
+            mut self.pending_quotes,
+            mut self.sigs,
+            mut self.pending_sigs,
+            accept_sigs,
+            expected_prices: self.group_medians,
+            expected_ts: self.round_ts,
+            mut self.scratch,
+        )
+    }
+
+    pub(ingot) fn step_rebroadcast<M: PeerMesh>(
+        mut self,
+        use_quote: bool,
+        _ pub_sleep: mut Sleep,
+        _ peer: mut M,
+        _ telemetry: mut TelemetrySink,
+    )
+    uses (net: mut Net, clock: Clock, sched: mut Scheduler, io: mut SocketIo)
+    {
+        if let Poll::Ready(_) = pub_sleep.poll() {
+            if use_quote {
+                let _ = peer.publish(self.quote_frame.span(), mut telemetry)
+                pub_sleep = Sleep::after(owner: self.owner, delay_ms: 1000)
+            } else {
+                let _ = peer.publish(self.sig_frame.span(), mut telemetry)
+                pub_sleep = Sleep::after(owner: self.owner, delay_ms: 2000)
+            }
+        }
+    }
+
+    pub(ingot) fn next_round_state(mut self) -> ConsensusState
+    uses (net: mut Net, sched: mut Scheduler, io: mut SocketIo)
+    {
+        if self.config.rounds > 0 && self.completed_rounds >= self.config.rounds {
+            return ConsensusState::Done(0)
+        }
+        self.round_id = self.fallback_round
+        ConsensusState::QueryRoundState {
+            query: QueryRoundState::start(
+                rpc_addr: self.config.rpc_addr,
+                rpc_path: self.config.rpc_path.span(),
+                contract_0x: self.config.contract_0x.span(),
+            ),
+        }
+    }
+
+    pub(ingot) fn begin_fetching_state(mut self, _ telemetry: mut TelemetrySink) -> ConsensusState
+    uses (net: mut Net, out: mut Stdout, sched: mut Scheduler, io: mut SocketIo)
+    {
+        let zero_prices: [u64; 20] = [0; 20]
+        println!(
+            "node ",
+            self.config.node_id,
+            " starting round ",
+            self.round_id,
+        )
+        telemetry.record_event(TelemetryEvent::RoundStarted)
+        telemetry
+            .set_phase(
+                round_id: self.round_id,
+                phase: "fetching".span(),
+                local_prices: zero_prices,
+                group_medians: zero_prices,
+                round_ts: 0,
+            )
+        ConsensusState::FetchingFeeds {
+            try_idx: 0,
+            fetcher: FetchFeedsCoro::start(self.config.sources.as_slice()),
+        }
+    }
+}
